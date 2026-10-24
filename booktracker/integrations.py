@@ -88,39 +88,82 @@ def fetch_saved_page_metadata(path: str | Path, story_url: str) -> dict:
     return parse_story_html(path.read_text(encoding="utf-8-sig", errors="replace"), source)
 
 
-def openlibrary_lookup(query: str) -> list[dict]:
-    """Public Open Library search (not a Goodreads API). Returns up to 10 candidates."""
+OPEN_LIBRARY_FIELDS = (
+    "key,title,author_name,first_publish_year,cover_i,isbn,number_of_pages_median,"
+    "edition_count,subject,language,first_sentence,series,cover_edition_key"
+)
+
+
+def _openlibrary_lookup(query: str, *, mode: str, limit: int) -> list[dict]:
     query = query.strip()
     if not query:
         return []
-    if re.fullmatch(r"[\dXx-]{10,17}", query):
-        params = urllib.parse.urlencode({"isbn": query.replace("-", ""), "limit": 10})
+    if mode == "author":
+        search = {"author": query}
+    elif re.fullmatch(r"[\\dXx-]{10,17}", query):
+        search = {"isbn": query.replace("-", "")}
     else:
-        params = urllib.parse.urlencode({"q": query, "limit": 10})
+        search = {"q": query}
+    params = urllib.parse.urlencode({
+        **search, "limit": limit, "fields": OPEN_LIBRARY_FIELDS,
+    })
     try:
         payload = json.loads(_get("https://openlibrary.org/search.json?" + params))
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
         raise ValueError(f"Open Library lookup failed: {exc}") from exc
     output = []
     for doc in payload.get("docs", []):
-        if not doc.get("title"):
+        if not doc.get("title") or not str(doc.get("key", "")).startswith("/works/"):
             continue
-        isbn = next(iter(doc.get("isbn") or []), "")
+        identifiers = doc.get("isbn") or []
         cover = doc.get("cover_i")
+        first_sentence = doc.get("first_sentence") or []
+        if isinstance(first_sentence, str):
+            first_sentence = [first_sentence]
+        elif isinstance(first_sentence, dict):
+            first_sentence = [first_sentence.get("value", "")]
+        subjects = [
+            str(v) for v in (doc.get("subject") or [])
+            if isinstance(v, str) and len(v) <= 85
+        ][:12]
+        languages = doc.get("language") or []
+        series = doc.get("series") or []
         output.append({
             "title": doc["title"],
-            "author": ", ".join(doc.get("author_name", [])[:3]),
+            "author": ", ".join(doc.get("author_name") or []),
             "kind": "book", "progress_unit": "pages",
+            "publication_status": "completed",
             "total_units": doc.get("number_of_pages_median") or 0,
-            "edition_count": doc.get("edition_count") or 0,  # search relevance only
-            "isbn": isbn,
+            "edition_count": doc.get("edition_count") or 0,
+            "isbn": next(iter(identifiers), ""),
             "source_site": "Open Library",
             "source_url": "https://openlibrary.org" + doc["key"],
             "source_id": doc["key"],
             "published_at": str(doc.get("first_publish_year") or ""),
-            "cover_url": f"https://covers.openlibrary.org/b/id/{cover}-L.jpg" if cover else "",
+            "cover_url": (
+                f"https://covers.openlibrary.org/b/id/{cover}-M.jpg"
+                if cover else
+                (f"https://covers.openlibrary.org/b/olid/{doc['cover_edition_key']}-M.jpg?default=false"
+                 if doc.get("cover_edition_key") else
+                 (f"https://covers.openlibrary.org/b/isbn/{identifiers[0]}-M.jpg?default=false"
+                  if identifiers else ""))
+            ),
+            "description": " ".join(str(x) for x in first_sentence[:2]).strip(),
+            "language": languages[0] if languages else "",
+            "tags": subjects,
+            "series": series[0] if series else "",
         })
     return output
+
+
+def openlibrary_lookup(query: str) -> list[dict]:
+    """Public Open Library title/ISBN search; no Goodreads API keys needed."""
+    return _openlibrary_lookup(query, mode="title", limit=12)
+
+
+def openlibrary_author_lookup(author: str) -> list[dict]:
+    """Browse many distinct works by author from the public catalog."""
+    return _openlibrary_lookup(author, mode="author", limit=100)
 
 
 def export_file(library: Library, path: str | Path):

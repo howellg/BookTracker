@@ -4,8 +4,8 @@ from __future__ import annotations
 import sys
 import webbrowser
 
-from PySide6.QtCore import Qt, QThread, QUrl, Signal
-from PySide6.QtGui import QAction, QFont, QPixmap
+from PySide6.QtCore import QSize, Qt, QThread, QUrl, Signal
+from PySide6.QtGui import QAction, QColor, QFont, QIcon, QPalette, QPixmap
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
 from PySide6.QtWidgets import (
     QApplication,
@@ -39,7 +39,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .book_search import cached_book_search
+from .book_search import _normalize, cached_book_search
+from .covers import CoverCache, cover_url_for
 from .database import KINDS, PUBLICATION, STATUSES, UNITS, Library
 from .integrations import (
     export_file,
@@ -49,6 +50,7 @@ from .integrations import (
     import_goodreads,
     source_from_url,
 )
+from .metadata import missing_book_metadata
 
 LABELS = {
     "book": "Book", "fanfiction": "Fanfiction", "web_novel": "Web novel", "other": "Other",
@@ -156,6 +158,9 @@ class WorkEditor(QDialog):
         self.cover_url = self.work.get("cover_url", "")
         self.lookup_thread = None
         self.online_books = []
+        self.bulk_selection = []
+        self.bulk_status = "completed"
+        self.bulk_update_existing = False
         self.cover_network = QNetworkAccessManager(self)
         self.cover_request_token = 0
 
@@ -168,14 +173,19 @@ class WorkEditor(QDialog):
         self.tabs = tabs
         layout.addWidget(tabs, stretch=1)
 
-        online_page, basic, extras, notes_page = QWidget(), QWidget(), QWidget(), QWidget()
-        for page in (online_page, basic, extras, notes_page):
+        online_page, bulk_page, basic, extras, notes_page = (
+            QWidget(), QWidget(), QWidget(), QWidget(), QWidget()
+        )
+        for page in (online_page, bulk_page, basic, extras, notes_page):
             page.setObjectName("editorPage")
         tabs.addTab(online_page, "Find online")
+        tabs.addTab(bulk_page, "Paste titles")
+        tabs.setTabEnabled(1, not bool(work))
         tabs.addTab(basic, "Book & source")
         tabs.addTab(extras, "More details")
         tabs.addTab(notes_page, "Notes & tags")
         self.build_online_tab(online_page)
+        self.build_bulk_titles_tab(bulk_page)
         if work:
             tabs.setCurrentWidget(basic)
         form = QFormLayout(basic)
@@ -282,6 +292,84 @@ class WorkEditor(QDialog):
         if not work:
             self.online_query.setFocus()
 
+    def build_bulk_titles_tab(self, page):
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
+        layout.addWidget(label("Add many books without searching them individually", "subheading"))
+        layout.addWidget(label(
+            "Paste one title per line and enter its author once. The entries will "
+            "be added as custom books; you can fill missing metadata later. "
+            "This also works when catalog websites are unavailable.", "muted"
+        ))
+        row = QHBoxLayout()
+        row.addWidget(label("Author:"))
+        self.pasted_author = QLineEdit()
+        self.pasted_author.setPlaceholderText("e.g. Brandon Sanderson")
+        row.addWidget(self.pasted_author, stretch=1)
+        layout.addLayout(row)
+        layout.addWidget(label("Book titles (one per line):"))
+        self.pasted_titles = QTextEdit()
+        self.pasted_titles.setPlaceholderText(
+            "The Final Empire\nThe Well of Ascension\nThe Hero of Ages\n"
+            "The Way of Kings\nWords of Radiance\nOathbringer"
+        )
+        layout.addWidget(self.pasted_titles, stretch=1)
+        options = QHBoxLayout()
+        options.addWidget(label("Reading status:"))
+        self.pasted_status = QComboBox()
+        self.pasted_status.addItem("Completed (date unknown)", "completed")
+        self.pasted_status.addItem("Plan to read", "plan_to_read")
+        options.addWidget(self.pasted_status)
+        options.addStretch()
+        options.addWidget(button("Add all pasted titles", self.add_pasted_titles, primary=True))
+        layout.addLayout(options)
+        self.pasted_update_checkbox = QCheckBox(
+            "Also mark matching existing unread books completed"
+        )
+        layout.addWidget(self.pasted_update_checkbox)
+        self.pasted_status.currentIndexChanged.connect(
+            lambda: self.pasted_update_checkbox.setEnabled(
+                self.pasted_status.currentData() == "completed"
+            )
+        )
+        self.pasted_status_note = label(
+            "Duplicate titles by the same author are automatically skipped. "
+            "No completion dates will be invented.", "muted"
+        )
+        layout.addWidget(self.pasted_status_note)
+
+    def add_pasted_titles(self):
+        author = self.pasted_author.text().strip()
+        if not author:
+            self.pasted_status_note.setText("Enter an author before adding multiple titles.")
+            return
+        import re
+
+        raw_lines = self.pasted_titles.toPlainText().splitlines()
+        titles = [
+            re.sub(r"^\s*(?:[-*•]\s*|\d+[).]\s*)", "", line).strip()
+            for line in raw_lines
+            if line.strip()
+        ]
+        titles = list(dict.fromkeys(title for title in titles if title))
+        if not titles:
+            self.pasted_status_note.setText("Paste at least one book title (one per line).")
+            return
+        if len(titles) > 500:
+            self.pasted_status_note.setText("Please add no more than 500 books at once.")
+            return
+        self.bulk_selection = [
+            {"title": title, "author": author, "kind": "book",
+             "progress_unit": "pages", "publication_status": "unknown"}
+            for title in titles
+        ]
+        self.bulk_status = self.pasted_status.currentData()
+        self.bulk_update_existing = (
+            self.pasted_update_checkbox.isChecked() and self.bulk_status == "completed"
+        )
+        self.accept()
+
     def build_online_tab(self, page):
         layout = QVBoxLayout(page)
         layout.setContentsMargins(14, 14, 14, 12)
@@ -292,8 +380,13 @@ class WorkEditor(QDialog):
         ))
 
         search_bar = QHBoxLayout()
+        self.online_mode = QComboBox()
+        self.online_mode.addItem("Title / ISBN", "title")
+        self.online_mode.addItem("Author", "author")
+        self.online_mode.currentIndexChanged.connect(self.online_mode_changed)
+        search_bar.addWidget(self.online_mode)
         self.online_query = QLineEdit()
-        self.online_query.setPlaceholderText("e.g. The Way of Kings, Brandon Sanderson, or an ISBN")
+        self.online_query.setPlaceholderText("Search by title or ISBN")
         self.online_query.returnPressed.connect(self.search_online)
         self.online_search_button = button("Search books", self.search_online, primary=True)
         search_bar.addWidget(self.online_query, stretch=1)
@@ -305,6 +398,7 @@ class WorkEditor(QDialog):
         self.online_results.setObjectName("onlineResults")
         self.online_results.setSpacing(3)
         self.online_results.setWordWrap(True)
+        self.online_results.itemChanged.connect(self.selection_count_changed)
         self.online_results.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.online_results.currentRowChanged.connect(self.preview_online_result)
         self.online_results.itemDoubleClicked.connect(lambda _: self.use_online_result())
@@ -346,11 +440,74 @@ class WorkEditor(QDialog):
         splitter.addWidget(preview)
         splitter.setSizes([330, 455])
         layout.addWidget(splitter, stretch=1)
+        bulk_row = QHBoxLayout()
+        bulk_row.addWidget(button("Select all results", self.select_all_books))
+        bulk_row.addWidget(button("Clear selection", self.clear_selected_books))
+        self.bulk_counter = label("0 selected", "muted")
+        bulk_row.addWidget(self.bulk_counter)
+        bulk_row.addStretch()
+        bulk_row.addWidget(label("Set reading status:", "muted"))
+        self.bulk_status_select = QComboBox()
+        self.bulk_status_select.addItem("Completed (date unknown)", "completed")
+        self.bulk_status_select.addItem("Plan to read", "plan_to_read")
+        bulk_row.addWidget(self.bulk_status_select)
+        self.bulk_add_button = button("Add 0 selected", self.add_selected_books, primary=True)
+        self.bulk_add_button.setEnabled(False)
+        bulk_row.addWidget(self.bulk_add_button)
+        layout.addLayout(bulk_row)
+        self.bulk_update_checkbox = QCheckBox(
+            "Also mark matching existing unread books completed"
+        )
+        layout.addWidget(self.bulk_update_checkbox)
+        self.bulk_status_select.currentIndexChanged.connect(
+            lambda: self.bulk_update_checkbox.setEnabled(
+                self.bulk_status_select.currentData() == "completed"
+            )
+        )
+
         self.online_status = label(
             "Search two public catalogs. You can still enter a custom work using the Book & source tab.",
             "muted",
         )
         layout.addWidget(self.online_status)
+
+    def online_mode_changed(self, _index):
+        is_author = self.online_mode.currentData() == "author"
+        self.online_query.setPlaceholderText(
+            "e.g. Brandon Sanderson — select multiple works"
+            if is_author else "e.g. The Way of Kings or an ISBN"
+        )
+
+    def selection_count_changed(self, _item):
+        count = sum(self.online_results.item(i).checkState() == Qt.CheckState.Checked
+                    for i in range(self.online_results.count()))
+        self.bulk_counter.setText(f"{count} selected")
+        self.bulk_add_button.setText(f"Add {count} selected")
+        self.bulk_add_button.setEnabled(count > 0)
+
+    def select_all_books(self):
+        for i in range(self.online_results.count()):
+            self.online_results.item(i).setCheckState(Qt.CheckState.Checked)
+
+    def clear_selected_books(self):
+        for i in range(self.online_results.count()):
+            self.online_results.item(i).setCheckState(Qt.CheckState.Unchecked)
+
+    def add_selected_books(self):
+        chosen = [
+            dict(self.online_books[i])
+            for i in range(self.online_results.count())
+            if self.online_results.item(i).checkState() == Qt.CheckState.Checked
+        ]
+        if not chosen:
+            self.online_status.setText("Check at least one book to add.")
+            return
+        self.bulk_selection = chosen
+        self.bulk_status = self.bulk_status_select.currentData()
+        self.bulk_update_existing = (
+            self.bulk_update_checkbox.isChecked() and self.bulk_status == "completed"
+        )
+        self.accept()
 
     def search_online(self):
         query = self.online_query.text().strip()
@@ -363,6 +520,7 @@ class WorkEditor(QDialog):
             return
         self.online_books = []
         self.online_results.clear()
+        self.selection_count_changed(None)
         self.online_use_button.setEnabled(False)
         self.online_add_button.setEnabled(False)
         self.online_description.clear()
@@ -370,12 +528,32 @@ class WorkEditor(QDialog):
         self.online_meta.setText("")
         self.online_cover.setPixmap(QPixmap())
         self.online_cover.setText("No cover")
-        self.run_lookup(cached_book_search, query, self.show_online_results)
-        self.online_status.setText(f"Searching both catalogs for “{query}”…")
+        mode = self.online_mode.currentData()
+        self.run_lookup(
+            lambda term: cached_book_search(term, mode=mode),
+            query, self.show_online_results,
+        )
+        self.online_status.setText(f"Searching {mode} catalogs for “{query}”…")
 
     def show_online_results(self, response):
         results = response.get("results", [])
         errors = response.get("errors", [])
+        if self.online_mode.currentData() == "author":
+            # Work-centric list: don't show the same novel twice just because
+            # Google Books and Open Library list different editions.
+            deduped = {}
+            for work in results:
+                key = (_normalize(work.get("title", "")), _normalize(work.get("author", "")))
+                if not all(key):
+                    continue
+                previous = deduped.get(key)
+                def quality(entry):
+                    return (bool(entry.get("cover_url")), bool(entry.get("total_units")),
+                            bool(entry.get("description")), len(entry.get("tags") or []))
+                if not previous or quality(work) > quality(previous):
+                    deduped[key] = work
+            results = sorted(deduped.values(), key=lambda item: _normalize(item["title"]))
+
         self.online_books = results
         self.online_results.clear()
         for book in results:
@@ -389,8 +567,11 @@ class WorkEditor(QDialog):
             if pages:
                 subtitle += f"  ·  {pages:,} pages"
             item = QListWidgetItem(f"{book.get('title', '')}\n{subtitle}")
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Unchecked)
             item.setData(Qt.ItemDataRole.UserRole, book.get("source_id"))
             self.online_results.addItem(item)
+        self.selection_count_changed(None)
         if results:
             self.online_results.setCurrentRow(0)
         else:
@@ -398,7 +579,7 @@ class WorkEditor(QDialog):
             self.online_meta.setText("Try a shorter title, an author, or an ISBN.")
             self.online_cover.setText("No cover")
         warnings = " | ".join(errors)
-        message = f"{len(results)} book results"
+        message = f"{len(results)} unique book results" if self.online_mode.currentData() == "author" else f"{len(results)} book results"
         if response.get("cached"):
             message += " · Loaded from local search cache"
         if warnings:
@@ -469,7 +650,7 @@ class WorkEditor(QDialog):
         if not 0 <= index < len(self.online_books):
             return
         self.fill_metadata(self.online_books[index])
-        self.tabs.setCurrentIndex(1)
+        self.tabs.setCurrentIndex(2)
         self.feedback.setText(
             "Book details filled from the selected catalog entry. "
             "Choose a reading status or edit anything before saving."
@@ -676,6 +857,11 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.library = library
         self.selected_id = None
+        self.covers = CoverCache(self)
+        self.covers.cover_ready.connect(self.cover_available)
+        self.current_cover_label = None
+        self.current_cover_url = ""
+        self.metadata_worker = None
         self.setWindowTitle("BookTracker — Your reading, remembered")
         self.resize(1360, 840)
         self.setMinimumSize(900, 620)
@@ -789,6 +975,7 @@ class MainWindow(QMainWindow):
         self.table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setAlternatingRowColors(False)
+        self.table.setIconSize(QSize(37, 53))
         self.table.verticalHeader().setVisible(False)
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
@@ -806,8 +993,13 @@ class MainWindow(QMainWindow):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+        scroll.setStyleSheet("QScrollArea { border: none; }")
         detail_content = QWidget()
+        for surface in (scroll.viewport(), detail_content):
+            palette = surface.palette()
+            palette.setColor(QPalette.ColorRole.Window, QColor("#192231"))
+            surface.setPalette(palette)
+            surface.setAutoFillBackground(True)
         self.details = QVBoxLayout(detail_content)
         self.details.setAlignment(Qt.AlignmentFlag.AlignTop)
         scroll.setWidget(detail_content)
@@ -888,11 +1080,17 @@ class MainWindow(QMainWindow):
                 item = QTableWidgetItem(str(value))
                 if col == 0:
                     item.setData(Qt.ItemDataRole.UserRole, book["id"])
+                    url = cover_url_for(book)
+                    item.setData(Qt.ItemDataRole.UserRole + 1, url)
+                    if url:
+                        cover = self.covers.get(url)
+                        if cover is not None:
+                            item.setIcon(QIcon(cover))
                     item.setFont(QFont("Noto Sans", 10, QFont.Weight.DemiBold))
                 if col > 1:
                     item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
                 self.table.setItem(row, col, item)
-            self.table.setRowHeight(row, 44)
+            self.table.setRowHeight(row, 62)
         self.table.blockSignals(False)
         if chosen >= 0:
             self.table.selectRow(chosen)
@@ -923,6 +1121,23 @@ class MainWindow(QMainWindow):
         if not book:
             return
         self.clear_layout(self.details)
+        cover_url = cover_url_for(book)
+        self.current_cover_url = cover_url
+        self.current_cover_label = QLabel()
+        self.current_cover_label.setFixedSize(105, 150)
+        self.current_cover_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.current_cover_label.setStyleSheet(
+            "background: #2b3a4d; border-radius: 6px; color: #9ba9bf;"
+        )
+        pixmap = self.covers.get(cover_url) if cover_url else None
+        if pixmap is not None:
+            self.current_cover_label.setPixmap(pixmap.scaled(
+                105, 150, Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            ))
+        else:
+            self.current_cover_label.setText("No cover")
+        self.details.addWidget(self.current_cover_label, alignment=Qt.AlignmentFlag.AlignHCenter)
         self.details.addWidget(label(book["title"], "subheading"))
         self.details.addWidget(label(f"{book['author'] or 'Unknown author'} · {name(book['kind'])}", "muted"))
         self.details.addSpacing(8)
@@ -950,6 +1165,8 @@ class MainWindow(QMainWindow):
         self.details.addSpacing(10)
         self.details.addWidget(button("Log progress", self.log_progress, primary=True))
         self.details.addWidget(button("Edit details", self.edit_work))
+        if book["kind"] == "book":
+            self.details.addWidget(button("Fill missing metadata / cover", self.refresh_selected_metadata))
         self.details.addWidget(button("Mark caught up", lambda: self.change_status("caught_up")))
         self.details.addWidget(button("Mark completed", lambda: self.change_status("completed")))
         self.details.addWidget(button("Start a reread", self.reread))
@@ -962,6 +1179,54 @@ class MainWindow(QMainWindow):
             self.details.addWidget(label(
                 f"• {run['started_at'][:10]} → {run['finished_at'][:10] or 'in progress'}", "muted"))
 
+    def cover_available(self, url):
+        pixmap = self.covers.get(url)
+        if pixmap is None:
+            return
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 0)
+            if item and item.data(Qt.ItemDataRole.UserRole + 1) == url:
+                item.setIcon(QIcon(pixmap))
+        if self.current_cover_url == url and self.current_cover_label is not None:
+            self.current_cover_label.setText("")
+            self.current_cover_label.setPixmap(pixmap.scaled(
+                105, 150, Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            ))
+
+    def refresh_selected_metadata(self):
+        work = self.selected_work()
+        if not work:
+            return
+        if self.metadata_worker and self.metadata_worker.isRunning():
+            self.statusBar().showMessage("A metadata lookup is already running.")
+            return
+        self.statusBar().showMessage(f"Checking public metadata for {work['title']}…")
+        worker = LookupThread(missing_book_metadata, work)
+        self.metadata_worker = worker
+        work_id = work["id"]
+        worker.found.connect(
+            lambda response, book_id=work_id: self.apply_refreshed_metadata(book_id, response)
+        )
+        worker.failed.connect(
+            lambda message: QMessageBox.warning(self, "Metadata lookup", message)
+        )
+        worker.finished.connect(lambda: self.statusBar().showMessage("Metadata lookup finished."))
+        worker.start()
+
+    def apply_refreshed_metadata(self, work_id, response):
+        updates = response.get("updates") or {}
+        if updates and self.library.get_work(work_id):
+            self.library.update_work(work_id, updates)
+            self.refresh_all(work_id)
+        if response.get("warnings") and not updates:
+            message = "Catalogs did not provide additional metadata. " + " | ".join(response["warnings"])
+        elif updates:
+            message = f"Updated {len(updates)} metadata fields without changing your reading history."
+        else:
+            message = "This book already has all metadata available from the catalog."
+        self.statusBar().showMessage(message, 15000)
+
     def selected_work(self):
         return self.library.get_work(self.selected_id) if self.selected_id else None
 
@@ -970,6 +1235,25 @@ class MainWindow(QMainWindow):
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         try:
+            if dialog.bulk_selection:
+                count = len(dialog.bulk_selection)
+                status = dialog.bulk_status
+                # All selected works are inserted atomically; previously saved
+                # titles and their progress history remain untouched.
+                result = self.library.bulk_add_works(
+                    dialog.bulk_selection, status=status,
+                    update_existing_status=dialog.bulk_update_existing,
+                )
+                self.refresh_all()
+                message = (
+                    f"Selected: {count}\nAdded: {result['added']}\n"
+                    f"Updated existing statuses: {result['updated']}\n"
+                    f"Skipped existing/duplicate editions: {result['skipped']}"
+                )
+                if status == "completed":
+                    message += "\n\nHistorical completion dates were left unknown."
+                QMessageBox.information(self, "Bulk books added", message)
+                return
             values = dialog.values()
             if self.library.find_match(values):
                 QMessageBox.warning(self, "Already in library",
@@ -1123,6 +1407,8 @@ class MainWindow(QMainWindow):
             fail(self, exc)
 
     def closeEvent(self, event):
+        if self.metadata_worker and self.metadata_worker.isRunning():
+            self.metadata_worker.wait()
         self.library.close()
         super().closeEvent(event)
 
