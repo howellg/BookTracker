@@ -15,6 +15,7 @@ Built with Python, PySide6, and SQLite. No account, cloud subscription, or alway
 - Import a **Goodreads library CSV** (from Goodreads → My Books → Import and export).
 - Look up regular-book metadata via the public **Open Library** search API (title/ISBN).
 - Paste story URLs for *best-effort* metadata extraction from AO3, FanFiction.net, Royal Road, Scribble Hub, SpaceBattles, and Sufficient Velocity.
+- When a website blocks automated requests, **import HTML saved from your browser** to fill in title, author, and (for AO3) tags, chapters, word count and fandom, without uploading the file.
 - Export and import **JSON/XML full backups**, preserving the books, reading runs and progress events across computers.
 - Export and import **CSV catalogs** for spreadsheets (CSV does *not* preserve reading-history events).
 - Review basic library statistics and recent progress history.
@@ -52,10 +53,11 @@ The database is stored in your OS's user-data directory (platformdirs), not insi
 
 1. Click **+ Add work**. Enter a title and author; select Book, Fanfiction or Web novel. You can leave metadata blank.
 2. To auto-fill a regular book, enter its title/ISBN and click **Search Open Library**, then select a result.
-3. To try a serialized work import, paste the HTTPS story URL and click **Get metadata from URL**. Confirm the extracted details before saving.
-4. Select a work and click **Log progress**. Enter the **chapter/page reached**, not the number read in that session. Each change becomes a dated history event.
-5. Use **Mark caught up** for ongoing serials you've reached the latest chapter; **Mark completed** for a finished read; **Start a reread** to begin a new reading run.
-6. Use **Import library** / **Export library** in the sidebar to move reading history between computers.
+3. For a serialized work, paste its HTTPS story URL in **Story/book URL** and click **Fetch from URL**. Confirm the extracted details before saving. The application identifies the site and work ID even if the request fails.
+4. **If a story lookup fails:** Open that story in Firefox, press **Ctrl+S**, and save as **Web Page, HTML Only**. Back in BookTracker, leave the story URL in place and click **Import saved page…** to select the saved HTML. This is especially helpful for AO3, where Cloudflare may reject direct requests. You can also enter the title manually.
+5. Select a work and click **Log progress**. Enter the **chapter/page reached**, not the number read in that session. Each change becomes a dated history event.
+6. Use **Mark caught up** for ongoing serials you've reached the latest chapter; **Mark completed** for a finished read; **Start a reread** to begin a new reading run.
+7. Use **Import library** / **Export library** in the sidebar to move reading history between computers.
 
 For existing Goodreads history, use **File → Import Goodreads CSV**. It imports Goodreads shelves and ratings; it does not create a detailed historical progress log that Goodreads never exported.
 
@@ -74,7 +76,7 @@ The SQLite database is another valid local backup, but copy it while BookTracker
 
 ## Site-specific limitations
 
-The website importer uses public HTML metadata on a **best-effort** basis, without logging in, bypassing bot protection, or requesting hidden content. AO3 and other sites may require login, show age gates, rate-limit requests, or change their markup; the import will then fail gracefully and manual entry is available. Only approved HTTPS hostnames are fetched.
+The website importer uses public HTML metadata on a **best-effort** basis, without logging in, bypassing bot protection, or requesting hidden content. For browser-saved HTML, the parser works locally: the page contents are never transmitted anywhere. AO3 and other sites may require login, show age gates, rate-limit requests, or change their markup; the import will then fail gracefully and manual entry is available. Only approved HTTPS hostnames are fetched.
 
 Goodreads has no generally available new public API access; BookTracker supports its user-exported CSV instead. Open Library is used for ordinary-book metadata.
 

@@ -2,18 +2,17 @@
 from __future__ import annotations
 
 import csv
-import html
 import json
 import re
 import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
-from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import urlparse
 
 from .database import WORK_FIELDS, Library
+from .story_metadata import parse_story_html
 
 USER_AGENT = "BookTracker/0.1 (personal reading-library metadata client)"
 KNOWN_HOSTS = {
@@ -29,35 +28,6 @@ KNOWN_HOSTS = {
     "forums.sufficientvelocity.com": ("Sufficient Velocity", "fanfiction", r"/threads/[^/]*?(\d+)"),
 }
 CSV_FIELDS = ["id", *WORK_FIELDS, "progress"]
-
-
-class MetaParser(HTMLParser):
-    def __init__(self):
-        super().__init__(convert_charrefs=True)
-        self.meta = {}
-        self.title = ""
-        self.in_title = False
-        self.json_ld = []
-
-    def handle_starttag(self, tag, attrs):
-        attrs = dict(attrs)
-        if tag == "meta":
-            key = (attrs.get("property") or attrs.get("name") or "").lower()
-            value = attrs.get("content", "")
-            if key and value:
-                self.meta.setdefault(key, value)
-        elif tag == "title":
-            self.in_title = True
-        elif tag == "script" and attrs.get("type") == "application/ld+json":
-            self.json_ld.append("")
-
-    def handle_data(self, data):
-        if self.in_title:
-            self.title += data
-
-    def handle_endtag(self, tag):
-        if tag == "title":
-            self.in_title = False
 
 
 def source_from_url(url: str) -> dict:
@@ -86,37 +56,36 @@ def _get(url: str) -> bytes:
 
 
 def fetch_url_metadata(url: str) -> dict:
-    """Best-effort: sites may reject requests or change their HTML at any time."""
+    """Best-effort lookup; a failed request never means the story URL is invalid."""
     info = source_from_url(url)
     try:
         raw = _get(info["source_url"]).decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        if exc.code == 525:
+            detail = "The website's Cloudflare gateway reported an SSL handshake failure (HTTP 525)."
+        elif exc.code in (403, 429, 520, 521, 522, 523, 524, 526):
+            detail = f"The website could not serve this automated request (HTTP {exc.code})."
+        else:
+            raise ValueError(f"Story server returned HTTP {exc.code}.") from exc
+        raise ValueError(
+            detail + " Open the story in your browser, save it as HTML, "
+            "then choose 'Import saved page'."
+        ) from exc
     except (urllib.error.URLError, TimeoutError) as exc:
-        raise ValueError(f"Could not access this story: {exc}") from exc
-    parser = MetaParser()
-    parser.feed(raw)
-    title = parser.meta.get("og:title") or parser.meta.get("twitter:title") or parser.title
-    title = html.unescape(re.sub(r"\s+", " ", title)).strip()
-    title = re.sub(r"\s*[-|]\s*(Archive of Our Own|FanFiction|Royal Road|Scribble Hub|SpaceBattles Forums).*$",
-                   "", title, flags=re.IGNORECASE).strip()
-    if not title:
-        raise ValueError("No title could be extracted; enter this work manually.")
-    info["title"] = title
-    info["description"] = html.unescape(re.sub(r"<[^>]+>", "", parser.meta.get(
-        "og:description") or parser.meta.get("description") or "")).strip()
-    info["author"] = parser.meta.get("author", "").strip()
-    image = parser.meta.get("og:image", "")
-    if image.startswith("https://"):
-        info["cover_url"] = image
-    # AO3 pages usually provide the byline; avoid guessing if unavailable.
-    if info["source_site"] == "AO3" and not info["author"]:
-        match = re.search(r'<a[^>]*rel=["\']author["\'][^>]*>(.*?)</a>', raw, re.DOTALL | re.IGNORECASE)
-        if match:
-            info["author"] = html.unescape(re.sub(r"<[^>]+>", "", match.group(1))).strip()
-    if info["source_site"] == "FanFiction.net" and not info["author"]:
-        match = re.search(r'<a[^>]+href=["\']/u/\d+[^>]*>(.*?)</a>', raw, re.DOTALL | re.IGNORECASE)
-        if match:
-            info["author"] = html.unescape(re.sub(r"<[^>]+>", "", match.group(1))).strip()
-    return info
+        raise ValueError(
+            "The story website could not be reached or timed out. "
+            "Open it in your browser, save the page as HTML, then use 'Import saved page'."
+        ) from exc
+    return parse_story_html(raw, info)
+
+
+def fetch_saved_page_metadata(path: str | Path, story_url: str) -> dict:
+    """Parse a browser-saved HTML document locally; never upload its contents."""
+    source = source_from_url(story_url)
+    path = Path(path)
+    if path.stat().st_size > 8_000_000:
+        raise ValueError("Saved HTML exceeds the 8 MB import limit.")
+    return parse_story_html(path.read_text(encoding="utf-8-sig", errors="replace"), source)
 
 
 def openlibrary_lookup(query: str) -> list[dict]:
