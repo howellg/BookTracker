@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import uuid
 from contextlib import contextmanager
@@ -27,6 +28,16 @@ def now() -> str:
 
 def new_id() -> str:
     return str(uuid.uuid4())
+
+
+def _book_identity(value: str) -> str:
+    """Basic normalized title/author comparison; does not combine different volumes."""
+    words = re.findall(r"[^\W_]+", str(value).casefold(), flags=re.UNICODE)
+    if len(words) > 1 and words[0] in ("the", "a", "an"):
+        words = words[1:]
+    return " ".join(words)
+
+
 
 
 class Library:
@@ -350,6 +361,101 @@ class Library:
             if row:
                 return row["id"]
         return None
+
+    def bulk_add_works(
+        self, books: list[dict], *, status: str = "completed",
+        update_existing_status: bool = False,
+    ) -> dict:
+        """Atomically import books, matching across catalog sources and editions.
+
+        Historical completion timestamps remain unknown. By default, existing
+        books and all their reading history stay untouched. An explicit opt-in
+        upgrades existing unread (planned/dropped) matches to Completed, without
+        fabricating a completed reading run or losing personal metadata.
+        """
+        if status not in ("completed", "plan_to_read"):
+            raise ValueError("Bulk additions must be Completed or Plan to read.")
+        if not isinstance(books, list):
+            raise ValueError("Books must be a list.")
+        if len(books) > 500:
+            raise ValueError("Please import no more than 500 works at once.")
+
+        added, updated, duplicates = [], [], []
+        with self.transaction():
+            existing = list(self.db.execute(
+                "SELECT id,title,author,status,isbn,source_site,source_id,source_url FROM works"
+            ))
+            by_name = {
+                (_book_identity(row["title"]), _book_identity(row["author"])): row["id"]
+                for row in existing if row["title"] and row["author"]
+            }
+            by_isbn = {row["isbn"]: row["id"] for row in existing if row["isbn"]}
+            by_site = {
+                (row["source_site"], row["source_id"]): row["id"]
+                for row in existing if row["source_site"] and row["source_id"]
+            }
+            by_url = {row["source_url"]: row["id"] for row in existing if row["source_url"]}
+            statuses = {row["id"]: row["status"] for row in existing}
+
+            for data in books:
+                if not isinstance(data, dict):
+                    raise ValueError("Each book must be an object.")
+                fields = self._clean(data)
+                if not fields.get("title"):
+                    raise ValueError("Every imported book needs a title.")
+                fields["status"] = status
+                key = (_book_identity(fields["title"]), _book_identity(fields.get("author", "")))
+                isbn = fields.get("isbn", "")
+                site_id = (fields.get("source_site", ""), fields.get("source_id", ""))
+                url = fields.get("source_url", "")
+
+                # Existing match may be from a different provider or ISBN.
+                existing_id = (
+                    (by_name.get(key) if key[1] else None)
+                    or (by_isbn.get(isbn) if isbn else None)
+                    or (by_site.get(site_id) if all(site_id) else None)
+                    or (by_url.get(url) if url else None)
+                )
+                if existing_id:
+                    if (
+                        update_existing_status and status == "completed"
+                        and statuses.get(existing_id) in ("plan_to_read", "dropped")
+                    ):
+                        self.db.execute(
+                            "UPDATE works SET status='completed',updated_at=? WHERE id=?",
+                            (now(), existing_id),
+                        )
+                        statuses[existing_id] = "completed"
+                        updated.append(existing_id)
+                    else:
+                        duplicates.append(fields["title"])
+                    continue
+
+                timestamp = now()
+                fields.update(id=new_id(), added_at=timestamp, updated_at=timestamp)
+                cols = ",".join(fields)
+                self.db.execute(
+                    f"INSERT INTO works ({cols}) VALUES ({','.join('?' for _ in fields)})",
+                    tuple(fields.values()),
+                )
+                added.append(fields["id"])
+                statuses[fields["id"]] = status
+                if key[1]:
+                    by_name[key] = fields["id"]
+                if isbn:
+                    by_isbn[isbn] = fields["id"]
+                if all(site_id):
+                    by_site[site_id] = fields["id"]
+                if url:
+                    by_url[url] = fields["id"]
+                # No invented reading run, start or finish date.
+
+        return {
+            "added": len(added), "updated": len(updated),
+            "skipped": len(duplicates),
+            "added_ids": added, "updated_ids": updated,
+            "skipped_titles": duplicates,
+        }
 
     def export_data(self):
         return {"format": "booktracker", "schema_version": 1, "exported_at": now(),

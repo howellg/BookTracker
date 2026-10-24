@@ -13,7 +13,11 @@ Built with Python, PySide6, and SQLite. No account, cloud subscription, or alway
 - Search titles, authors, fandoms, series and tags; filter by type, reading status and favorites.
 - Store personal star ratings (0.5 increments), notes, publication status, word counts, source URLs and more.
 - Import a **Goodreads library CSV** (from Goodreads → My Books → Import and export).
-- Search traditional books **inside + Add Work** by title, author or ISBN, using Open Library and Google Books. Compare catalog results, cover art (when available), page counts and publication years; choose **Add to library** or **Review details**. No API key required.
+- Search by **title/ISBN or author** from **+ Add work → Find online**. Author search returns many matching works, with checkboxes and an **Add N selected** action.
+- Paste a list of book titles using **+ Add work → Paste titles**. Enter an author once and import every pasted line as a book, even when catalog services are unavailable.
+- Import checked books as **Completed (date unknown)** or **Plan to read**. Existing titles and cross-provider duplicate editions are skipped without changing previous reading history.
+- Show cover thumbnails in the library and larger covers in each work's details. Covers are cached on disk for offline use.
+- Enrich public metadata where available, including pages, year, ISBN, genre/subject tags, language and a description. Existing books have a **Fill missing metadata / cover** button.
 - Cache successful public book searches locally for 12 hours, reducing API requests and allowing previously searched titles to be viewed if the catalogs temporarily go offline.
 - Paste story URLs for *best-effort* metadata extraction from AO3, FanFiction.net, Royal Road, Scribble Hub, SpaceBattles, and Sufficient Velocity.
 - When a website blocks automated requests, **import HTML saved from your browser** to fill in title, author, and (for AO3) tags, chapters, word count and fandom, without uploading the file.
@@ -52,14 +56,15 @@ The database is stored in your OS's user-data directory (platformdirs), not insi
 
 ## First steps
 
-1. Click **+ Add work**. It opens on the **Find online** tab.
-2. Type a title such as **Way of Kings**, an author's name, or an ISBN; press **Enter** or click **Search books**.
-3. Select a search result to see the author, edition, pages and cover (when available). Click **Add to library** to save it immediately with status **Plan to read**, or **Review details** to set a different status and edit metadata first.
-4. For a serialized work or a completely custom book, use the **Book & source** tab. Paste an HTTPS story URL and click **Fetch from URL**, or enter a manual title. The application identifies supported story sites and work IDs even if retrieval fails.
-5. **If a story lookup fails:** Open that story in Firefox, press **Ctrl+S**, and save as **Web Page, HTML Only**. Back in BookTracker, leave the story URL in place and click **Import saved page…** to select the saved HTML. This is especially helpful for AO3, where Cloudflare may reject direct requests. You can also enter the title manually.
-6. Select a work and click **Log progress**. Enter the **chapter/page reached**, not the number read in that session. Each change becomes a dated history event.
-7. Use **Mark caught up** for ongoing serials you've reached the latest chapter; **Mark completed** for a finished read; **Start a reread** to begin a new reading run.
-8. Use **Import library** / **Export library** in the sidebar to move reading history between computers.
+1. Click **+ Add work** and open **Find online**.
+2. To bulk-add one author, choose **Author** from the search selector, type **Brandon Sanderson**, and click **Search books**. Check the titles you read, or use **Select all results**. Choose **Completed (date unknown)** or **Plan to read** and click **Add N selected**. Optionally check **Also mark matching existing unread books completed** if you want the books already in your library updated too. You can review each edition before checking it.
+3. To import one book, use **Title / ISBN**, select a result and choose **Add to library** or **Review details**.
+4. If the catalog sites are down, choose the **Paste titles** tab. Enter **Brandon Sanderson** once, paste several titles (one per line), and click **Add all pasted titles**. These are manual entries without automatically fetched metadata.
+5. For a serialized work or a completely custom book, use the **Book & source** tab. Paste an HTTPS story URL and click **Fetch from URL**, or enter a manual title. The application identifies supported story sites and work IDs even if retrieval fails.
+6. **If a story lookup fails:** Open that story in Firefox, press **Ctrl+S**, and save as **Web Page, HTML Only**. Back in BookTracker, leave the story URL in place and click **Import saved page…** to select the saved HTML. This is especially helpful for AO3, where Cloudflare may reject direct requests. You can also enter the title manually.
+7. Select a work and click **Log progress**. Enter the **chapter/page reached**, not the number read in that session. Each change becomes a dated history event.
+8. Use **Mark caught up** for ongoing serials you've reached the latest chapter; **Mark completed** for a finished read; **Start a reread** to begin a new reading run.
+9. Use **Import library** / **Export library** in the sidebar to move reading history between computers.
 
 For existing Goodreads history, use **File → Import Goodreads CSV**. It imports Goodreads shelves and ratings; it does not create a detailed historical progress log that Goodreads never exported.
 
@@ -80,7 +85,7 @@ The SQLite database is another valid local backup, but copy it while BookTracker
 
 The website importer uses public HTML metadata on a **best-effort** basis, without logging in, bypassing bot protection, or requesting hidden content. For browser-saved HTML, the parser works locally: the page contents are never transmitted anywhere. AO3 and other sites may require login, show age gates, rate-limit requests, or change their markup; the import will then fail gracefully and manual entry is available. Only approved HTTPS hostnames are fetched.
 
-Goodreads has no generally available new public API access; BookTracker supports its user-exported CSV instead. The built-in title search uses the public Open Library and Google Books catalogs. New searches require an internet connection and may be rate-limited or temporarily unavailable. If one provider fails, the application still shows results from the other. Successful search results are cached on your computer for 12 hours and can also serve as a fallback during a temporary outage. Saved metadata and reading history remain local.
+Goodreads has no generally available new public API access; BookTracker supports its user-exported CSV instead. The built-in title search uses the public Open Library and Google Books catalogs. New searches require an internet connection and may be rate-limited or temporarily unavailable; the Paste titles tab always works offline. If one provider fails, the application still shows results from the other. Successful search results are cached on your computer for 12 hours and can also serve as a fallback during a temporary outage. Saved metadata and reading history remain local.
 
 **Current scope:** This release is a reading-history tracker, not a downloader, e-reader, chapter-notification service, or background story crawler.
 
@@ -92,11 +97,15 @@ Goodreads has no generally available new public API access; BookTracker supports
 
 To run a minimal GUI smoke test without a display on CI, set QT_QPA_PLATFORM=offscreen.
 
+**Catalog metadata limits:** Public book catalogs can sometimes supply an ISBN, page count, cover, subjects and description, but not necessarily all of them. They do **not** know your personal rating, notes, original completion date, or reading status. Bulk marking books completed deliberately leaves the historical finish date unknown rather than recording today. For books already in your library, select one and click **Fill missing metadata / cover**; personal data isn't overwritten.
+
 Project layout:
 
 - booktracker/database.py — data model, reading runs, progress and merge logic
 - booktracker/integrations.py — Open Library/story metadata, Goodreads CSV, JSON/XML/CSV
-- booktracker/book_search.py — multi-provider public book catalog search and ranking
+- booktracker/book_search.py — title/author catalog search and caching
+- booktracker/covers.py — async disk-cached cover thumbnails
+- booktracker/metadata.py — optional public metadata enrichment
 - booktracker/gui.py — Qt desktop application
 - tests/ — database and portability regression tests
 

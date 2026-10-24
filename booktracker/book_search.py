@@ -21,7 +21,7 @@ from pathlib import Path
 from bs4 import BeautifulSoup
 from platformdirs import user_cache_dir
 
-from .integrations import _get, openlibrary_lookup
+from .integrations import _get, openlibrary_author_lookup, openlibrary_lookup
 
 MAX_QUERY_LENGTH = 160
 MAX_PER_PROVIDER = 12
@@ -105,6 +105,7 @@ def parse_google_books(payload: dict) -> list[dict]:
                 str(volume_id), safe=""
             ),
             "cover_url": _google_cover(info.get("imageLinks") or {}),
+            "tags": [str(x) for x in (info.get("categories") or [])][:12],
             "publisher": info.get("publisher") or "",  # display-only
             "edition_label": info.get("publishedDate") or "",
         })
@@ -124,7 +125,27 @@ def google_books_lookup(query: str) -> list[dict]:
     return parse_google_books(payload)
 
 
-def search_book_catalogs(query: str) -> dict:
+def google_books_author_lookup(author: str) -> list[dict]:
+    """Author-specific catalog query, fetching at most 40 results per request."""
+    params = urllib.parse.urlencode({
+        "q": f"inauthor:{author}", "maxResults": 40,
+        "printType": "books", "orderBy": "relevance",
+    })
+    try:
+        payload = json.loads(_get("https://www.googleapis.com/books/v1/volumes?" + params))
+    except (urllib.error.URLError, TimeoutError, ValueError) as exc:
+        raise ValueError(f"Google Books author lookup failed: {exc}") from exc
+    return parse_google_books(payload)
+
+
+def _author_matches(author_query: str, result: dict) -> bool:
+    query_tokens = set(_normalize(author_query).split())
+    candidate_tokens = set(_normalize(result.get("author") or "").split())
+    # Reject biographies written by other people or unrelated search results.
+    return bool(query_tokens) and query_tokens.issubset(candidate_tokens)
+
+
+def search_book_catalogs(query: str, *, mode: str = "title") -> dict:
     """Search both catalogs; return partial results and provider warnings.
 
     Result format: {"results": [...], "errors": [...]}.
@@ -137,9 +158,11 @@ def search_book_catalogs(query: str) -> dict:
     if len(query) > MAX_QUERY_LENGTH:
         raise ValueError(f"Search terms must be under {MAX_QUERY_LENGTH} characters.")
 
+    if mode not in ("title", "author"):
+        raise ValueError("Choose Title/ISBN or Author search mode.")
     provider_calls = (
-        ("Open Library", openlibrary_lookup),
-        ("Google Books", google_books_lookup),
+        ("Open Library", openlibrary_author_lookup if mode == "author" else openlibrary_lookup),
+        ("Google Books", google_books_author_lookup if mode == "author" else google_books_lookup),
     )
     output = []
     errors = []
@@ -159,16 +182,27 @@ def search_book_catalogs(query: str) -> dict:
     unique = []
     for entry in output:
         key = (entry.get("source_site"), entry.get("source_id"))
-        if key in seen or _relevance(query, entry) < 45:
+        if key in seen:
+            continue
+        if mode == "author":
+            if not _author_matches(query, entry):
+                continue
+        elif _relevance(query, entry) < 45:
             continue
         seen.add(key)
         unique.append(entry)
-    unique.sort(key=lambda x: _relevance(query, x), reverse=True)
-    return {"results": unique[:24], "errors": errors}
+    if mode == "author":
+        # Searching an author's back catalog is about browsing, not relevance:
+        # prefer titled alphabetical results and retain up to 140 matches.
+        unique.sort(key=lambda x: (_normalize(x["title"]), -(x.get("edition_count") or 0)))
+    else:
+        unique.sort(key=lambda x: _relevance(query, x), reverse=True)
+    return {"results": unique[:140 if mode == "author" else 24], "errors": errors}
 
 
 def cached_book_search(
-    query: str, *, cache_root: str | Path | None = None, freshness_seconds: int = 12 * 3600
+    query: str, *, mode: str = "title", cache_root: str | Path | None = None,
+    freshness_seconds: int = 12 * 3600
 ) -> dict:
     """Search with a local, bounded-lifetime cache to avoid unnecessary API traffic.
 
@@ -179,14 +213,16 @@ def cached_book_search(
     query = query.strip()
     if not query or len(query) > MAX_QUERY_LENGTH:
         # Raise the same validation errors as the uncached search.
-        return search_book_catalogs(query)
+        return search_book_catalogs(query, mode=mode)
 
+    if mode not in ("title", "author"):
+        raise ValueError("Invalid search mode.")
     cache_dir = (
         Path(cache_root)
         if cache_root is not None
         else Path(user_cache_dir("BookTracker", "BookTracker")) / "book-search"
     )
-    cache_key = hashlib.sha256(_normalize(query).encode("utf-8")).hexdigest()
+    cache_key = hashlib.sha256(f"{mode}:{_normalize(query)}".encode()).hexdigest()
     path = cache_dir / f"{cache_key}.json"
     cached = None
     is_fresh = False
@@ -204,7 +240,10 @@ def cached_book_search(
     if cached is not None and is_fresh:
         return {"results": cached, "errors": [], "cached": True}
 
-    response = search_book_catalogs(query)
+    response = (
+        search_book_catalogs(query) if mode == "title"
+        else search_book_catalogs(query, mode="author")
+    )
     if response["results"]:
         try:
             cache_dir.mkdir(parents=True, exist_ok=True)

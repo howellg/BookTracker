@@ -51,7 +51,7 @@ def test_search_results_and_review(app):
 
     editor.use_online_result()
     values = editor.values()
-    assert editor.tabs.currentIndex() == 1
+    assert editor.tabs.currentIndex() == 2
     assert values["title"] == "The Way of Kings"
     assert values["author"] == "Brandon Sanderson"
     assert values["progress_unit"] == "pages"
@@ -75,7 +75,7 @@ def test_find_online_button_from_details_tab(app):
     editor.tabs.setCurrentIndex(1)
     editor.title.setText("A sample search")
     editor.lookup_books = lambda: None  # avoid live network in this focused GUI test
-    assert editor.tabs.tabText(1) == "Book & source"
+    assert editor.tabs.tabText(2) == "Book & source"
     editor.close()
 
 
