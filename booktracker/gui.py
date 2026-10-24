@@ -40,10 +40,12 @@ from PySide6.QtWidgets import (
 from .database import KINDS, PUBLICATION, STATUSES, UNITS, Library
 from .integrations import (
     export_file,
+    fetch_saved_page_metadata,
     fetch_url_metadata,
     import_file,
     import_goodreads,
     openlibrary_lookup,
+    source_from_url,
 )
 
 LABELS = {
@@ -60,6 +62,8 @@ ACCENT = "#7bb6ff"
 STYLE = """
 QWidget { color: #e7eef9; font-family: 'Inter', 'Noto Sans', sans-serif; font-size: 13px; }
 QMainWindow, QDialog { background: #10151f; }
+QWidget#editorPage { background: #192231; }
+QTabWidget::pane { background: #192231; border: 1px solid #34445a; border-radius: 7px; }
 QFrame#side, QFrame#details, QFrame#statCard { background: #192231; border-radius: 12px; }
 QLabel#headline { font-size: 25px; font-weight: 700; }
 QLabel#subheading { font-size: 16px; font-weight: 650; }
@@ -140,19 +144,34 @@ class WorkEditor(QDialog):
     def __init__(self, parent=None, work=None):
         super().__init__(parent)
         self.setWindowTitle("Edit work" if work else "Add a work")
-        self.resize(690, 730)
+        self.resize(745, 595)
+        self.setMinimumSize(600, 490)
         self.work = work or {}
         self.source_id = self.work.get("source_id", "")
         self.cover_url = self.work.get("cover_url", "")
         self.lookup_thread = None
+
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 14)
+        layout.setSpacing(12)
+        intro = label("Add a story or book" if not work else "Edit book details", "subheading")
+        layout.addWidget(intro)
         tabs = QTabWidget()
-        layout.addWidget(tabs)
-        page1, page2 = QWidget(), QWidget()
-        tabs.addTab(page1, "Book details")
-        tabs.addTab(page2, "Notes & tags")
-        form = QFormLayout(page1)
-        form.setSpacing(12)
+        layout.addWidget(tabs, stretch=1)
+
+        basic, extras, notes_page = QWidget(), QWidget(), QWidget()
+        for page in (basic, extras, notes_page):
+            page.setObjectName("editorPage")
+        tabs.addTab(basic, "Book & source")
+        tabs.addTab(extras, "More details")
+        tabs.addTab(notes_page, "Notes & tags")
+        form = QFormLayout(basic)
+        form.setSpacing(10)
+        more = QFormLayout(extras)
+        more.setSpacing(10)
+
+        self.source_url = QLineEdit(self.work.get("source_url", ""))
+        self.source_url.setPlaceholderText("Paste a story link, or leave blank for manual entries")
         self.title = QLineEdit(self.work.get("title", ""))
         self.title.setPlaceholderText("Title (required)")
         self.author = QLineEdit(self.work.get("author", ""))
@@ -175,53 +194,78 @@ class WorkEditor(QDialog):
         self.fandom = QLineEdit(self.work.get("fandom", ""))
         self.series = QLineEdit(self.work.get("series", ""))
         self.source_site = QLineEdit(self.work.get("source_site", ""))
-        self.source_url = QLineEdit(self.work.get("source_url", ""))
-        self.source_url.setPlaceholderText("https://...")
         self.isbn = QLineEdit(self.work.get("isbn", ""))
+        self.language = QLineEdit(self.work.get("language", ""))
         self.favorite = QCheckBox("Favorite")
         self.favorite.setChecked(bool(self.work.get("favorite")))
         self.published = QLineEdit(self.work.get("published_at", ""))
         self.published.setPlaceholderText("YYYY or YYYY-MM-DD")
         self.started = QLineEdit(self.work.get("started_at", ""))
-        self.started.setPlaceholderText("Optional ISO date (YYYY-MM-DD)")
+        self.started.setPlaceholderText("Optional date: YYYY-MM-DD")
         self.finished = QLineEdit(self.work.get("finished_at", ""))
-        self.finished.setPlaceholderText("Optional ISO date (YYYY-MM-DD)")
+        self.finished.setPlaceholderText("Optional date: YYYY-MM-DD")
+
+        form.addRow("Story/book URL", self.source_url)
+        lookups = QHBoxLayout()
+        lookups.setSpacing(7)
+        self.url_button = button("Fetch from URL", self.lookup_url)
+        self.saved_button = button("Import saved page…", self.import_saved_page)
+        self.search_button = button("Search Open Library", self.lookup_books)
+        lookups.addWidget(self.url_button)
+        lookups.addWidget(self.saved_button)
+        lookups.addWidget(self.search_button)
+        form.addRow("Auto-fill", lookups)
         for heading, control in (
-            ("Title", self.title), ("Author", self.author), ("Type", self.kind),
-            ("Reading status", self.status), ("Publication", self.publication),
-            ("Progress unit", self.unit), ("Published units", self.total),
-            ("Word count", self.words), ("Rating", self.rating),
-            ("Fandom", self.fandom), ("Series", self.series),
-            ("Source website", self.source_site), ("Original URL", self.source_url),
-            ("ISBN", self.isbn), ("Published date", self.published),
-            ("Started date", self.started), ("Finished date", self.finished),
+            ("Title", self.title),
+            ("Author", self.author),
+            ("Type", self.kind),
+            ("Reading status", self.status),
+            ("Progress unit", self.unit),
+            ("Published chapters/pages", self.total),
             ("", self.favorite),
         ):
             form.addRow(heading, control)
-        lookups = QHBoxLayout()
-        self.url_button = button("Get metadata from URL", self.lookup_url)
-        self.search_button = button("Search Open Library", self.lookup_books)
-        lookups.addWidget(self.url_button)
-        lookups.addWidget(self.search_button)
-        form.addRow("Auto-fill", lookups)
 
-        second = QFormLayout(page2)
-        self.tags = QLineEdit(", ".join(self.work.get("tags") or []))
-        self.tags.setPlaceholderText("Fantasy, LitRPG, favorites...")
+        for heading, control in (
+            ("Publication status", self.publication),
+            ("Word count", self.words),
+            ("Rating", self.rating),
+            ("Fandom", self.fandom),
+            ("Series", self.series),
+            ("Source website", self.source_site),
+            ("ISBN", self.isbn),
+            ("Language", self.language),
+            ("Published date", self.published),
+            ("Started date", self.started),
+            ("Finished date", self.finished),
+        ):
+            more.addRow(heading, control)
+
+        note_form = QFormLayout(notes_page)
+        note_form.setSpacing(10)
+        self.tags = QTextEdit("\n".join(self.work.get("tags") or []))
+        self.tags.setPlaceholderText("One tag per line (commas within tags are preserved)")
+        self.tags.setMinimumHeight(105)
         self.notes = QTextEdit(self.work.get("notes", ""))
-        self.notes.setMinimumHeight(150)
+        self.notes.setMinimumHeight(140)
         self.description = QTextEdit(self.work.get("description", ""))
         self.description.setMinimumHeight(140)
-        second.addRow("Tags", self.tags)
-        second.addRow("Personal notes", self.notes)
-        second.addRow("Description", self.description)
-        self.feedback = label("Metadata lookups are optional. Review results before saving.", "muted")
+        note_form.addRow("Tags", self.tags)
+        note_form.addRow("Personal notes", self.notes)
+        note_form.addRow("Description", self.description)
+
+        self.feedback = label(
+            "Paste a URL to identify its source. If a site blocks automatic access, "
+            "save the page from your browser and choose Import saved page.", "muted"
+        )
         layout.addWidget(self.feedback)
-        actions = QDialogButtonBox(QDialogButtonBox.StandardButton.Save |
-                                   QDialogButtonBox.StandardButton.Cancel)
+        actions = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
+        )
         actions.accepted.connect(self.validate_and_accept)
         actions.rejected.connect(self.reject)
         layout.addWidget(actions)
+        self.source_url.textChanged.connect(self.source_changed)
 
     @staticmethod
     def combo(choices, selected):
@@ -233,6 +277,13 @@ class WorkEditor(QDialog):
         return widget
 
     def values(self):
+        # Every saved recognized URL gets a stable site/work ID even if
+        # the metadata request timed out or was blocked by Cloudflare.
+        url = self.source_url.text().strip()
+        try:
+            source = source_from_url(url)
+        except ValueError:
+            source = {}
         return {
             "title": self.title.text().strip(),
             "author": self.author.text().strip(),
@@ -242,14 +293,15 @@ class WorkEditor(QDialog):
             "total_units": self.total.value(), "word_count": self.words.value(),
             "rating": self.rating.value() or None,
             "fandom": self.fandom.text().strip(), "series": self.series.text().strip(),
-            "source_site": self.source_site.text().strip(),
-            "source_url": self.source_url.text().strip(),
-            "source_id": self.source_id,
+            "source_site": source.get("source_site") or self.source_site.text().strip(),
+            "source_url": url,
+            "source_id": source.get("source_id") or self.source_id,
             "cover_url": self.cover_url,
+            "language": self.language.text().strip(),
             "isbn": self.isbn.text().strip(), "favorite": self.favorite.isChecked(),
             "published_at": self.published.text().strip(),
             "started_at": self.started.text().strip(), "finished_at": self.finished.text().strip(),
-            "tags": [t.strip() for t in self.tags.text().split(",") if t.strip()],
+            "tags": [t.strip() for t in self.tags.toPlainText().splitlines() if t.strip()],
             "notes": self.notes.toPlainText().strip(),
             "description": self.description.toPlainText().strip(),
         }
@@ -261,29 +313,54 @@ class WorkEditor(QDialog):
             return
         self.accept()
 
+    def source_changed(self, url):
+        self.source_id = ""
+        if url.strip() == self.work.get("source_url"):
+            self.source_id = self.work.get("source_id", "")
+        try:
+            info = source_from_url(url)
+        except ValueError:
+            return
+        self.source_id = info["source_id"]
+        self.source_site.setText(info["source_site"])
+        ix = self.kind.findData(info["kind"])
+        if ix >= 0:
+            self.kind.setCurrentIndex(ix)
+        self.feedback.setText(
+            f"Recognized {info['source_site']} work #{info['source_id']}. "
+            "You can save with a manual title if the lookup is unavailable."
+        )
+
     def fill_metadata(self, info):
-        self.source_id = info.get("source_id", "")
-        self.cover_url = info.get("cover_url", "")
         for attr, key in ((self.title, "title"), (self.author, "author"),
                           (self.fandom, "fandom"), (self.source_site, "source_site"),
                           (self.source_url, "source_url"), (self.isbn, "isbn"),
-                          (self.published, "published_at")):
+                          (self.published, "published_at"), (self.language, "language")):
             if info.get(key):
                 attr.setText(str(info[key]))
+        self.source_id = info.get("source_id", "")
+        self.cover_url = info.get("cover_url", "")
         if info.get("description"):
             self.description.setPlainText(info["description"])
-        for attr, key in ((self.kind, "kind"), (self.unit, "progress_unit")):
+        if info.get("tags"):
+            current = [t.strip() for t in self.tags.toPlainText().splitlines() if t.strip()]
+            self.tags.setPlainText("\n".join(dict.fromkeys(current + info["tags"])))
+        for attr, key in ((self.kind, "kind"), (self.unit, "progress_unit"),
+                          (self.publication, "publication_status")):
             ix = attr.findData(info.get(key))
             if ix >= 0:
                 attr.setCurrentIndex(ix)
         if info.get("total_units"):
             self.total.setValue(info["total_units"])
-        self.feedback.setText("Metadata loaded. Review and save to add it.")
+        if info.get("word_count"):
+            self.words.setValue(info["word_count"])
+        self.feedback.setText("Metadata loaded. Check the details and save when ready.")
 
     def run_lookup(self, func, arg, callback):
         if self.lookup_thread and self.lookup_thread.isRunning():
             return
         self.url_button.setEnabled(False)
+        self.saved_button.setEnabled(False)
         self.search_button.setEnabled(False)
         self.feedback.setText("Looking up metadata…")
         thread = LookupThread(func, arg)
@@ -291,15 +368,44 @@ class WorkEditor(QDialog):
         thread.found.connect(callback)
         thread.failed.connect(lambda message: self.feedback.setText("Lookup failed: " + message))
         thread.finished.connect(lambda: self.url_button.setEnabled(True))
+        thread.finished.connect(lambda: self.saved_button.setEnabled(True))
         thread.finished.connect(lambda: self.search_button.setEnabled(True))
         thread.start()
 
     def lookup_url(self):
         url = self.source_url.text().strip()
         if not url:
-            QMessageBox.information(self, "Paste a link", "Enter a story URL in Original URL first.")
+            QMessageBox.information(self, "Paste a link", "Enter a story URL first.")
+            return
+        try:
+            source_from_url(url)
+        except ValueError as exc:
+            self.feedback.setText(str(exc))
             return
         self.run_lookup(fetch_url_metadata, url, self.fill_metadata)
+
+    def import_saved_page(self):
+        url = self.source_url.text().strip()
+        if not url:
+            QMessageBox.information(
+                self, "Story URL required", "Paste the original story URL first, "
+                "then select the HTML file saved from your browser."
+            )
+            return
+        try:
+            source_from_url(url)
+        except ValueError as exc:
+            self.feedback.setText(str(exc))
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select saved story page", "", "HTML pages (*.html *.htm)"
+        )
+        if not path:
+            return
+        try:
+            self.fill_metadata(fetch_saved_page_metadata(path, url))
+        except (OSError, ValueError) as exc:
+            self.feedback.setText(f"Saved page import failed: {exc}")
 
     def lookup_books(self):
         query = self.title.text().strip() or self.isbn.text().strip()
