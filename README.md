@@ -13,7 +13,8 @@ Built with Python, PySide6, and SQLite. No account, cloud subscription, or alway
 - Search titles, authors, fandoms, series and tags; filter by type, reading status and favorites.
 - Store personal star ratings (0.5 increments), notes, publication status, word counts, source URLs and more.
 - Import a **Goodreads library CSV** (from Goodreads → My Books → Import and export).
-- Look up regular-book metadata via the public **Open Library** search API (title/ISBN).
+- Search traditional books **inside + Add Work** by title, author or ISBN, using Open Library and Google Books. Compare catalog results, cover art (when available), page counts and publication years; choose **Add to library** or **Review details**. No API key required.
+- Cache successful public book searches locally for 12 hours, reducing API requests and allowing previously searched titles to be viewed if the catalogs temporarily go offline.
 - Paste story URLs for *best-effort* metadata extraction from AO3, FanFiction.net, Royal Road, Scribble Hub, SpaceBattles, and Sufficient Velocity.
 - When a website blocks automated requests, **import HTML saved from your browser** to fill in title, author, and (for AO3) tags, chapters, word count and fandom, without uploading the file.
 - Export and import **JSON/XML full backups**, preserving the books, reading runs and progress events across computers.
@@ -51,13 +52,14 @@ The database is stored in your OS's user-data directory (platformdirs), not insi
 
 ## First steps
 
-1. Click **+ Add work**. Enter a title and author; select Book, Fanfiction or Web novel. You can leave metadata blank.
-2. To auto-fill a regular book, enter its title/ISBN and click **Search Open Library**, then select a result.
-3. For a serialized work, paste its HTTPS story URL in **Story/book URL** and click **Fetch from URL**. Confirm the extracted details before saving. The application identifies the site and work ID even if the request fails.
-4. **If a story lookup fails:** Open that story in Firefox, press **Ctrl+S**, and save as **Web Page, HTML Only**. Back in BookTracker, leave the story URL in place and click **Import saved page…** to select the saved HTML. This is especially helpful for AO3, where Cloudflare may reject direct requests. You can also enter the title manually.
-5. Select a work and click **Log progress**. Enter the **chapter/page reached**, not the number read in that session. Each change becomes a dated history event.
-6. Use **Mark caught up** for ongoing serials you've reached the latest chapter; **Mark completed** for a finished read; **Start a reread** to begin a new reading run.
-7. Use **Import library** / **Export library** in the sidebar to move reading history between computers.
+1. Click **+ Add work**. It opens on the **Find online** tab.
+2. Type a title such as **Way of Kings**, an author's name, or an ISBN; press **Enter** or click **Search books**.
+3. Select a search result to see the author, edition, pages and cover (when available). Click **Add to library** to save it immediately with status **Plan to read**, or **Review details** to set a different status and edit metadata first.
+4. For a serialized work or a completely custom book, use the **Book & source** tab. Paste an HTTPS story URL and click **Fetch from URL**, or enter a manual title. The application identifies supported story sites and work IDs even if retrieval fails.
+5. **If a story lookup fails:** Open that story in Firefox, press **Ctrl+S**, and save as **Web Page, HTML Only**. Back in BookTracker, leave the story URL in place and click **Import saved page…** to select the saved HTML. This is especially helpful for AO3, where Cloudflare may reject direct requests. You can also enter the title manually.
+6. Select a work and click **Log progress**. Enter the **chapter/page reached**, not the number read in that session. Each change becomes a dated history event.
+7. Use **Mark caught up** for ongoing serials you've reached the latest chapter; **Mark completed** for a finished read; **Start a reread** to begin a new reading run.
+8. Use **Import library** / **Export library** in the sidebar to move reading history between computers.
 
 For existing Goodreads history, use **File → Import Goodreads CSV**. It imports Goodreads shelves and ratings; it does not create a detailed historical progress log that Goodreads never exported.
 
@@ -78,7 +80,7 @@ The SQLite database is another valid local backup, but copy it while BookTracker
 
 The website importer uses public HTML metadata on a **best-effort** basis, without logging in, bypassing bot protection, or requesting hidden content. For browser-saved HTML, the parser works locally: the page contents are never transmitted anywhere. AO3 and other sites may require login, show age gates, rate-limit requests, or change their markup; the import will then fail gracefully and manual entry is available. Only approved HTTPS hostnames are fetched.
 
-Goodreads has no generally available new public API access; BookTracker supports its user-exported CSV instead. Open Library is used for ordinary-book metadata.
+Goodreads has no generally available new public API access; BookTracker supports its user-exported CSV instead. The built-in title search uses the public Open Library and Google Books catalogs. New searches require an internet connection and may be rate-limited or temporarily unavailable. If one provider fails, the application still shows results from the other. Successful search results are cached on your computer for 12 hours and can also serve as a fallback during a temporary outage. Saved metadata and reading history remain local.
 
 **Current scope:** This release is a reading-history tracker, not a downloader, e-reader, chapter-notification service, or background story crawler.
 
@@ -94,6 +96,7 @@ Project layout:
 
 - booktracker/database.py — data model, reading runs, progress and merge logic
 - booktracker/integrations.py — Open Library/story metadata, Goodreads CSV, JSON/XML/CSV
+- booktracker/book_search.py — multi-provider public book catalog search and ranking
 - booktracker/gui.py — Qt desktop application
 - tests/ — database and portability regression tests
 

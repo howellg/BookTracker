@@ -112,6 +112,7 @@ def openlibrary_lookup(query: str) -> list[dict]:
             "author": ", ".join(doc.get("author_name", [])[:3]),
             "kind": "book", "progress_unit": "pages",
             "total_units": doc.get("number_of_pages_median") or 0,
+            "edition_count": doc.get("edition_count") or 0,  # search relevance only
             "isbn": isbn,
             "source_site": "Open Library",
             "source_url": "https://openlibrary.org" + doc["key"],

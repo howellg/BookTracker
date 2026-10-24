@@ -4,8 +4,9 @@ from __future__ import annotations
 import sys
 import webbrowser
 
-from PySide6.QtCore import Qt, QThread, Signal
-from PySide6.QtGui import QAction, QFont
+from PySide6.QtCore import Qt, QThread, QUrl, Signal
+from PySide6.QtGui import QAction, QFont, QPixmap
+from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -22,6 +23,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QPushButton,
@@ -37,6 +39,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .book_search import cached_book_search
 from .database import KINDS, PUBLICATION, STATUSES, UNITS, Library
 from .integrations import (
     export_file,
@@ -44,7 +47,6 @@ from .integrations import (
     fetch_url_metadata,
     import_file,
     import_goodreads,
-    openlibrary_lookup,
     source_from_url,
 )
 
@@ -65,6 +67,9 @@ QMainWindow, QDialog { background: #10151f; }
 QWidget#editorPage { background: #192231; }
 QTabWidget::pane { background: #192231; border: 1px solid #34445a; border-radius: 7px; }
 QFrame#side, QFrame#details, QFrame#statCard { background: #192231; border-radius: 12px; }
+QFrame#onlinePreview { background: #202c3c; border: 1px solid #34445a; border-radius: 10px; }
+QLabel#onlineCover { background: #2b3a4d; border-radius: 6px; color: #9ba9bf; }
+QListWidget#onlineResults::item { padding: 9px; }
 QLabel#headline { font-size: 25px; font-weight: 700; }
 QLabel#subheading { font-size: 16px; font-weight: 650; }
 QLabel#muted { color: #9ba9bf; }
@@ -144,12 +149,15 @@ class WorkEditor(QDialog):
     def __init__(self, parent=None, work=None):
         super().__init__(parent)
         self.setWindowTitle("Edit work" if work else "Add a work")
-        self.resize(745, 595)
-        self.setMinimumSize(600, 490)
+        self.resize(895, 640)
+        self.setMinimumSize(725, 520)
         self.work = work or {}
         self.source_id = self.work.get("source_id", "")
         self.cover_url = self.work.get("cover_url", "")
         self.lookup_thread = None
+        self.online_books = []
+        self.cover_network = QNetworkAccessManager(self)
+        self.cover_request_token = 0
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 16, 16, 14)
@@ -157,14 +165,19 @@ class WorkEditor(QDialog):
         intro = label("Add a story or book" if not work else "Edit book details", "subheading")
         layout.addWidget(intro)
         tabs = QTabWidget()
+        self.tabs = tabs
         layout.addWidget(tabs, stretch=1)
 
-        basic, extras, notes_page = QWidget(), QWidget(), QWidget()
-        for page in (basic, extras, notes_page):
+        online_page, basic, extras, notes_page = QWidget(), QWidget(), QWidget(), QWidget()
+        for page in (online_page, basic, extras, notes_page):
             page.setObjectName("editorPage")
+        tabs.addTab(online_page, "Find online")
         tabs.addTab(basic, "Book & source")
         tabs.addTab(extras, "More details")
         tabs.addTab(notes_page, "Notes & tags")
+        self.build_online_tab(online_page)
+        if work:
+            tabs.setCurrentWidget(basic)
         form = QFormLayout(basic)
         form.setSpacing(10)
         more = QFormLayout(extras)
@@ -210,7 +223,7 @@ class WorkEditor(QDialog):
         lookups.setSpacing(7)
         self.url_button = button("Fetch from URL", self.lookup_url)
         self.saved_button = button("Import saved page…", self.import_saved_page)
-        self.search_button = button("Search Open Library", self.lookup_books)
+        self.search_button = button("Find books online", self.lookup_books)
         lookups.addWidget(self.url_button)
         lookups.addWidget(self.saved_button)
         lookups.addWidget(self.search_button)
@@ -266,6 +279,208 @@ class WorkEditor(QDialog):
         actions.rejected.connect(self.reject)
         layout.addWidget(actions)
         self.source_url.textChanged.connect(self.source_changed)
+        if not work:
+            self.online_query.setFocus()
+
+    def build_online_tab(self, page):
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(14, 14, 14, 12)
+        layout.setSpacing(10)
+        layout.addWidget(label(
+            "Find traditional books by title, author, or ISBN. Compare catalog entries "
+            "before adding one to your reading library.", "muted"
+        ))
+
+        search_bar = QHBoxLayout()
+        self.online_query = QLineEdit()
+        self.online_query.setPlaceholderText("e.g. The Way of Kings, Brandon Sanderson, or an ISBN")
+        self.online_query.returnPressed.connect(self.search_online)
+        self.online_search_button = button("Search books", self.search_online, primary=True)
+        search_bar.addWidget(self.online_query, stretch=1)
+        search_bar.addWidget(self.online_search_button)
+        layout.addLayout(search_bar)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.online_results = QListWidget()
+        self.online_results.setObjectName("onlineResults")
+        self.online_results.setSpacing(3)
+        self.online_results.setWordWrap(True)
+        self.online_results.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.online_results.currentRowChanged.connect(self.preview_online_result)
+        self.online_results.itemDoubleClicked.connect(lambda _: self.use_online_result())
+        splitter.addWidget(self.online_results)
+
+        preview = QFrame()
+        preview.setObjectName("onlinePreview")
+        preview_layout = QVBoxLayout(preview)
+        preview_layout.setContentsMargins(14, 10, 14, 10)
+        preview_layout.setSpacing(9)
+        cover_and_info = QHBoxLayout()
+        cover_and_info.setSpacing(12)
+        self.online_cover = QLabel("No cover")
+        self.online_cover.setObjectName("onlineCover")
+        self.online_cover.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.online_cover.setFixedSize(96, 140)
+        cover_and_info.addWidget(self.online_cover)
+        headings = QVBoxLayout()
+        self.online_title = label("Search for a book to see its details", "subheading")
+        self.online_meta = label("Results from Open Library and Google Books", "muted")
+        headings.addWidget(self.online_title)
+        headings.addWidget(self.online_meta)
+        headings.addStretch()
+        cover_and_info.addLayout(headings, stretch=1)
+        preview_layout.addLayout(cover_and_info)
+        preview_layout.addWidget(label("Description", "muted"))
+        self.online_description = QTextEdit()
+        self.online_description.setReadOnly(True)
+        self.online_description.setPlaceholderText("Descriptions appear here when a catalog provides one.")
+        preview_layout.addWidget(self.online_description, stretch=1)
+        preview_actions = QHBoxLayout()
+        self.online_use_button = button("Review details", self.use_online_result)
+        self.online_add_button = button("Add to library", self.add_online_result, primary=True)
+        self.online_use_button.setEnabled(False)
+        self.online_add_button.setEnabled(False)
+        preview_actions.addWidget(self.online_use_button)
+        preview_actions.addWidget(self.online_add_button)
+        preview_layout.addLayout(preview_actions)
+        splitter.addWidget(preview)
+        splitter.setSizes([330, 455])
+        layout.addWidget(splitter, stretch=1)
+        self.online_status = label(
+            "Search two public catalogs. You can still enter a custom work using the Book & source tab.",
+            "muted",
+        )
+        layout.addWidget(self.online_status)
+
+    def search_online(self):
+        query = self.online_query.text().strip()
+        if not query:
+            self.online_status.setText("Enter a book title, author, or ISBN to search.")
+            self.online_query.setFocus()
+            return
+        if self.lookup_thread and self.lookup_thread.isRunning():
+            self.online_status.setText("A search or metadata lookup is already running.")
+            return
+        self.online_books = []
+        self.online_results.clear()
+        self.online_use_button.setEnabled(False)
+        self.online_add_button.setEnabled(False)
+        self.online_description.clear()
+        self.online_title.setText("Searching…")
+        self.online_meta.setText("")
+        self.online_cover.setPixmap(QPixmap())
+        self.online_cover.setText("No cover")
+        self.run_lookup(cached_book_search, query, self.show_online_results)
+        self.online_status.setText(f"Searching both catalogs for “{query}”…")
+
+    def show_online_results(self, response):
+        results = response.get("results", [])
+        errors = response.get("errors", [])
+        self.online_books = results
+        self.online_results.clear()
+        for book in results:
+            published = str(book.get("published_at") or "").strip()
+            year = published[:4] if published else "Year unknown"
+            subtitle = "  ·  ".join(
+                x for x in (book.get("author") or "Unknown author",
+                            year, book.get("source_site", "")) if x
+            )
+            pages = book.get("total_units") or 0
+            if pages:
+                subtitle += f"  ·  {pages:,} pages"
+            item = QListWidgetItem(f"{book.get('title', '')}\n{subtitle}")
+            item.setData(Qt.ItemDataRole.UserRole, book.get("source_id"))
+            self.online_results.addItem(item)
+        if results:
+            self.online_results.setCurrentRow(0)
+        else:
+            self.online_title.setText("No matching books found")
+            self.online_meta.setText("Try a shorter title, an author, or an ISBN.")
+            self.online_cover.setText("No cover")
+        warnings = " | ".join(errors)
+        message = f"{len(results)} book results"
+        if response.get("cached"):
+            message += " · Loaded from local search cache"
+        if warnings:
+            message += f" · Some sources unavailable: {warnings}"
+        self.online_status.setText(message)
+        self.feedback.setText(
+            "Select a catalog result and choose Add to library, or Review details "
+            "to adjust reading status and other fields."
+        )
+
+    def preview_online_result(self, index):
+        if not 0 <= index < len(self.online_books):
+            self.online_use_button.setEnabled(False)
+            self.online_add_button.setEnabled(False)
+            return
+        book = self.online_books[index]
+        self.online_use_button.setEnabled(True)
+        self.online_add_button.setEnabled(True)
+        self.online_title.setText(book.get("title") or "Untitled")
+        details = [
+            book.get("author") or "Unknown author",
+            book.get("source_site") or "Unknown catalog",
+        ]
+        if book.get("published_at"):
+            details.append(f"Published: {book['published_at']}")
+        if book.get("total_units"):
+            details.append(f"{book['total_units']:,} pages")
+        if book.get("isbn"):
+            details.append(f"ISBN: {book['isbn']}")
+        if book.get("publisher"):
+            details.append(book["publisher"])
+        self.online_meta.setText("\n".join(details))
+        self.online_description.setPlainText(
+            book.get("description") or "No description available for this catalog entry."
+        )
+        self.load_online_cover(book.get("cover_url") or "")
+
+    def load_online_cover(self, url):
+        self.cover_request_token += 1
+        token = self.cover_request_token
+        self.online_cover.setPixmap(QPixmap())
+        self.online_cover.setText("No cover")
+        parsed = QUrl(url)
+        if (parsed.scheme() != "https" or parsed.host() not in
+                ("covers.openlibrary.org", "books.google.com", "books.googleusercontent.com")):
+            return
+        request = QNetworkRequest(parsed)
+        request.setTransferTimeout(8000)
+        reply = self.cover_network.get(request)
+
+        def handle_reply():
+            if token == self.cover_request_token and reply.error() == QNetworkReply.NetworkError.NoError:
+                data = bytes(reply.readAll())
+                if len(data) <= 2_000_000:
+                    pixmap = QPixmap()
+                    if pixmap.loadFromData(data):
+                        self.online_cover.setText("")
+                        self.online_cover.setPixmap(pixmap.scaled(
+                            96, 140, Qt.AspectRatioMode.KeepAspectRatio,
+                            Qt.TransformationMode.SmoothTransformation,
+                        ))
+            reply.deleteLater()
+
+        reply.finished.connect(handle_reply)
+
+    def use_online_result(self):
+        index = self.online_results.currentRow()
+        if not 0 <= index < len(self.online_books):
+            return
+        self.fill_metadata(self.online_books[index])
+        self.tabs.setCurrentIndex(1)
+        self.feedback.setText(
+            "Book details filled from the selected catalog entry. "
+            "Choose a reading status or edit anything before saving."
+        )
+
+    def add_online_result(self):
+        index = self.online_results.currentRow()
+        if not 0 <= index < len(self.online_books):
+            return
+        self.fill_metadata(self.online_books[index])
+        self.validate_and_accept()
 
     @staticmethod
     def combo(choices, selected):
@@ -362,15 +577,23 @@ class WorkEditor(QDialog):
         self.url_button.setEnabled(False)
         self.saved_button.setEnabled(False)
         self.search_button.setEnabled(False)
+        self.online_search_button.setEnabled(False)
         self.feedback.setText("Looking up metadata…")
         thread = LookupThread(func, arg)
         self.lookup_thread = thread
         thread.found.connect(callback)
-        thread.failed.connect(lambda message: self.feedback.setText("Lookup failed: " + message))
+        thread.failed.connect(self.lookup_failed)
         thread.finished.connect(lambda: self.url_button.setEnabled(True))
         thread.finished.connect(lambda: self.saved_button.setEnabled(True))
         thread.finished.connect(lambda: self.search_button.setEnabled(True))
+        thread.finished.connect(lambda: self.online_search_button.setEnabled(True))
         thread.start()
+
+    def lookup_failed(self, message):
+        self.feedback.setText("Lookup failed: " + message)
+        self.online_status.setText("Search failed: " + message)
+        if self.tabs.currentIndex() == 0:
+            self.online_title.setText("Could not search the catalogs")
 
     def lookup_url(self):
         url = self.source_url.text().strip()
@@ -409,32 +632,13 @@ class WorkEditor(QDialog):
 
     def lookup_books(self):
         query = self.title.text().strip() or self.isbn.text().strip()
-        if not query:
-            QMessageBox.information(self, "Search", "Enter a book title or ISBN first.")
-            return
-        self.run_lookup(openlibrary_lookup, query, self.choose_openlibrary)
-
-    def choose_openlibrary(self, works):
-        if not works:
-            self.feedback.setText("No matching books found.")
-            return
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Select Open Library result")
-        dialog.resize(560, 420)
-        layout = QVBoxLayout(dialog)
-        results = QListWidget()
-        for item in works:
-            results.addItem(f"{item['title']} — {item['author']} ({item['published_at']})")
-        layout.addWidget(results)
-        actions = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
-                                   QDialogButtonBox.StandardButton.Cancel)
-        actions.accepted.connect(dialog.accept)
-        actions.rejected.connect(dialog.reject)
-        layout.addWidget(actions)
-        results.setCurrentRow(0)
-        results.itemDoubleClicked.connect(lambda _: dialog.accept())
-        if dialog.exec() == QDialog.DialogCode.Accepted and results.currentRow() >= 0:
-            self.fill_metadata(works[results.currentRow()])
+        if query:
+            self.online_query.setText(query)
+        self.tabs.setCurrentIndex(0)
+        if self.online_query.text().strip():
+            self.search_online()
+        else:
+            self.online_query.setFocus()
 
     def done(self, code):
         # Accept/reject hides a QDialog without necessarily calling closeEvent.
