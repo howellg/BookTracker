@@ -142,6 +142,8 @@ class WorkEditor(QDialog):
         self.setWindowTitle("Edit work" if work else "Add a work")
         self.resize(690, 730)
         self.work = work or {}
+        self.source_id = self.work.get("source_id", "")
+        self.cover_url = self.work.get("cover_url", "")
         self.lookup_thread = None
         layout = QVBoxLayout(self)
         tabs = QTabWidget()
@@ -242,6 +244,8 @@ class WorkEditor(QDialog):
             "fandom": self.fandom.text().strip(), "series": self.series.text().strip(),
             "source_site": self.source_site.text().strip(),
             "source_url": self.source_url.text().strip(),
+            "source_id": self.source_id,
+            "cover_url": self.cover_url,
             "isbn": self.isbn.text().strip(), "favorite": self.favorite.isChecked(),
             "published_at": self.published.text().strip(),
             "started_at": self.started.text().strip(), "finished_at": self.finished.text().strip(),
@@ -258,6 +262,8 @@ class WorkEditor(QDialog):
         self.accept()
 
     def fill_metadata(self, info):
+        self.source_id = info.get("source_id", "")
+        self.cover_url = info.get("cover_url", "")
         for attr, key in ((self.title, "title"), (self.author, "author"),
                           (self.fandom, "fandom"), (self.source_site, "source_site"),
                           (self.source_url, "source_url"), (self.isbn, "isbn"),
