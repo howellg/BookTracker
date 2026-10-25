@@ -47,6 +47,61 @@ def _clean_title(value: str) -> str:
     ).strip()
 
 
+def _chapter_count(soup, site: str, story_id: str) -> int:
+    """Only count scoped chapter rows/links or an explicitly labeled count.
+
+    Do not infer totals from a generic page's many navigation links, from an
+    arbitrary number in a title, or from a partially loaded/paginated thread.
+    Return 0 (unknown) when a page cannot supply evidence.
+    """
+    if site == "FanFiction.net":
+        header = soup.select_one("#profile_top")
+        if header:
+            match = re.search(
+                r"\bChapters?:?\s*([\d,]+)\b",
+                header.get_text(" ", strip=True), flags=re.IGNORECASE,
+            )
+            if match:
+                return _number(match.group(1))
+        return 0
+    if site == "Royal Road":
+        # Royal Road exposes full public chapter lists in a chapter table;
+        # prefer stable data-url attributes, then scoped chapter anchors.
+        paths = set()
+        for elem in soup.select(
+            "#chapters tr[data-url], table.chapter-list tr[data-url], "
+            "#chapters a[href*='/chapter/'], .chapter-list a[href*='/chapter/']"
+        ):
+            url = elem.get("data-url") or elem.get("href") or ""
+            match = re.search(
+                r"/(?:fiction/\d+/)?chapter/(\d+)",
+                str(url), flags=re.IGNORECASE,
+            )
+            if match:
+                paths.add(match.group(1))
+        return len(paths)
+    if site == "Scribble Hub":
+        ids = set()
+        for elem in soup.select(
+            ".chapter_list .chapter-title a[href], "
+            ".chapter_list a[href], li.toc_w a[href], #chp_raw a[href]"
+        ):
+            href = elem.get("href") or ""
+            match = re.search(r"/read/[^/]+/chapter/(\d+)/?", href)
+            if match:
+                ids.add(match.group(1))
+            elif "/read/" in href or "/chapter/" in href:
+                ids.add(href.split("#")[0].rstrip("/"))
+        return len(ids)
+    # SpaceBattles and Sufficient Velocity often paginate threadmarks.
+    # Reading just the first threadmarks page must not be called a total.
+    if site in ("SpaceBattles", "Sufficient Velocity"):
+        elem = soup.select_one(".threadmark-count, [data-threadmark-count]")
+        if elem:
+            return _number(elem.get("data-threadmark-count") or _text(elem))
+    return 0
+
+
 def parse_story_html(raw_html: str, source: dict) -> dict:
     """Return metadata and canonical source ID from saved browser HTML."""
     soup = BeautifulSoup(raw_html, "html.parser")
@@ -98,6 +153,7 @@ def parse_story_html(raw_html: str, source: dict) -> dict:
             "title": title,
             "author": author,
             "description": _meta(soup, "og:description", "description"),
+            "total_units": _chapter_count(soup, site, info["source_id"]),
             "progress_unit": "chapters",
         })
         cover = _meta(soup, "og:image")

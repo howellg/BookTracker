@@ -477,7 +477,7 @@ def test_upgrade_from_v4_database_preserves_books_and_saved_views(tmp_path):
 
     reopened = Library(path)
     try:
-        assert reopened.db.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert reopened.db.execute("PRAGMA user_version").fetchone()[0] == 8
         assert reopened.get_work(key)["notes"] == "Do not lose this."
         assert reopened.list_views()[0]["id"] == view
         reopened.add_session(

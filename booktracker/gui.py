@@ -49,6 +49,7 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QSplitter,
     QStackedWidget,
+    QSystemTrayIcon,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
@@ -197,6 +198,39 @@ class LookupThread(QThread):
             self.found.emit(self.func(*self.args))
         except Exception as exc:
             self.failed.emit(str(exc))
+
+
+class SerialCheckThread(QThread):
+    """Sequential, user-requested supported-source checks; never DB in worker."""
+
+    result = Signal(str, object)
+    failed = Signal(str, str)
+    status = Signal(int, int, str)
+
+    def __init__(self, entries, fetch=fetch_url_metadata):
+        super().__init__()
+        self.entries = tuple(entries)
+        self.fetch = fetch
+
+    def run(self):
+        total = len(self.entries)
+        for index, entry in enumerate(self.entries):
+            if self.isInterruptionRequested():
+                break
+            if index:
+                # Single worker + spacing avoids provider request bursts.
+                for _ in range(15):
+                    if self.isInterruptionRequested():
+                        break
+                    self.msleep(100)
+            if self.isInterruptionRequested():
+                break
+            self.status.emit(index + 1, total, entry["title"])
+            try:
+                data = self.fetch(entry["url"])
+                self.result.emit(entry["source_id"], data)
+            except Exception as exc:
+                self.failed.emit(entry["source_id"], str(exc)[:500])
 
 
 class WorkEditor(QDialog):
@@ -2226,6 +2260,12 @@ class MainWindow(QMainWindow):
         self.gallery_books = []
         self.metadata_worker = None
         self.epub_worker = None
+        self.serial_worker = None
+        self._serial_added = []
+        self._serial_errors = 0
+        self._serial_completed = 0
+        self._serial_cancelled = False
+        self._serial_tray = None
         self.settings = QSettings("BookTracker", "BookTracker")
         self.setWindowTitle("BookTracker — Your reading, remembered")
         self.resize(1360, 840)
@@ -2316,6 +2356,9 @@ class MainWindow(QMainWindow):
             automatic_backup(self.library, destination=self.library.path.parent / 'backups')
         except Exception as exc:
             self.statusBar().showMessage(f"Automatic backup warning: {exc}", 25000)
+        # Strictly opt-in. Never scrape as an unannounced default behavior.
+        if self.settings.value("serial_auto_check", False, type=bool):
+            QTimer.singleShot(1800, self.maybe_check_on_launch)
 
     def make_menu(self):
         menu = self.menuBar().addMenu("&File")
@@ -2338,6 +2381,8 @@ class MainWindow(QMainWindow):
             ("Log reading or listening time", self.log_reading_session, "Ctrl+Shift+T"),
             ("Sources and editions", self.manage_work_catalog, "Ctrl+Shift+M"),
             ("Update center", lambda: self.navigate(9), "Ctrl+Shift+U"),
+            ("Check followed stories", lambda: self.check_serial_sources(only_followed=True),
+             "Ctrl+Alt+U"),
             ("Reading queue", lambda: self.navigate(10), "Ctrl+Shift+Q"),
             ("Reading habits", lambda: self.navigate(11), "Ctrl+Alt+H"),
             ("Start reading timer", self.open_reading_timer, "Ctrl+Alt+T"),
@@ -3535,39 +3580,75 @@ class MainWindow(QMainWindow):
             fail(self, exc)
 
     def create_updates_page(self):
-        page = QWidget()
-        layout = QVBoxLayout(page)
-        row = QHBoxLayout()
-        row.addWidget(label("Update center", "headline"), stretch=1)
-        row.addWidget(button(
-            "Manage selected sources", self.manage_update_source, primary=True
+        page=QWidget()
+        layout=QVBoxLayout(page)
+        heading=QHBoxLayout()
+        heading.addWidget(label("Update center","headline"),stretch=1)
+        heading.addWidget(button(
+            "Check eligible stories",self.check_serial_sources,primary=True
         ))
-        row.addWidget(button("Open work", self.open_update_work))
-        layout.addLayout(row)
+        self.update_cancel_button=button(
+            "Cancel check",self.cancel_serial_checks
+        )
+        self.update_cancel_button.setEnabled(False)
+        heading.addWidget(self.update_cancel_button)
+        layout.addLayout(heading)
         layout.addWidget(label(
-            "Track known chapters and crossposted sources of serialized stories. "
-            "Checks are manually requested; BookTracker will not bypass Cloudflare.",
+            "Follow ongoing fanfiction and LitRPG, distinguish newly detected "
+            "chapters from unread backlog, and keep historical release observations. "
+            "Checks use supported public sites only and never bypass Cloudflare.",
             "muted"
         ))
-        filters = QHBoxLayout()
-        self.update_search = QLineEdit()
-        self.update_search.setPlaceholderText("Search serial titles or authors…")
+        switches=QGridLayout()
+        self.update_followed_only=QCheckBox("Check followed stories only")
+        self.update_followed_only.setChecked(True)
+        switches.addWidget(self.update_followed_only,0,0)
+        self.update_override_cooldown=QCheckBox("Override 12-hour cooldown")
+        switches.addWidget(self.update_override_cooldown,0,1)
+        self.update_auto_check=QCheckBox("Check followed on startup (24-hour minimum)")
+        self.update_auto_check.setChecked(
+            self.settings.value("serial_auto_check",False,type=bool)
+        )
+        self.update_auto_check.toggled.connect(
+            lambda value:self.settings.setValue("serial_auto_check",value)
+        )
+        switches.addWidget(self.update_auto_check,1,0)
+        self.update_alerts=QCheckBox("Desktop alerts")
+        self.update_alerts.setChecked(
+            self.settings.value("serial_alerts",False,type=bool)
+        )
+        self.update_alerts.toggled.connect(
+            lambda value:self.settings.setValue("serial_alerts",value)
+        )
+        switches.addWidget(self.update_alerts,1,1)
+        layout.addLayout(switches)
+        self.update_progress=QProgressBar()
+        self.update_progress.setRange(0,1)
+        self.update_progress.setValue(0)
+        self.update_progress.setFormat("No check running")
+        layout.addWidget(self.update_progress)
+        filter_bar=QHBoxLayout()
+        self.update_search=QLineEdit()
+        self.update_search.setPlaceholderText("Search titles or authors…")
         self.update_search.textChanged.connect(self.refresh_updates_page)
-        filters.addWidget(self.update_search, stretch=2)
-        self.update_filter = QComboBox()
-        self.update_filter.addItem("All tracked stories", "all")
-        self.update_filter.addItem("Unread known chapters", "unread")
-        self.update_filter.addItem("Failed checks", "errors")
-        self.update_filter.addItem("Never checked", "unchecked")
+        filter_bar.addWidget(self.update_search,stretch=2)
+        self.update_filter=QComboBox()
+        for title,key in (
+            ("All tracked serials","all"),("Following","following"),
+            ("New since acknowledged","new"),("Unread known chapters","unread"),
+            ("Failed checks","errors"),("Never checked","unchecked"),
+            ("No growth observed in 90+ days","quiet")
+        ):
+            self.update_filter.addItem(title,key)
         self.update_filter.currentIndexChanged.connect(self.refresh_updates_page)
-        filters.addWidget(self.update_filter)
-        layout.addLayout(filters)
-        self.update_counts = label("", "subheading")
+        filter_bar.addWidget(self.update_filter,stretch=1)
+        layout.addLayout(filter_bar)
+        self.update_counts=label("","subheading")
         layout.addWidget(self.update_counts)
-        self.update_table = QTableWidget(0, 6)
+        self.update_table=QTableWidget(0,9)
         self.update_table.setHorizontalHeaderLabels([
-            "Work", "Unread chapters", "Read / published",
-            "Sources", "Last checked", "Status"
+            "Work","Following","New","Unread","Read / known",
+            "Sources","Latest growth seen","Last checked","Status"
         ])
         self.update_table.setSelectionBehavior(
             QTableWidget.SelectionBehavior.SelectRows
@@ -3580,70 +3661,450 @@ class MainWindow(QMainWindow):
         )
         self.update_table.verticalHeader().setVisible(False)
         self.update_table.horizontalHeader().setSectionResizeMode(
-            0, QHeaderView.ResizeMode.Stretch
+            0,QHeaderView.ResizeMode.Interactive
         )
-        for col in range(1, 6):
+        self.update_table.horizontalHeader().resizeSection(0,270)
+        for i in range(1,9):
             self.update_table.horizontalHeader().setSectionResizeMode(
-                col, QHeaderView.ResizeMode.ResizeToContents
+                i,QHeaderView.ResizeMode.ResizeToContents
             )
+        self.update_table.itemSelectionChanged.connect(self.refresh_update_actions)
         self.update_table.itemDoubleClicked.connect(
-            lambda _: self.manage_update_source()
+            lambda _:self.manage_update_source()
         )
-        layout.addWidget(self.update_table, stretch=1)
+        layout.addWidget(self.update_table,stretch=1)
+        actions=QHBoxLayout()
+        self.update_follow_button=button("Follow story",self.toggle_follow_selected)
+        self.update_notify_button=button(
+            "Enable story alerts",self.toggle_selected_notifications
+        )
+        self.update_seen_button=button("Acknowledge new",self.acknowledge_selected)
+        for control in (
+            self.update_follow_button,self.update_notify_button,self.update_seen_button
+        ):
+            actions.addWidget(control)
+        actions.addWidget(button(
+            "Mark caught up",self.catch_up_selected_serial
+        ))
+        actions.addWidget(button("Open source",self.open_update_source))
+        actions.addWidget(button(
+            "Sources & editions",self.manage_update_source
+        ))
+        layout.addLayout(actions)
+        bottom=QHBoxLayout()
+        bottom.addWidget(button("Release history",self.show_serial_release_history))
+        bottom.addWidget(button("Provider reliability",self.show_provider_reliability))
+        bottom.addWidget(button("Export releases CSV",self.export_serial_releases_csv))
+        bottom.addWidget(button("Open book",self.open_update_work))
+        bottom.addStretch()
+        layout.addLayout(bottom)
         layout.addWidget(label(
-            "Open a story's Sources & Editions dialog to check a supported "
-            "website or import a browser-saved HTML page. "
-            "Higher published chapter counts update your known total but "
-            "never reset your reading position.", "muted"
+            "New = increases observed after a previously known chapter count, "
+            "until you acknowledge them. Unread = known published chapters "
+            "minus your saved reading position. The first successful check "
+            "establishes a baseline; failures do not imply a deleted story. "
+            "Bulk checks are limited to 20 stories per run, with a 1.5-second "
+            "gap and an optional cooldown. Automatic checks and desktop alerts "
+            "are off until you enable them.",
+            "muted"
         ))
         self.pages.addWidget(page)
 
-    def refresh_updates_page(self, *_args):
-        rows = self.library.source_update_summary()
-        search = self.update_search.text().strip().casefold()
-        mode = self.update_filter.currentData()
-        filtered = []
+    def refresh_updates_page(self,*_args):
+        rows=self.library.source_update_summary()
+        search=self.update_search.text().strip().casefold()
+        mode=self.update_filter.currentData()
+        selected=self.selected_update_work_id()
+        visible=[]
         for entry in rows:
             if search and not (
-                search in entry["title"].casefold()
-                or search in entry["author"].casefold()
+                search in entry["title"].casefold() or
+                search in entry["author"].casefold()
             ):
                 continue
-            if mode == "unread" and not entry["unread"]:
+            if mode=="following" and not entry["following"]:
                 continue
-            if mode == "errors" and not entry["has_error"]:
+            if mode=="new" and not entry["new_since_seen"]:
                 continue
-            if mode == "unchecked" and entry["last_checked_at"]:
+            if mode=="unread" and not entry["unread"]:
                 continue
-            filtered.append(entry)
-        count_unread = sum(1 for entry in rows if entry["unread"])
-        total = sum(entry["unread"] for entry in rows)
+            if mode=="errors" and not entry["has_error"]:
+                continue
+            if mode=="unchecked" and entry["last_checked_at"]:
+                continue
+            if mode=="quiet" and not entry["quiet_days"]:
+                continue
+            visible.append(entry)
+        follows=sum(bool(entry["following"]) for entry in rows)
+        new=sum(entry["new_since_seen"] for entry in rows)
+        backlog=sum(entry["unread"] for entry in rows)
         self.update_counts.setText(
-            f"{len(rows)} tracked serials   ·   {count_unread} with unread chapters"
-            f"   ·   {total:,} known unread chapters"
+            f"{len(rows)} tracked serials · {follows} followed · "
+            f"{new:,} newly observed chapters · {backlog:,} unread chapters"
         )
-        selected = self.selected_update_work_id()
-        self.update_table.setRowCount(len(filtered))
-        selected_row = -1
-        for i,entry in enumerate(filtered):
-            if selected == entry["work_id"]:
-                selected_row = i
-            values = (
-                entry["title"], str(entry["unread"]),
+        self.update_table.blockSignals(True)
+        self.update_table.setRowCount(len(visible))
+        selected_row=-1
+        for row,entry in enumerate(visible):
+            if entry["work_id"]==selected:
+                selected_row=row
+            values=(
+                entry["title"],
+                "★" if entry["following"] else "—",
+                str(entry["new_since_seen"]) if entry["new_since_seen"] else "—",
+                str(entry["unread"]),
                 f"{entry['progress']} / {entry['known_chapters']}",
                 str(entry["source_count"]),
+                local_timestamp(entry["last_release_at"])[:10]
+                  if entry["last_release_at"] else "No increase recorded",
                 local_timestamp(entry["last_checked_at"])
-                if entry["last_checked_at"] else "Never",
-                "Check failed" if entry["has_error"] else name(entry["status"]),
+                  if entry["last_checked_at"] else "Never",
+                "Check blocked" if entry["has_error"]
+                else f"No growth observed {entry['quiet_days']}d"
+                  if entry["quiet_days"] else name(entry["status"])
             )
             for col,value in enumerate(values):
-                cell=QTableWidgetItem(value)
+                item=QTableWidgetItem(value)
                 if col==0:
-                    cell.setData(Qt.ItemDataRole.UserRole,entry["work_id"])
-                self.update_table.setItem(i,col,cell)
-            self.update_table.setRowHeight(i,39)
+                    item.setData(Qt.ItemDataRole.UserRole,entry["work_id"])
+                self.update_table.setItem(row,col,item)
+            self.update_table.setRowHeight(row,39)
+        self.update_table.blockSignals(False)
         if selected_row>=0:
             self.update_table.selectRow(selected_row)
+        elif visible:
+            self.update_table.selectRow(0)
+        self.refresh_update_actions()
+
+    def refresh_update_actions(self):
+        work_id=self.selected_update_work_id()
+        follow=self.library.get_follow(work_id) if work_id else None
+        self.update_follow_button.setEnabled(bool(work_id))
+        self.update_follow_button.setText(
+            "Unfollow story" if follow else "Follow story"
+        )
+        self.update_notify_button.setEnabled(bool(follow))
+        self.update_notify_button.setText(
+            "Disable story alerts" if follow and follow["notify"]
+            else "Enable story alerts"
+        )
+        self.update_seen_button.setEnabled(bool(follow))
+
+    def toggle_library_story_follow(self):
+        work=self.selected_work()
+        if not work:
+            return
+        try:
+            if self.library.get_follow(work["id"]):
+                self.library.unfollow_work(work["id"])
+                self.statusBar().showMessage("Stopped following story.",5000)
+            else:
+                self.library.follow_work(work["id"],notify=False)
+                self.statusBar().showMessage(
+                    "Following story. Enable alerts in Update center if desired.",6000
+                )
+            self.refresh_all(work["id"])
+        except Exception as exc:
+            fail(self,exc)
+
+    def toggle_follow_selected(self):
+        key=self.selected_update_work_id()
+        if not key:
+            return
+        try:
+            if self.library.get_follow(key):
+                if QMessageBox.question(
+                    self,"Unfollow story?",
+                    "Unfollow this story? Book and release-check history remain."
+                )!=QMessageBox.StandardButton.Yes:
+                    return
+                self.library.unfollow_work(key)
+            else:
+                self.library.follow_work(key,notify=False)
+            self.refresh_updates_page()
+        except Exception as exc:
+            fail(self,exc)
+
+    def toggle_selected_notifications(self):
+        key=self.selected_update_work_id()
+        follow=self.library.get_follow(key) if key else None
+        if not follow:
+            return
+        self.library.set_follow_notification(key,not follow["notify"])
+        self.refresh_updates_page()
+
+    def acknowledge_selected(self):
+        key=self.selected_update_work_id()
+        if key and self.library.get_follow(key):
+            self.library.acknowledge_releases(key)
+            self.refresh_updates_page()
+
+    def catch_up_selected_serial(self):
+        key=self.selected_update_work_id()
+        work=self.library.get_work(key) if key else None
+        if not work:
+            return
+        if QMessageBox.question(
+            self,"Mark caught up?",
+            f"Record reading progress through {work['total_units']} chapters "
+            f"of {work['title']}? This writes a real progress milestone."
+        )!=QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self.library.catch_up_to_published(key)
+            if self.library.get_follow(key):
+                self.library.acknowledge_releases(key)
+            self.refresh_all(key)
+            self.refresh_updates_page()
+        except Exception as exc:
+            fail(self,exc)
+
+    def open_update_source(self):
+        key=self.selected_update_work_id()
+        sources=self.library.list_sources(key) if key else []
+        if sources:
+            webbrowser.open(sources[0]["url"])
+
+    def maybe_check_on_launch(self):
+        if not self.settings.value("serial_auto_check",False,type=bool):
+            return
+        self.check_serial_sources(only_followed=True,startup=True)
+
+    def check_serial_sources(self,*_args,only_followed=None,startup=False):
+        if self.serial_worker and self.serial_worker.isRunning():
+            self.statusBar().showMessage("A serial-check batch is already running.",5000)
+            return
+        followed = (
+            bool(only_followed) if only_followed is not None
+            else self.update_followed_only.isChecked()
+        )
+        minimum = 24 if startup else (
+            0 if self.update_override_cooldown.isChecked() else 12
+        )
+        result=self.library.batch_source_candidates(
+            followed_only=followed,minimum_hours=minimum,
+            limit=8 if startup else 20
+        )
+        pending=result["candidates"]
+        if not pending:
+            self.statusBar().showMessage(
+                "No eligible stories due for checking. "
+                f"{result['cooldown']} are within the cooldown; "
+                f"{result['unsupported']} have no supported source.",10000
+            )
+            return
+        self._serial_added=[]
+        self._serial_errors=0
+        self._serial_completed=0
+        self._serial_cancelled=False
+        self.update_progress.setRange(0,len(pending))
+        self.update_progress.setValue(0)
+        self.update_progress.setFormat(
+            f"Checking 0/{len(pending)} supported story sources"
+        )
+        self.update_cancel_button.setEnabled(True)
+        worker=SerialCheckThread(pending)
+        self.serial_worker=worker
+        worker.status.connect(self._serial_check_status)
+        worker.result.connect(self._serial_check_result)
+        worker.failed.connect(self._serial_check_failed)
+        worker.finished.connect(self._serial_check_finished)
+        worker.start()
+
+    def _serial_check_status(self,index,total,title):
+        self.update_progress.setFormat(
+            f"Checking {index}/{total}: {title[:60]}"
+        )
+
+    def _serial_check_result(self,source_id,data):
+        previous=self.library.get_source(source_id)
+        if not previous:
+            return
+        key=previous["work_id"]
+        known_before=self.library.get_work(key)["total_units"]
+        count=data.get("total_units") or 0
+        try:
+            self.library.record_source_check(
+                source_id,observed_units=count,message="Checked public story metadata."
+            )
+            self._serial_completed+=1
+            follow=self.library.get_follow(key)
+            after=self.library.get_work(key)["total_units"]
+            if (
+                known_before>0 and after>known_before and follow
+                and follow["notify"] and self.update_alerts.isChecked()
+            ):
+                self._serial_added.append((self.library.get_work(key)["title"],
+                                           after-known_before))
+        except Exception as exc:
+            self._serial_errors+=1
+            self.statusBar().showMessage(f"Story check could not be saved: {exc}",9000)
+        self.update_progress.setValue(
+            min(self.update_progress.maximum(),
+                self._serial_completed+self._serial_errors)
+        )
+        self.refresh_updates_page()
+
+    def _serial_check_failed(self,source_id,message):
+        self._serial_errors+=1
+        if self.library.get_source(source_id):
+            try:
+                self.library.record_source_check(source_id,error=message)
+            except Exception as exc:
+                self.statusBar().showMessage(f"Could not store check error: {exc}",7000)
+        self.update_progress.setValue(
+            min(self.update_progress.maximum(),
+                self._serial_completed+self._serial_errors)
+        )
+        self.refresh_updates_page()
+
+    def cancel_serial_checks(self):
+        worker=self.serial_worker
+        if worker and worker.isRunning():
+            self._serial_cancelled=True
+            worker.requestInterruption()
+            self.update_progress.setFormat(
+                "Stopping after the active request completes…"
+            )
+            self.update_cancel_button.setEnabled(False)
+
+    def _serial_check_finished(self):
+        self.update_cancel_button.setEnabled(False)
+        self.update_progress.setFormat(
+            f"{'Stopped' if self._serial_cancelled else 'Complete'}: "
+            f"{self._serial_completed} checked, {self._serial_errors} failed"
+        )
+        self.statusBar().showMessage(
+            self.update_progress.format(),12000
+        )
+        if self._serial_added:
+            self._show_serial_alert()
+        self.refresh_updates_page()
+
+    def _show_serial_alert(self):
+        if not self.update_alerts.isChecked():
+            return
+        total=sum(delta for _,delta in self._serial_added)
+        names=", ".join(title for title,_ in self._serial_added[:3])
+        message=f"{total} newly observed chapters across {len(self._serial_added)} stories: {names}"
+        if QSystemTrayIcon.isSystemTrayAvailable():
+            if self._serial_tray is None:
+                self._serial_tray=QSystemTrayIcon(self.windowIcon(),self)
+                self._serial_tray.setToolTip("BookTracker")
+                self._serial_tray.show()
+            self._serial_tray.showMessage(
+                "BookTracker chapter updates",message,
+                QSystemTrayIcon.MessageIcon.Information,8000
+            )
+        else:
+            QApplication.alert(self,5000)
+        self.statusBar().showMessage(message,12000)
+
+    def show_serial_release_history(self):
+        releases=self.library.list_serial_releases(limit=2000)
+        if not releases:
+            QMessageBox.information(
+                self,"No observed releases",
+                "BookTracker has not recorded any *increases* since a known "
+                "chapter count. A first check establishes a baseline."
+            )
+            return
+        dialog=QDialog(self)
+        dialog.setWindowTitle("Observed chapter release history")
+        dialog.resize(950,570)
+        layout=QVBoxLayout(dialog)
+        layout.addWidget(label(
+            "An observation date is when BookTracker detected the increase, "
+            "not necessarily the story's actual publication date.","muted"
+        ))
+        table=QTableWidget(len(releases),5)
+        table.setHorizontalHeaderLabels([
+            "Observed","Story","Source","Old → new","Chapters gained"
+        ])
+        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        table.horizontalHeader().setSectionResizeMode(
+            1,QHeaderView.ResizeMode.Stretch
+        )
+        for row,entry in enumerate(releases):
+            columns=(
+                local_timestamp(entry["observed_at"]),
+                entry["title"],entry["site"] or "Deleted source",
+                f"{entry['old_units']} → {entry['new_units']}",
+                f"+{entry['new_units']-entry['old_units']}"
+            )
+            for col,value in enumerate(columns):
+                table.setItem(row,col,QTableWidgetItem(value))
+        layout.addWidget(table)
+        buttons=QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        dialog.exec()
+
+    def show_provider_reliability(self):
+        sources=self.library.source_reliability()
+        if not sources:
+            QMessageBox.information(
+                self,"No source checks","No site checks have been recorded."
+            )
+            return
+        dialog=QDialog(self)
+        dialog.setWindowTitle("Source provider reliability")
+        dialog.resize(790,480)
+        layout=QVBoxLayout(dialog)
+        layout.addWidget(label(
+            "Observed requests only. A blocked or unknown response doesn't "
+            "mean the story is gone.","muted"
+        ))
+        table=QTableWidget(len(sources),5)
+        table.setHorizontalHeaderLabels([
+            "Provider","Checks","Known counts","Errors","Last checked"
+        ])
+        table.horizontalHeader().setSectionResizeMode(
+            0,QHeaderView.ResizeMode.Stretch
+        )
+        for i,entry in enumerate(sources):
+            values=(
+                entry["site"],str(entry["checks"]),
+                str(entry["successful_counts"]),str(entry["failures"]),
+                local_timestamp(entry["last_checked_at"])
+            )
+            for col,value in enumerate(values):
+                table.setItem(i,col,QTableWidgetItem(value))
+        layout.addWidget(table)
+        buttons=QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        dialog.exec()
+
+    def export_serial_releases_csv(self):
+        path,_=QFileDialog.getSaveFileName(
+            self,"Export observed chapter releases",
+            "BookTracker-chapter-releases.csv","CSV files (*.csv)"
+        )
+        if not path:
+            return
+        try:
+            with Path(path).open("w",newline="",encoding="utf-8-sig") as target:
+                writer=csv.writer(target)
+                writer.writerow([
+                    "Observed at","Work","Author","Source","Previous chapters",
+                    "Observed chapters","New chapters","Note"
+                ])
+                for item in self.library.list_serial_releases(limit=10000):
+                    def safe(value):
+                        text=str(value or "")
+                        return (
+                            "'"+text if text.lstrip().startswith(("=","+","-","@"))
+                            else text
+                        )
+                    writer.writerow([
+                        item["observed_at"],safe(item["title"]),safe(item["author"]),
+                        safe(item["site"]),item["old_units"],item["new_units"],
+                        item["new_units"]-item["old_units"],safe(item["note"])
+                    ])
+            self.statusBar().showMessage("Exported observed release history.",7000)
+        except OSError as exc:
+            fail(self,exc)
 
     def selected_update_work_id(self):
         row = self.update_table.currentRow()
@@ -4628,6 +5089,15 @@ class MainWindow(QMainWindow):
         self.details.addWidget(button(
             "Start reading / listening timer", self.open_reading_timer
         ))
+        if book["kind"] in ("fanfiction","web_novel") and linked:
+            follow=self.library.get_follow(work_id)
+            self.details.addWidget(button(
+                "Unfollow serialized story" if follow else "★ Follow serialized story",
+                self.toggle_library_story_follow
+            ))
+            self.details.addWidget(button(
+                "Open Update center",lambda: self.navigate(9)
+            ))
         queued=self.library.get_queue_entry(work_id)
         if queued:
             self.details.addWidget(label(
@@ -5596,9 +6066,19 @@ class MainWindow(QMainWindow):
             fail(self, exc)
 
     def closeEvent(self, event):
+        if self.serial_worker and self.serial_worker.isRunning():
+            self.serial_worker.requestInterruption()
+            if not self.serial_worker.wait(12000):
+                event.ignore()
+                self.statusBar().showMessage(
+                    "Finishing the current website request before closing.",7000
+                )
+                return
         for worker in (self.metadata_worker, self.epub_worker):
             if worker and worker.isRunning():
                 worker.wait()
+        if self._serial_tray:
+            self._serial_tray.hide()
         self.settings.setValue("window_geometry", self.saveGeometry())
         self.settings.setValue("library_view", self.view_selector.currentData())
         self.library.close()

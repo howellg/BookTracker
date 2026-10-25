@@ -209,7 +209,7 @@ def test_v5_db_migrates_legacy_isbn_and_site_safely(tmp_path):
         con.execute("PRAGMA user_version=5")
     reloaded=Library(path)
     try:
-        assert reloaded.db.execute("PRAGMA user_version").fetchone()[0]==7
+        assert reloaded.db.execute("PRAGMA user_version").fetchone()[0]==8
         assert len(reloaded.list_sources(work))==1
         assert len(reloaded.list_editions(work))==1
         assert reloaded.list_editions(work)[0]["pages"]==600
@@ -288,7 +288,7 @@ def test_migration_backup_created_before_updating_schema(tmp_path):
         connection.execute("PRAGMA user_version=5")
     db=Library(path)
     try:
-        files=list((tmp_path/"backups").glob("BookTracker-before-v010-*.sqlite3"))
+        files=list((tmp_path/"backups").glob("BookTracker-before-v012-*.sqlite3"))
         assert files
         with sqlite3.connect(files[-1]) as raw:
             assert raw.execute("PRAGMA user_version").fetchone()[0]==5
@@ -343,7 +343,7 @@ def test_catalog_dialog_source_and_edition_workflows(tmp_path,monkeypatch):
             assert EditionEditor(screen, db.get_edition(ed)).values()["format"]=="ebook"
             screen.navigate(9)
             assert screen.update_table.rowCount()==1
-            assert screen.update_table.item(0,1).text()=="9"
+            assert screen.update_table.item(0,3).text()=="9"
             assert screen.update_counts.text().startswith("1 tracked")
         finally:
             manager.close()
