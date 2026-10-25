@@ -13,6 +13,7 @@ Built with Python, PySide6, and SQLite. No account, cloud subscription, or alway
 - Distinguish **caught up with an ongoing story** from **completed the work**.
 - Build a **reading queue** with priority, planned dates, personal notes, manual order and random suggestions.
 - Associate existing EPUB/M4B/PDF and other reading files with a book; bulk-relink missing files from a folder across computers.
+- Import AudiobookAI completed parts and archival editions read-only, or scan standalone M4Bs. Match titles deliberately, inspect narrator/part/duration/chapter metadata, and open media in the system player.
 - Associate **multiple crossposted story sources** with the same work, instead of creating duplicate reading histories.
 - Track **print, ebook, web, and audiobook editions** under one work; choose which edition should supply the main ISBN and page count.
 - Use the **Update center** to follow ongoing stories, distinguish newly detected vs unread chapters, inspect release history, and run bounded manual or opt-in checks.
@@ -47,6 +48,97 @@ Built with Python, PySide6, and SQLite. No account, cloud subscription, or alway
 - Review library statistics, recent progress history, reading goals, time spent and series progress.
 - Manage crosspost URLs, editions, followed stories, observed releases, and safe manual/opt-in chapter checks without altering work-level reading history.
 - All data is saved locally in an SQLite database; portable JSON/XML import uses stable UUIDs for merge.
+
+## New in v0.13.0
+
+**AudiobookAI interoperability** adds a dedicated **Audiobooks** sidebar page,
+a read-only import from AudiobookAI Studio's durable completed-parts ledger,
+and standalone local M4B discovery. AudiobookAI remains a separate application:
+BookTracker never opens its generation engine, runs TTS, changes its queue or
+database, moves files, or fabricates playback progress.
+
+### Import completed AudiobookAI audio
+
+1. Open **Audiobooks → Import AudiobookAI**. Browse to AudiobookAI's local
+   output/audiobookai_studio.sqlite3 (by default inside your AudiobookAI
+   project directory). The importer opens SQLite with read-only access.
+2. BookTracker reads completed-parts receipts, including entries removed
+   from AudiobookAI's visible job queue. It preserves their real book
+   title, author, part numbers, narrator labels, source EPUB section
+   ranges, and links to M4Bs that still exist.
+3. If AudiobookAI's archive/catalog.json is present, completed archival
+   M4Bs recorded there can also be discovered. Matching source EPUBs
+   keep archives grouped with their original completed parts.
+4. **Match preview:** For every source book, confirm a destination library
+   work, choose Create custom book (unread), or Skip. Only one uniquely
+   matching exact title **and** author is automatically preselected.
+   Unmatched or authorless titles require explicit user review.
+5. Missing receipts are displayed and can optionally be imported as
+   **relinkable file hints**. They do not count as locally playable audio.
+
+### Discover other audiobooks
+
+- **Scan M4B folder** discovers M4Bs to five nested folder levels, without
+  following symlinked folders or contacting external websites.
+  Scans are bounded to 15,000 encountered files and 1,200 M4B candidates.
+- **Add M4B files** imports up to 150 individually selected M4Bs, and
+  supports dropping M4B files onto the empty Audiobooks page.
+- Non-audiobook/executable files are ignored or rejected. File content
+  stays on disk; BookTracker stores links and bounded metadata.
+- Metadata reading runs off the Qt UI thread, with a Cancel scan action.
+  It makes no transcodes and does not decode full audio streams.
+
+### Inspect, organize, and relink audio
+
+- View audiobooks grouped by original BookTracker work and narrator.
+- See completed parts, complete M4B editions, detected part sequence gaps,
+  unavailable files, approximate media duration, embedded chapter-marker
+  counts, source EPUB section ranges, audio codec and provenance.
+- Open files in your default audio player, inspect a selected M4B's embedded
+  chapter markers on demand, or refresh its metadata if the file changed.
+- Existing **Local files → Find in folder** and manual Relink continue to
+  resolve absent media on other computers, preserving audiobook metadata.
+- If both a full audiobook and its constituent parts exist, BookTracker
+  uses the longer verified coverage estimate, **not the sum of overlapping
+  M4Bs**. Missing part numbers are labeled possible gaps; they cannot
+  prove whether a part was generated.
+- **FFprobe is optional but recommended** (usually bundled with FFmpeg).
+  Without it, file names and durable AudiobookAI metadata still import,
+  while precise durations, codecs and chapter-marker counts remain Unknown.
+- The new Audiobooks screen can be opened with **Ctrl+Alt+B**, from the
+  File menu, or from a book's library detail panel.
+
+### Safety and portability
+
+- BookTracker **never infers minutes listened, reading progress, chapter
+  completion, or a reading-history entry from existing audio files**. You
+  can continue logging actual listening time via its stopwatch.
+- SQLite **schema v9** adds audio_metadata linked to the existing
+  local_files table; older book records, covers, notes, goals, shelves
+  and reading history remain intact.
+- For existing installations BookTracker creates a WAL-consistent
+  pre-migration snapshot in backups/BookTracker-before-v013-*.sqlite3.
+- **JSON, XML and .btbackup schema v9** preserve narrator, part,
+  section-range, media duration, chapter count and file-link metadata.
+  Backups intentionally exclude full M4B/EPUB/PDF contents, local
+  absolute paths, and original AudiobookAI SQLite databases. Relink
+  transferred media on the destination computer.
+- Older BookTracker **v1–v8** structured backups remain importable.
+  Reimporting the same media does not create duplicate local-file links
+  or reset existing listening history.
+
+### Upgrade
+
+1. Close BookTracker and export a .btbackup as an additional precaution.
+2. From your BookTracker repository run: git pull; uv sync.
+3. Launch with: uv run python -m booktracker.
+4. Open **Audiobooks** and choose **Import AudiobookAI** to select its
+   studio database, or **Scan M4B folder** for standalone audiobooks.
+
+**Note:** AudiobookAI archives and finished parts can refer to alternate
+narrators, incomplete EPUB section selections, and overlapping versions.
+BookTracker only presents the evidence in the source ledger and M4B
+metadata; it does not assume these represent a finished book or time listened.
 
 ## New in v0.12.0
 
@@ -380,11 +472,11 @@ For existing Goodreads history, use **File → Import Goodreads CSV**. It import
 
 ## Backup and portability
 
-| Format | Works & history | Follows, releases, queue, editions, journal | Local EPUB covers |
+| Format | Works & history | Audio metadata, follows, queue, journal | Local EPUB covers |
 |---|---|---|---|
 | **.btbackup** portable bundle | Yes | Yes (including time, notes and saved views) | **Yes** |
-| JSON (schema v8) | Yes | Yes (including time, notes and saved views) | No |
-| XML (schema v8) | Yes | Yes (including time, notes and saved views) | No |
+| JSON (schema v9) | Yes | Yes (including time, notes and saved views) | No |
+| XML (schema v9) | Yes | Yes (including time, notes and saved views) | No |
 | CSV catalog | Works/metadata only | No | No |
 | Goodreads CSV (import) | Imported work fields | No | No |
 
@@ -416,7 +508,9 @@ To run a minimal GUI smoke test without a display on CI, set QT_QPA_PLATFORM=off
 
 Project layout:
 
-- booktracker/database.py — reading runs, queue, timed sessions, habits and annual-goal analysis, deduplicated annotation imports, local file associations, calendar statistics, versioned merges
+- booktracker/database.py — reading runs, queue, listening sessions, source follows/releases, audio metadata, habits, local files, calendar statistics, and versioned merges
+- booktracker/audiobooks.py — read-only AudiobookAI Studio ledger, bounded M4B scanning and FFprobe metadata parsing
+- booktracker/audio_gui.py — audiobook catalogue, matching preview, M4B discovery worker and chapter viewer
 - booktracker/backups.py — daily SQLite snapshots and retention
 - booktracker/integrations.py — Open Library/story metadata, Goodreads CSV, JSON/XML/CSV
 - booktracker/epub_import.py — offline EPUB metadata and embedded cover parsing

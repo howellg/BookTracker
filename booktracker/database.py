@@ -66,17 +66,17 @@ class Library:
             raise
 
     def _snapshot_before_schema_migration(self):
-        """Save a WAL-consistent snapshot before an existing database moves to v8."""
+        """Save a WAL-consistent snapshot before an existing database moves to v9."""
         version = self.db.execute("PRAGMA user_version").fetchone()[0]
         exists = self.db.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='works'"
         ).fetchone()
-        if not exists or version >= 8:
+        if not exists or version >= 9:
             return
         folder = self.path.parent / "backups"
         folder.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-        target = folder / f"BookTracker-before-v012-{stamp}.sqlite3"
+        target = folder / f"BookTracker-before-v013-{stamp}.sqlite3"
         # sqlite3.backup copies committed WAL content safely.
         with sqlite3.connect(target) as destination:
             self.db.backup(destination)
@@ -286,8 +286,27 @@ class Library:
             ON serial_releases(work_id,observed_at DESC);
         CREATE INDEX IF NOT EXISTS idx_serial_releases_observed
             ON serial_releases(observed_at DESC);
+        CREATE TABLE IF NOT EXISTS audio_metadata (
+            file_id TEXT PRIMARY KEY REFERENCES local_files(id) ON DELETE CASCADE,
+            duration_ms INTEGER NOT NULL DEFAULT 0 CHECK(duration_ms BETWEEN 0 AND 10000000000000),
+            chapter_count INTEGER NOT NULL DEFAULT 0 CHECK(chapter_count BETWEEN 0 AND 100000),
+            codec TEXT NOT NULL DEFAULT '',
+            title TEXT NOT NULL DEFAULT '',
+            author TEXT NOT NULL DEFAULT '',
+            narrator TEXT NOT NULL DEFAULT '',
+            part_number INTEGER NOT NULL DEFAULT 0 CHECK(part_number BETWEEN 0 AND 1000000),
+            section_first INTEGER NOT NULL DEFAULT 0 CHECK(section_first BETWEEN 0 AND 10000000),
+            section_last INTEGER NOT NULL DEFAULT 0 CHECK(section_last BETWEEN 0 AND 10000000),
+            is_complete INTEGER NOT NULL DEFAULT 0 CHECK(is_complete IN (0,1)),
+            origin TEXT NOT NULL DEFAULT 'folder'
+                CHECK(origin IN ('folder','audiobookai','archive')),
+            studio_book_id INTEGER NOT NULL DEFAULT 0 CHECK(studio_book_id>=0),
+            probe_status TEXT NOT NULL DEFAULT '',
+            checked_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_audio_origin ON audio_metadata(origin);
         """)
-        self.db.execute("PRAGMA user_version=8")
+        self.db.execute("PRAGMA user_version=9")
         self._backfill_catalog_relationships()
         self.db.commit()
 
@@ -2772,6 +2791,295 @@ class Library:
             )
             return bool(cursor.rowcount)
 
+    @staticmethod
+    def _audio_fields(data):
+        """Validate metadata without ever copying local source paths to backups."""
+        if not isinstance(data,dict):
+            raise ValueError("Invalid audiobook metadata.")
+        integers={
+            "duration_ms":10_000_000_000_000,
+            "chapter_count":100000,
+            "part_number":1000000,
+            "section_first":10000000,
+            "section_last":10000000,
+            "studio_book_id":1000000000,
+        }
+        fields={}
+        for key,limit in integers.items():
+            try:
+                val=int(data.get(key) or 0)
+            except (ValueError,TypeError,OverflowError) as exc:
+                raise ValueError("Invalid audiobook "+key+".") from exc
+            if not 0<=val<=limit:
+                raise ValueError("Audiobook "+key+" exceeds supported limits.")
+            fields[key]=val
+        if fields["section_first"]>fields["section_last"]:
+            raise ValueError("Invalid audiobook section range.")
+        if fields["section_last"] and not fields["section_first"]:
+            raise ValueError("Audiobook first section is missing.")
+        fields["is_complete"]=int(bool(data.get("is_complete",False)))
+        origin=str(data.get("origin") or "folder")
+        if origin not in ("audiobookai","folder","archive"):
+            raise ValueError("Unsupported audiobook provenance.")
+        fields["origin"]=origin
+        for field,length in (
+            ("codec",60),("title",500),("author",500),("narrator",180),
+            ("probe_status",100)
+        ):
+            value=str(data.get(field) or "").strip()
+            if len(value)>length or "\x00" in value:
+                raise ValueError("Audiobook "+field+" is invalid.")
+            fields[field]=value
+        fields["checked_at"]=str(data.get("checked_at") or now())[:64]
+        return fields
+
+    def import_audio_files(self, records, decisions):
+        """Explicitly approved, fully transactional audiobook associations.
+
+        Caller maps source-title/author/Studio ID keys to work IDs or "create".
+        Never logs progress or reading time or modifies any media or Studio DB.
+        """
+        from .audiobooks import group_candidates
+
+        if not isinstance(records,list) or len(records)>1200:
+            raise ValueError("Choose fewer than 1,200 audiobook files.")
+        if not isinstance(decisions,dict):
+            raise ValueError("Choose a BookTracker destination for each title.")
+        groups=group_candidates(records)
+        mapping={}
+        stats={"linked":0,"already_linked":0,"missing":0,"created":0,"unmatched":0}
+        with self.transaction():
+            for group in groups:
+                decision=decisions.get(group["key"])
+                if decision is None:
+                    stats["unmatched"]+=group["count"]
+                    continue
+                if decision=="create":
+                    stable=json.dumps(
+                        ["BookTracker-audiobookai-v1",group["key"]],
+                        ensure_ascii=False,separators=(",",":")
+                    )
+                    work_id=str(uuid.uuid5(uuid.NAMESPACE_URL,stable))
+                    previous=self.get_work(work_id)
+                    if previous:
+                        if (
+                            previous["title"].casefold()!=group["title"].casefold()
+                            or previous["author"].casefold()!=group["author"].casefold()
+                        ):
+                            raise ValueError("Audiobook book identity conflict.")
+                    else:
+                        self.db.execute(
+                            """INSERT INTO works(
+                            id,title,author,kind,status,publication_status,
+                            progress_unit,added_at,updated_at)
+                            VALUES(?,?,?,'book','plan_to_read','unknown','pages',?,?)""",
+                            (work_id,group["title"],group["author"],now(),now())
+                        )
+                        stats["created"]+=1
+                    mapping[group["key"]]=work_id
+                else:
+                    decision=str(decision)
+                    if not self.get_work(decision):
+                        raise ValueError("Selected audiobook destination no longer exists.")
+                    mapping[group["key"]]=decision
+            for group in groups:
+                work_id=mapping.get(group["key"])
+                if not work_id:
+                    continue
+                for index in group["indices"]:
+                    record=records[index]
+                    if not isinstance(record,dict):
+                        raise ValueError("Malformed audiobook record.")
+                    if not record.get("filename") or (
+                        Path(str(record["filename"])).name!=record["filename"]
+                        or not record["filename"].casefold().endswith(".m4b")
+                        or len(record["filename"])>300
+                    ):
+                        raise ValueError("Invalid M4B file name.")
+                    source_path=str(record.get("path") or "")
+                    if source_path:
+                        try:
+                            path,filename,fmt,size=self._local_path(source_path)
+                        except ValueError:
+                            # Media was moved after scan, still preserve hint.
+                            path=""
+                            filename=record["filename"]
+                            size=max(0,int(record.get("size_bytes") or 0))
+                            fmt="m4b"
+                    else:
+                        path=""
+                        filename=record["filename"]
+                        size=max(0,int(record.get("size_bytes") or 0))
+                        fmt="m4b"
+                    if fmt!="m4b":
+                        raise ValueError("Only actual M4B files can be imported.")
+                    if size>100_000_000_000_000:
+                        raise ValueError("M4B file is larger than supported limits.")
+                    narrator=str(record.get("narrator") or "").strip()
+                    number=int(record.get("part_number") or 0)
+                    hint=(
+                        ("Complete audiobook" if record.get("is_complete")
+                         else f"Part {number}" if number else "Audiobook")
+                        + (f" · {narrator}" if narrator else "")
+                    )
+                    hint=self._file_label(hint[:180])
+                    existing=None
+                    if path:
+                        existing=self.db.execute(
+                            "SELECT id FROM local_files WHERE work_id=? AND path=?",
+                            (work_id,path)
+                        ).fetchone()
+                    if not existing:
+                        existing=self.db.execute(
+                            """SELECT id,path FROM local_files
+                            WHERE work_id=? AND filename=? AND path=''
+                              AND label=?
+                            LIMIT 1""",
+                            (work_id,filename,hint)
+                        ).fetchone()
+                        if existing and path:
+                            duplicate=self.db.execute(
+                                "SELECT 1 FROM local_files WHERE work_id=? AND path=?",
+                                (work_id,path)
+                            ).fetchone()
+                            if not duplicate:
+                                self.db.execute(
+                                    """UPDATE local_files SET path=?,size_bytes=?,
+                                    updated_at=? WHERE id=?""",
+                                    (path,size,now(),existing["id"])
+                                )
+                    if existing:
+                        ident=existing["id"]
+                        stats["already_linked"]+=1
+                    else:
+                        ident=new_id()
+                        stamp=now()
+                        self.db.execute(
+                            """INSERT INTO local_files(
+                            id,work_id,path,filename,format,label,size_bytes,
+                            created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)""",
+                            (ident,work_id,path,filename,fmt,hint,size,stamp,stamp)
+                        )
+                        stats["linked"]+=1
+                    if not path:
+                        stats["missing"]+=1
+                    fields=self._audio_fields(record)
+                    saved=self.db.execute(
+                        "SELECT * FROM audio_metadata WHERE file_id=?",(ident,)
+                    ).fetchone()
+                    if saved:
+                        # A failed FFprobe or weaker folder scan must never
+                        # erase richer metadata from an earlier successful scan.
+                        for key in ("duration_ms","chapter_count","codec",
+                                    "title","author","narrator"):
+                            if not fields[key] and saved[key]:
+                                fields[key]=saved[key]
+                        if fields["origin"]=="folder" and saved["origin"] in (
+                            "audiobookai","archive"
+                        ):
+                            fields["origin"]=saved["origin"]
+                            for key in ("part_number","section_first",
+                                        "section_last","studio_book_id"):
+                                if not fields[key] and saved[key]:
+                                    fields[key]=saved[key]
+                    field_names=list(fields)
+                    self.db.execute(
+                        """INSERT INTO audio_metadata(file_id,"""
+                        + ",".join(field_names)+") VALUES(?,"
+                        + ",".join("?" for _ in field_names)
+                        + """) ON CONFLICT(file_id) DO UPDATE SET """
+                        + ",".join(f"{key}=excluded.{key}" for key in field_names),
+                        (ident,*(fields[name] for name in field_names))
+                    )
+        return stats
+
+    def list_audio_files(self, *, work_id=None):
+        sql="""SELECT f.*,a.duration_ms,a.chapter_count,a.codec,a.title AS audio_title,
+                      a.author AS audio_author,a.narrator,a.part_number,
+                      a.section_first,a.section_last,a.is_complete,a.origin,
+                      a.studio_book_id,a.probe_status,a.checked_at,
+                      w.title AS work_title,w.author AS work_author
+               FROM audio_metadata a JOIN local_files f ON a.file_id=f.id
+               JOIN works w ON w.id=f.work_id"""
+        args=[]
+        if work_id:
+            sql+=" WHERE f.work_id=?"
+            args.append(work_id)
+        sql+=" ORDER BY w.title COLLATE NOCASE,a.narrator COLLATE NOCASE,"
+        sql+=" a.is_complete,a.part_number,f.filename COLLATE NOCASE"
+        results=[dict(row) for row in self.db.execute(sql,args)]
+        for item in results:
+            item["available"]=bool(item["path"] and Path(item["path"]).is_file())
+        return results
+
+    def audio_summary(self):
+        """Group metadata by work and narrator; avoid counting parts plus full M4B."""
+        from collections import defaultdict
+
+        buckets=defaultdict(list)
+        for item in self.list_audio_files():
+            buckets[(item["work_id"],item["narrator"])].append(item)
+        summaries=[]
+        for (work_id,narrator),rows in buckets.items():
+            parts=[item for item in rows if not item["is_complete"]]
+            full=[item for item in rows if item["is_complete"]]
+            available_full=[item for item in full if item["available"]]
+            # Choose longest verified complete edition, else sum known part
+            # durations (M4Bs can overlap; the estimate is not listening history).
+            verified_full=[
+                item for item in available_full if item["duration_ms"]>0
+            ]
+            duration=max(
+                max((item["duration_ms"] for item in verified_full),default=0),
+                sum(item["duration_ms"] for item in parts if item["available"])
+            )
+            numbers={item["part_number"] for item in parts if item["part_number"]>0}
+            expected=set(range(1,min(max(numbers),10000)+1)) if numbers else set()
+            missing_parts=sorted(expected-numbers)
+            summaries.append({
+                "work_id":work_id,"title":rows[0]["work_title"],
+                "author":rows[0]["work_author"],"narrator":narrator,
+                "files":len(rows),"parts":len(parts),"complete":len(full),
+                "missing_files":sum(not row["available"] for row in rows),
+                "missing_parts":missing_parts[:100],
+                "duration_ms":duration,
+                "chapters":(
+                    max((r["chapter_count"] for r in full),default=0)
+                    or sum(r["chapter_count"] for r in parts)
+                ),
+                "file_ids":[row["id"] for row in rows],
+            })
+        return sorted(summaries,key=lambda r:(r["title"].casefold(),r["narrator"].casefold()))
+
+    def update_audio_probe(self, file_id, details):
+        """Refresh one existing M4B's metadata without touching its book/run."""
+        existing=self.get_local_file(file_id)
+        if not existing or existing["format"]!="m4b":
+            raise ValueError("Select a linked M4B to inspect.")
+        old=self.db.execute(
+            "SELECT * FROM audio_metadata WHERE file_id=?",(file_id,)
+        ).fetchone()
+        merged=dict(old) if old else {}
+        merged.update({
+            key:value for key,value in details.items()
+            if key not in ("title","author","narrator") or value
+        })
+        if old and details.get("probe_status")!="ok":
+            # A temporary corrupt probe or missing ffprobe should not turn
+            # valid stored audio duration into zero.
+            for field in ("duration_ms","chapter_count","codec"):
+                if old[field]:
+                    merged[field]=old[field]
+        fields=self._audio_fields(merged)
+        keys=list(fields)
+        with self.transaction():
+            self.db.execute(
+                "INSERT INTO audio_metadata(file_id,"+",".join(keys)+") VALUES(?,"
+                + ",".join("?" for _ in keys)+") ON CONFLICT(file_id) DO UPDATE SET "
+                + ",".join(f"{key}=excluded.{key}" for key in keys),
+                (file_id,*(fields[k] for k in keys))
+            )
+
     def reading_habits(self, *, days=30, today=None):
         """Summarize real dated activity without guessing unlogged time."""
         days = int(days)
@@ -2987,7 +3295,7 @@ class Library:
         return result
 
     def export_data(self):
-        return {"format": "booktracker", "schema_version": 8, "exported_at": now(),
+        return {"format": "booktracker", "schema_version": 9, "exported_at": now(),
                 "works": [dict(row) for row in self.db.execute("SELECT * FROM works")],
                 "reading_runs": [dict(row) for row in self.db.execute("SELECT * FROM reading_runs")],
                 "progress_events": [dict(row) for row in self.db.execute("SELECT * FROM progress_events")],
@@ -3013,11 +3321,14 @@ class Library:
                 )],
                 "serial_releases": [dict(row) for row in self.db.execute(
                     "SELECT * FROM serial_releases"
+                )],
+                "audio_metadata": [dict(row) for row in self.db.execute(
+                    "SELECT * FROM audio_metadata"
                 )]}
 
     def import_data(self, data, *, strategy="merge"):
         """Transactional import; duplicate event IDs are skipped when merging."""
-        if data.get("format") != "booktracker" or data.get("schema_version") not in (1, 2, 3, 4, 5, 6, 7, 8):
+        if data.get("format") != "booktracker" or data.get("schema_version") not in (1, 2, 3, 4, 5, 6, 7, 8, 9):
             raise ValueError("Unsupported BookTracker backup format or schema version.")
         if data["schema_version"] >= 2 and (
             not isinstance(data.get("shelves"), list)
@@ -3048,6 +3359,8 @@ class Library:
             or not isinstance(data.get("serial_releases"), list)
         ):
             raise ValueError("Backup is missing serial subscriptions or release events.")
+        if data["schema_version"] >= 9 and not isinstance(data.get("audio_metadata"),list):
+            raise ValueError("Backup is missing audiobook metadata.")
         for key in ("works", "reading_runs", "progress_events"):
             if not isinstance(data.get(key), list):
                 raise ValueError(f"Backup is missing {key}.")
@@ -3469,6 +3782,26 @@ class Library:
                     (release["id"],target,target_source,old,new,
                      str(release.get("observed_at") or now()),
                      str(release.get("note") or "")[:500]),
+                )
+            if len(data.get("audio_metadata",[]))>100000:
+                raise ValueError("Too many audiobook metadata records in backup.")
+            for item in data.get("audio_metadata",[]):
+                if not isinstance(item,dict) or not item.get("file_id"):
+                    raise ValueError("Invalid audiobook metadata in backup.")
+                file_id=str(item["file_id"])
+                owner=self.db.execute(
+                    "SELECT work_id,format FROM local_files WHERE id=?",(file_id,)
+                ).fetchone()
+                if not owner or owner["format"]!="m4b":
+                    raise ValueError("Orphaned audiobook metadata in backup.")
+                fields=self._audio_fields(item)
+                keys=list(fields)
+                # Existing local M4B fields/metadata are authoritative on merge.
+                self.db.execute(
+                    "INSERT OR IGNORE INTO audio_metadata(file_id,"
+                    + ",".join(keys) + ") VALUES(?,"+
+                    ",".join("?" for _ in keys)+")",
+                    (file_id,*(fields[k] for k in keys))
                 )
             self._backfill_catalog_relationships()
         return count

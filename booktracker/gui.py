@@ -58,6 +58,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .audio_gui import AudioLibraryPage
 from .backups import automatic_backup
 from .book_search import _normalize, cached_book_search
 from .clippings import group_clippings, read_clippings
@@ -2313,7 +2314,8 @@ class MainWindow(QMainWindow):
                              ("✎   Notes && quotes", 8),
                              ("◉   Update center", 9),
                              ("☷   Reading queue", 10),
-                             ("◴   Reading habits", 11)):
+                             ("◴   Reading habits", 11),
+                             ("♫   Audiobooks", 12)):
             nav = button(title, lambda _, i=index: self.navigate(i))
             nav.setObjectName("nav")
             nav.setCheckable(True)
@@ -2343,6 +2345,8 @@ class MainWindow(QMainWindow):
         self.create_updates_page()
         self.create_queue_page()
         self.create_habits_page()
+        self.audio_page=AudioLibraryPage(self,self.library)
+        self.pages.addWidget(self.audio_page)
         geometry = self.settings.value("window_geometry")
         if geometry:
             self.restoreGeometry(geometry)
@@ -2385,6 +2389,11 @@ class MainWindow(QMainWindow):
              "Ctrl+Alt+U"),
             ("Reading queue", lambda: self.navigate(10), "Ctrl+Shift+Q"),
             ("Reading habits", lambda: self.navigate(11), "Ctrl+Alt+H"),
+            ("Audiobooks", lambda: self.navigate(12), "Ctrl+Alt+B"),
+            ("Import AudiobookAI completed parts",
+             lambda: self.audio_page.import_studio(), ""),
+            ("Scan audiobook folder",
+             lambda: self.audio_page.import_folder(), ""),
             ("Start reading timer", self.open_reading_timer, "Ctrl+Alt+T"),
             ("Import Kindle clippings", self.import_kindle_clippings, ""),
             ("Local book/audio files", self.manage_local_files, "Ctrl+Shift+F"),
@@ -2426,6 +2435,8 @@ class MainWindow(QMainWindow):
             self.refresh_queue_page()
         elif index == 11:
             self.refresh_habits_page()
+        elif index == 12:
+            self.audio_page.refresh()
 
     def focus_library_search(self):
         self.navigate(0)
@@ -4947,6 +4958,8 @@ class MainWindow(QMainWindow):
             self.refresh_queue_page()
         if self.pages.currentIndex() == 11:
             self.refresh_habits_page()
+        if self.pages.currentIndex() == 12:
+            self.audio_page.refresh()
 
     def refresh_library(self, *_args, select_id=None):
         active_view = self.saved_view_combo.currentData()
@@ -5085,6 +5098,18 @@ class MainWindow(QMainWindow):
         self.details.addWidget(button(
             f"Local files ({len(self.library.list_local_files(work_id))})",
             self.manage_local_files
+        ))
+        audio_files=self.library.list_audio_files(work_id=work_id)
+        if audio_files:
+            hours=sum(f["duration_ms"] for f in audio_files
+                      if not f["is_complete"] and f["available"])/3600000
+            self.details.addWidget(label(
+                f"Audiobooks: {len(audio_files)} M4B link(s)"
+                + (f" · {hours:.1f} h of part audio" if hours else "")
+                + " (duration ≠ time listened)","muted"
+            ))
+        self.details.addWidget(button(
+            "♫ Audiobooks & M4B imports",lambda:self.navigate(12)
         ))
         self.details.addWidget(button(
             "Start reading / listening timer", self.open_reading_timer
@@ -6066,6 +6091,14 @@ class MainWindow(QMainWindow):
             fail(self, exc)
 
     def closeEvent(self, event):
+        if self.audio_page.worker and self.audio_page.worker.isRunning():
+            self.audio_page.stop_scan()
+            if not self.audio_page.worker.wait(20000):
+                event.ignore()
+                self.statusBar().showMessage(
+                    "Finishing the active audio metadata probe before closing.",8000
+                )
+                return
         if self.serial_worker and self.serial_worker.isRunning():
             self.serial_worker.requestInterruption()
             if not self.serial_worker.wait(12000):
