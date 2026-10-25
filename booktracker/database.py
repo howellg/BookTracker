@@ -118,7 +118,19 @@ class Library:
             WHERE source_site != '' AND source_id != '';
         CREATE UNIQUE INDEX IF NOT EXISTS idx_isbn_unique ON works(isbn) WHERE isbn != '';
         CREATE INDEX IF NOT EXISTS idx_works_title ON works(title COLLATE NOCASE);
+        CREATE TABLE IF NOT EXISTS shelves (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS work_shelves (
+            work_id TEXT NOT NULL REFERENCES works(id) ON DELETE CASCADE,
+            shelf_id TEXT NOT NULL REFERENCES shelves(id) ON DELETE CASCADE,
+            PRIMARY KEY(work_id,shelf_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_shelf_work ON work_shelves(shelf_id,work_id);
         """)
+        self.db.execute("PRAGMA user_version=2")
         self.db.commit()
 
     @staticmethod
@@ -167,11 +179,12 @@ class Library:
             columns = ", ".join(fields)
             markers = ", ".join("?" for _ in fields)
             self.db.execute(f"INSERT INTO works ({columns}) VALUES ({markers})", tuple(fields.values()))
-            if fields.get("status") in ("reading", "caught_up", "completed"):
-                run_id = self._begin_run(work_id, fields.get("started_at") or timestamp)
-                if fields.get("status") == "completed":
-                    self.db.execute("UPDATE reading_runs SET finished_at=?,is_active=0 WHERE id=?",
-                                    (fields.get("finished_at") or timestamp, run_id))
+            if fields.get("status") in ("reading", "caught_up"):
+                self._begin_run(work_id, fields.get("started_at") or timestamp)
+            elif fields.get("status") == "completed" and fields.get("finished_at"):
+                run_id = self._begin_run(work_id, fields.get("started_at") or fields["finished_at"])
+                self.db.execute("UPDATE reading_runs SET finished_at=?,is_active=0 WHERE id=?",
+                                (fields["finished_at"], run_id))
         return work_id
 
     def update_work(self, work_id: str, data: dict):
@@ -196,7 +209,8 @@ class Library:
         work["tags"] = json.loads(work["tags"])
         return work
 
-    def list_works(self, search="", status="all", kind="all", favorites=False, sort="updated") -> list[dict]:
+    def list_works(self, search="", status="all", kind="all", favorites=False, sort="updated",
+                   shelf_id=None) -> list[dict]:
         sql = """SELECT w.*, COALESCE((
             SELECT current_progress FROM reading_runs
             WHERE work_id=w.id ORDER BY started_at DESC, rowid DESC LIMIT 1
@@ -214,6 +228,9 @@ class Library:
             args.append(kind)
         if favorites:
             sql += " AND w.favorite=1"
+        if shelf_id:
+            sql += " AND EXISTS (SELECT 1 FROM work_shelves ws WHERE ws.work_id=w.id AND ws.shelf_id=?)"
+            args.append(shelf_id)
         order = {
             "updated": "w.updated_at DESC", "title": "w.title COLLATE NOCASE",
             "author": "w.author COLLATE NOCASE", "added": "w.added_at DESC",
@@ -457,16 +474,134 @@ class Library:
             "skipped_titles": duplicates,
         }
 
+    def list_shelves(self):
+        return [dict(row) for row in self.db.execute(
+            "SELECT s.id,s.name,COUNT(ws.work_id) AS total FROM shelves s "
+            "LEFT JOIN work_shelves ws ON ws.shelf_id=s.id "
+            "GROUP BY s.id ORDER BY s.name COLLATE NOCASE"
+        )]
+
+    def create_shelf(self, name):
+        name = str(name).strip()
+        if not name or len(name) > 80:
+            raise ValueError("Shelf name must contain 1–80 characters.")
+        shelf_id = new_id()
+        with self.transaction():
+            self.db.execute("INSERT INTO shelves VALUES(?,?,?)", (shelf_id, name, now()))
+        return shelf_id
+
+    def rename_shelf(self, shelf_id, name):
+        name = str(name).strip()
+        if not name or len(name) > 80:
+            raise ValueError("Shelf name must contain 1–80 characters.")
+        with self.transaction():
+            self.db.execute("UPDATE shelves SET name=? WHERE id=?", (name, shelf_id))
+
+    def delete_shelf(self, shelf_id):
+        with self.transaction():
+            self.db.execute("DELETE FROM shelves WHERE id=?", (shelf_id,))
+
+    def set_shelf_membership(self, work_ids, shelf_id, include=True):
+        with self.transaction():
+            if not self.db.execute("SELECT 1 FROM shelves WHERE id=?", (shelf_id,)).fetchone():
+                raise ValueError("Shelf does not exist.")
+            for work_id in set(work_ids):
+                if include:
+                    self.db.execute(
+                        "INSERT OR IGNORE INTO work_shelves VALUES(?,?)", (work_id, shelf_id)
+                    )
+                else:
+                    self.db.execute(
+                        "DELETE FROM work_shelves WHERE work_id=? AND shelf_id=?", (work_id, shelf_id)
+                    )
+
+    def shelves_for_work(self, work_id):
+        return [row["id"] for row in self.db.execute(
+            "SELECT shelf_id AS id FROM work_shelves WHERE work_id=?", (work_id,)
+        )]
+
+    def batch_edit(self, work_ids, *, status=None, favorite=None, add_tags=None):
+        """Edit several works atomically without manufacturing reading dates or runs."""
+        work_ids = list(dict.fromkeys(work_ids))
+        if status is not None and status not in STATUSES:
+            raise ValueError("Invalid status.")
+        if favorite is not None and not isinstance(favorite, bool):
+            raise ValueError("Favorite must be True or False.")
+        tags = [str(tag).strip() for tag in (add_tags or []) if str(tag).strip()]
+        with self.transaction():
+            for work_id in work_ids:
+                book = self.get_work(work_id)
+                if not book:
+                    raise ValueError(f"Unknown work ID: {work_id}")
+                changes = {}
+                if status is not None:
+                    changes["status"] = status
+                if favorite is not None:
+                    changes["favorite"] = int(favorite)
+                if tags:
+                    changes["tags"] = json.dumps(list(dict.fromkeys(book["tags"] + tags)))
+                if changes:
+                    changes["updated_at"] = now()
+                    sql = ", ".join(f"{key}=?" for key in changes)
+                    self.db.execute(
+                        f"UPDATE works SET {sql} WHERE id=?", (*changes.values(), work_id)
+                    )
+        return len(work_ids)
+
+    def delete_progress_event(self, event_id):
+        """Remove an erroneous milestone and recompute that reading run's progress.
+
+        The last remaining event determines the current progress; all other
+        milestones, reading runs and unrelated works remain intact.
+        """
+        with self.transaction():
+            event = self.db.execute(
+                "SELECT * FROM progress_events WHERE id=?", (event_id,)
+            ).fetchone()
+            if not event:
+                raise ValueError("Progress event not found.")
+            self.db.execute("DELETE FROM progress_events WHERE id=?", (event_id,))
+            recent = self.db.execute(
+                "SELECT new_progress FROM progress_events WHERE run_id=? "
+                "ORDER BY recorded_at DESC,rowid DESC LIMIT 1", (event["run_id"],)
+            ).fetchone()
+            self.db.execute(
+                "UPDATE reading_runs SET current_progress=? WHERE id=?",
+                (recent["new_progress"] if recent else 0, event["run_id"])
+            )
+
+    def integrity_check(self):
+        return self.db.execute("PRAGMA integrity_check").fetchone()[0]
+
+    def backup_to(self, path):
+        """Consistent SQLite snapshot, even in WAL mode."""
+        dest = Path(path)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if dest.resolve() == self.path.resolve():
+            raise ValueError("Backup destination must differ from the live database.")
+        with sqlite3.connect(str(dest)) as target:
+            self.db.backup(target)
+            if target.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                raise ValueError("Database backup failed integrity check.")
+        return dest
+
     def export_data(self):
-        return {"format": "booktracker", "schema_version": 1, "exported_at": now(),
+        return {"format": "booktracker", "schema_version": 2, "exported_at": now(),
                 "works": [dict(row) for row in self.db.execute("SELECT * FROM works")],
                 "reading_runs": [dict(row) for row in self.db.execute("SELECT * FROM reading_runs")],
-                "progress_events": [dict(row) for row in self.db.execute("SELECT * FROM progress_events")]}
+                "progress_events": [dict(row) for row in self.db.execute("SELECT * FROM progress_events")],
+                "shelves": [dict(row) for row in self.db.execute("SELECT * FROM shelves")],
+                "work_shelves": [dict(row) for row in self.db.execute("SELECT * FROM work_shelves")]}
 
     def import_data(self, data, *, strategy="merge"):
         """Transactional import; duplicate event IDs are skipped when merging."""
-        if data.get("format") != "booktracker" or data.get("schema_version") != 1:
+        if data.get("format") != "booktracker" or data.get("schema_version") not in (1, 2):
             raise ValueError("Unsupported BookTracker backup format or schema version.")
+        if data["schema_version"] == 2 and (
+            not isinstance(data.get("shelves"), list)
+            or not isinstance(data.get("work_shelves"), list)
+        ):
+            raise ValueError("Backup is missing shelf information.")
         for key in ("works", "reading_runs", "progress_events"):
             if not isinstance(data.get(key), list):
                 raise ValueError(f"Backup is missing {key}.")
@@ -477,6 +612,7 @@ class Library:
         with self.transaction():
             if strategy == "replace":
                 self.db.execute("DELETE FROM works")
+                self.db.execute("DELETE FROM shelves")
             for item in data["works"]:
                 if not isinstance(item, dict) or not item.get("id"):
                     raise ValueError("Invalid work in backup.")
@@ -487,10 +623,24 @@ class Library:
                 target_id = existing or item["id"]
                 mapping[item["id"]] = target_id
                 if existing:
-                    fields["updated_at"] = now()
-                    keys = ", ".join(f"{k}=?" for k in fields)
-                    self.db.execute(f"UPDATE works SET {keys} WHERE id=?",
-                                    (*fields.values(), target_id))
+                    # During a merge, preserve local reading status, dates,
+                    # notes and corrections; backfill missing public fields.
+                    current = self.get_work(target_id)
+                    public = ("author", "description", "source_site", "source_url",
+                              "source_id", "isbn", "fandom", "series", "language",
+                              "cover_url", "total_units", "word_count", "published_at")
+                    patches = {}
+                    for field in public:
+                        incoming = fields.get(field)
+                        if not current.get(field) and incoming not in (None, "", 0):
+                            patches[field] = incoming
+                    if not current["tags"] and fields.get("tags") not in (None, "[]"):
+                        patches["tags"] = fields["tags"]
+                    if patches:
+                        patches["updated_at"] = now()
+                        keys = ", ".join(f"{k}=?" for k in patches)
+                        self.db.execute(f"UPDATE works SET {keys} WHERE id=?",
+                                        (*patches.values(), target_id))
                 else:
                     fields.update(id=target_id, added_at=item.get("added_at") or now(),
                                   updated_at=item.get("updated_at") or now())
@@ -518,4 +668,28 @@ class Library:
                     (event["id"], work_id, event["run_id"], event.get("recorded_at") or now(),
                      int(event.get("old_progress",0)), int(event.get("new_progress",0)),
                      str(event.get("note") or "")))
+            # Older v1 backups have no shelf data; preserve shelves on merge.
+            shelf_map = {}
+            for shelf in data.get("shelves", []):
+                name = str(shelf.get("name") or "").strip()
+                if not name or not shelf.get("id"):
+                    raise ValueError("Malformed shelf in backup.")
+                existing_shelf = self.db.execute(
+                    "SELECT id FROM shelves WHERE name=? COLLATE NOCASE", (name,)
+                ).fetchone()
+                new_shelf = existing_shelf["id"] if existing_shelf else shelf["id"]
+                shelf_map[shelf["id"]] = new_shelf
+                if not existing_shelf:
+                    self.db.execute(
+                        "INSERT INTO shelves VALUES(?,?,?)",
+                        (new_shelf, name, shelf.get("created_at") or now())
+                    )
+            for link in data.get("work_shelves", []):
+                work_id = mapping.get(link.get("work_id"))
+                shelf_id = shelf_map.get(link.get("shelf_id"))
+                if not work_id or not shelf_id:
+                    raise ValueError("Orphaned shelf assignment.")
+                self.db.execute(
+                    "INSERT OR IGNORE INTO work_shelves VALUES(?,?)", (work_id, shelf_id)
+                )
         return count

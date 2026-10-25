@@ -26,6 +26,19 @@ Built with Python, PySide6, and SQLite. No account, cloud subscription, or alway
 - Review basic library statistics and recent progress history.
 - All data is saved locally in an SQLite database; portable JSON/XML import uses stable UUIDs for merge.
 
+## New in v0.4.0
+
+- **Cover gallery:** Toggle between Detailed list and Cover gallery. Covers show when available; otherwise title placeholders.
+- **Custom shelves:** Create collections, select several books and add them to shelves, then filter by shelf.
+- **Bulk edit:** Change status, favorites or add tags across selected books without touching historical dates.
+- **Daily verified backups:** BookTracker creates one SQLite snapshot per day on startup, beside its database in the backups folder. It retains the 14 most recent backups. Manual backups are also available from the sidebar.
+- **Correct history mistakes:** Select a milestone in Reading history, then Delete selected mistaken milestone. Current progress recalculates using remaining milestones.
+- **Portable shelf backups:** JSON and XML version 2 include shelves and memberships. Version 1 imports remain compatible.
+- **Safer cross-device merges:** Existing personal notes, statuses, favorites and ratings aren't overwritten by older imports; missing public metadata is filled.
+- **Honest historical dates:** Importing an old completed book without a finish date no longer manufactures a reading run dated today.
+
+Before updating, export a JSON backup as an additional precaution. Existing v0.3 SQLite libraries are upgraded in place.
+
 ## Installation (Linux, Windows, macOS)
 
 Install Python **3.10–3.13** and Git. On Arch Linux you may prefer uv for isolated dependencies.
@@ -101,7 +114,8 @@ To run a minimal GUI smoke test without a display on CI, set QT_QPA_PLATFORM=off
 
 Project layout:
 
-- booktracker/database.py — data model, reading runs, progress and merge logic
+- booktracker/database.py — reading runs, shelves, bulk editing, corrections and versioned merges
+- booktracker/backups.py — daily SQLite snapshots and retention
 - booktracker/integrations.py — Open Library/story metadata, Goodreads CSV, JSON/XML/CSV
 - booktracker/book_search.py — title/author catalog search and caching
 - booktracker/covers.py — async disk-cached cover thumbnails
