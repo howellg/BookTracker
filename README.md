@@ -10,7 +10,7 @@ Built with Python, PySide6, and SQLite. No account, cloud subscription, or alway
 - Record **reading progress** in chapters, pages, or percent, with dated milestones and optional notes.
 - Distinguish **caught up with an ongoing story** from **completed the work**.
 - Track **rereads** as independent reading runs without losing previous history.
-- Search titles, authors, fandoms, series and tags; filter by type, reading status, shelves, exact series, exact tags and favorites.
+- Search titles, authors, fandoms, series, ISBNs, descriptions, personal notes and tags. Filter by type, status, shelves, exact author/series/tag, favorites and metadata completeness.
 - Store personal star ratings (0.5 increments), notes, publication status, word counts, source URLs and more. Imported tag lists in the book details panel collapse when long.
 - Import a **Goodreads library CSV** (from Goodreads → My Books → Import and export).
 - Search by **title/ISBN or author** from **+ Add work → Find online**. Author search returns many matching works, with checkboxes and an **Add N selected** action.
@@ -23,12 +23,54 @@ Built with Python, PySide6, and SQLite. No account, cloud subscription, or alway
 - When a website blocks automated requests, **import HTML saved from your browser** to fill in title, author, and (for AO3) tags, chapters, word count and fandom, without uploading the file.
 - Export and import **portable .btbackup files** containing the entire reading history, shelves, goals, and locally imported EPUB covers. JSON/XML remain available for structured-data portability without images.
 - Export and import **CSV catalogs** for spreadsheets (CSV does *not* preserve reading-history events).
-- Use a **Reading dashboard** with goals for books, chapters and pages, a Continue Reading list, and recent milestones. Double-click a current book to open it.
+- Use a **Reading dashboard** with goals, current reads, serialized works with unread published chapters and recent milestones.
 - Browse **Series** and **Authors** explorers; double-click to filter your library by that series or author.
 - **Import local EPUB metadata** offline, individually or in bulk, including embedded covers, authors, series, ISBNs, language, description, and tags where available. Recognize supported fanfiction source links embedded in EPUB metadata.
 - Search and filter your reading-event history by book, author, note and year. Edit milestones and backdate progress without corrupting the most recent reading position. Export the filtered history as CSV.
+- Save and restore **named library views** with complex filters and sorting rules. These travel in JSON/XML/.btbackup exports.
+- Explore **Insights** by month, including dated chapter/page progress, active reading days and completions, and export a monthly CSV.
+- Use **Library health** to inspect potential duplicates, missing metadata, unknown dates and serial backlogs without automatic deletions.
+- Manage global tags: rename/merge tag names or remove a tag across the library, keeping the books intact.
+- Quick-update serialized chapter counts, increment progress by one or five chapters, and mark a story caught up to its known published chapter count.
 - Review library statistics, recent progress history, reading goals and series progress.
 - All data is saved locally in an SQLite database; portable JSON/XML import uses stable UUIDs for merge.
+
+## New in v0.7.0
+
+BookTracker v0.7 is a substantial quality-of-life release with a new portable database schema (**v4**) and two new sidebar pages.
+
+### Library tools
+
+- **Saved views:** Combine your search text, type/status, favorites, collection/shelf, series, author, tag, quality and sort criteria. Click **Save current filters** to create a named view. Select it later to restore the filters or **Delete saved view** to remove only the preset, never its books. The saved view clears from the selector when you change one of its filters.
+- **Quality filters:** Filter by missing cover, author, description or source, no series, any of those incomplete fields, unlogged finish dates, or serialized stories with unread published chapters.
+- **Deeper search:** Search across ISBN, book description and personal notes in addition to titles, authors, fandoms, series and tags. Percentage signs and underscores are treated literally.
+- **Expanded bulk editing:** Change ratings, publication status and series; add or remove tags for multiple selected books. Existing progress and historical dates are retained.
+- **New sort:** Sort books by greatest recorded reading progress.
+
+### Serialized-fiction workflow
+
+- **Update published chapters:** Update how many chapters the author has currently released without altering your reading position.
+- **Quick progress:** Buttons to log +1 or +5 chapters on serialized works, capped at the known published count.
+- **Catch up to published:** Confirm a one-click operation to record progress through the known published chapter count and mark the story Caught up.
+- **Uncaught chapter counts:** The book details panel shows the remaining chapters, while the Dashboard displays serialized works with known chapter gaps. You can open a story directly by double-clicking it.
+- **Progress visualization:** Book details now include a progress bar where the published/total length is known. Cover tiles have informative tooltips.
+
+### New Insights and Library health screens
+
+- **Insights (sidebar):** Monthly chapters, pages, active reading days, milestone events and completions for a selected year, with an exportable CSV. Figures only use recorded activity and known finish dates; the page doesn't invent reading history. There is no 10,000-event aggregation truncation.
+- **Library health (sidebar):** Counts for missing metadata and unknown finish dates, an interactive list of likely duplicate books, and shortcuts to show affected books in the library.
+- **Duplicates are review-only:** Candidate matches are based on normalized title and author. No books, reading runs or notes are merged or deleted automatically.
+- **Tag cleanup:** Rename or merge a tag across the entire library, or remove the tag while keeping all works intact.
+- **Database integrity:** Run an on-demand SQLite integrity check from Library health.
+
+### Compatibility and migration
+
+- **JSON/XML/.btbackup v4** now include saved views as well as all previous works, reading events, goals and shelves. Portable .btbackup still includes locally imported EPUB covers.
+- **Legacy formats remain readable:** Versions 1–3 of the BookTracker backup schema can still be imported.
+- **Safer cross-device views:** A saved view's shelf reference is remapped by shelf name if merging a backup into a different library.
+- **Non-destructive database upgrade:** An existing v0.6 SQLite library gains the new saved_views table automatically, with no existing book or event records rewritten.
+
+Before installing a major version update, export a **.btbackup** file to somewhere safe. Close the app, run git pull and uv sync, and restart BookTracker. Your normal per-day SQLite snapshots continue to be created.
 
 ## New in v0.6.0
 
@@ -114,6 +156,8 @@ The database is stored in your OS's user-data directory (platformdirs), not insi
 8. Use **Mark caught up** for ongoing serials you've reached the latest chapter; **Mark completed** for a finished read; **Start a reread** to begin a new reading run.
 9. Use **Import library** / **Export library** in the sidebar to move reading history between computers. For EPUB cover images, choose a **.btbackup** portable full backup.
 10. Set annual reading goals and double-click current reads on the **Dashboard**. Browse series from **Series** or writers from **Authors**.
+11. For ongoing stories, update their chapter totals and use the +1, +5 or Catch up to published buttons in the book details.
+12. To reuse library searches and filters, click **Save current filters**. Explore **Insights** and **Library health** for more management tools.
 11. To record something you read last year, choose **Log progress**, check **Set a specific reading date**, then select the historical date. To correct an older log, use **Reading history → Edit selected**.
 
 For existing Goodreads history, use **File → Import Goodreads CSV**. It imports Goodreads shelves and ratings; it does not create a detailed historical progress log that Goodreads never exported.
@@ -122,9 +166,9 @@ For existing Goodreads history, use **File → Import Goodreads CSV**. It import
 
 | Format | Works & history | Shelves & goals | Local EPUB covers |
 |---|---|---|---|
-| **.btbackup** portable bundle | Yes | Yes | **Yes** |
-| JSON (schema v3) | Yes | Yes | No |
-| XML (schema v3) | Yes | Yes | No |
+| **.btbackup** portable bundle | Yes | Yes, plus saved views | **Yes** |
+| JSON (schema v4) | Yes | Yes, plus saved views | No |
+| XML (schema v4) | Yes | Yes, plus saved views | No |
 | CSV catalog | Works/metadata only | No | No |
 | Goodreads CSV (import) | Imported work fields | No | No |
 
@@ -169,7 +213,7 @@ Project layout:
 
 ## Roadmap
 
-Automatic site-specific word/chapter adapters, deeper monthly reading analytics, easier bulk URL importing, multi-source/edition grouping, a browser helper for fanfiction, AudiobookAI integration, optional multi-device synchronization, and installable desktop binaries.
+Automatic site-specific word/chapter adapters, additional visualization and reading calendar tools, easier bulk URL importing, multi-source/edition grouping, a browser helper for fanfiction, AudiobookAI integration, optional multi-device synchronization, and installable desktop binaries.
 
 ## License
 

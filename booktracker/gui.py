@@ -997,7 +997,8 @@ class MainWindow(QMainWindow):
         self.nav_buttons = []
         for title, index in (("▤   Library", 0), ("◷   Reading history", 1),
                              ("▥   Dashboard", 2), ("▦   Series", 3),
-                             ("♧   Authors", 4)):
+                             ("♧   Authors", 4), ("▤   Insights", 5),
+                             ("◇   Library health", 6)):
             nav = button(title, lambda _, i=index: self.navigate(i))
             nav.setObjectName("nav")
             nav.setCheckable(True)
@@ -1018,6 +1019,8 @@ class MainWindow(QMainWindow):
         self.create_stats_page()
         self.create_series_page()
         self.create_authors_page()
+        self.create_insights_page()
+        self.create_health_page()
         geometry = self.settings.value("window_geometry")
         if geometry:
             self.restoreGeometry(geometry)
@@ -1044,6 +1047,10 @@ class MainWindow(QMainWindow):
             ("Focus library search", self.focus_library_search, "Ctrl+F"),
             ("Reading history", lambda: self.navigate(1), "Ctrl+H"),
             ("Authors", lambda: self.navigate(4), "Ctrl+Shift+A"),
+            ("Reading insights", lambda: self.navigate(5), "Ctrl+Shift+I"),
+            ("Library health", lambda: self.navigate(6), "Ctrl+Shift+L"),
+            ("Save current library view", self.save_current_view, "Ctrl+Shift+V"),
+            ("Log progress on selected work", self.log_progress, "Ctrl+L"),
         ):
             action = QAction(title, self)
             action.triggered.connect(callback)
@@ -1067,6 +1074,10 @@ class MainWindow(QMainWindow):
             self.refresh_series_page()
         elif index == 4:
             self.refresh_authors_page()
+        elif index == 5:
+            self.refresh_insights_page()
+        elif index == 6:
+            self.refresh_health_page()
 
     def focus_library_search(self):
         self.navigate(0)
@@ -1087,7 +1098,9 @@ class MainWindow(QMainWindow):
         layout.addSpacing(12)
         filters = QHBoxLayout()
         self.search = QLineEdit()
-        self.search.setPlaceholderText("Search titles, authors, fandoms, tags…")
+        self.search.setPlaceholderText(
+            "Search title, author, fandom, tags, notes, description or ISBN…"
+        )
         self.search.textChanged.connect(self.refresh_library)
         self.filter_status = QComboBox()
         self.filter_status.addItem("All statuses", "all")
@@ -1102,7 +1115,8 @@ class MainWindow(QMainWindow):
         self.sort = QComboBox()
         for title, key in (("Recently updated", "updated"), ("Title", "title"),
                            ("Author", "author"), ("Recently added", "added"), ("Rating", "rating"),
-                           ("Recently finished", "finished"), ("Series", "series")):
+                           ("Recently finished", "finished"), ("Series", "series"),
+                           ("Most progress", "progress")):
             self.sort.addItem(title, key)
         self.sort.currentIndexChanged.connect(self.refresh_library)
         self.shelf_filter = QComboBox()
@@ -1117,6 +1131,20 @@ class MainWindow(QMainWindow):
         self.tag_filter = QComboBox()
         self.tag_filter.addItem("All tags", None)
         self.tag_filter.currentIndexChanged.connect(self.refresh_library)
+        self.quality_filter = QComboBox()
+        self.quality_filter.addItem("All records", None)
+        for caption, key in (
+            ("Missing cover", "missing_cover"),
+            ("Missing author", "missing_author"),
+            ("Missing description", "missing_description"),
+            ("Missing source link", "missing_source"),
+            ("No series assigned", "missing_series"),
+            ("Incomplete metadata", "incomplete"),
+            ("Uncaught serial chapters", "serial_backlog"),
+            ("Completed, date unknown", "unknown_dates"),
+        ):
+            self.quality_filter.addItem(caption, key)
+        self.quality_filter.currentIndexChanged.connect(self.refresh_library)
         self.only_fav = QCheckBox("★ Favorites")
         self.only_fav.toggled.connect(self.refresh_library)
         filters.addWidget(self.search, stretch=3)
@@ -1131,6 +1159,7 @@ class MainWindow(QMainWindow):
         secondary_filters.addWidget(self.series_filter, stretch=1)
         secondary_filters.addWidget(self.author_filter, stretch=1)
         secondary_filters.addWidget(self.tag_filter, stretch=1)
+        secondary_filters.addWidget(self.quality_filter, stretch=1)
         secondary_filters.addWidget(button("Clear filters", self.clear_library_filters))
         layout.addLayout(secondary_filters)
         commands = QHBoxLayout()
@@ -1146,6 +1175,15 @@ class MainWindow(QMainWindow):
         commands.addWidget(button("Manage shelves", self.manage_shelves))
         commands.addStretch()
         layout.addLayout(commands)
+        saved_row = QHBoxLayout()
+        saved_row.addWidget(label("Saved view:", "muted"))
+        self.saved_view_combo = QComboBox()
+        self.saved_view_combo.addItem("Choose a saved filter…", None)
+        self.saved_view_combo.currentIndexChanged.connect(self.apply_saved_view)
+        saved_row.addWidget(self.saved_view_combo, stretch=1)
+        saved_row.addWidget(button("Save current filters", self.save_current_view))
+        saved_row.addWidget(button("Delete saved view", self.delete_current_view))
+        layout.addLayout(saved_row)
         layout.addSpacing(10)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -1183,7 +1221,7 @@ class MainWindow(QMainWindow):
         details = QFrame()
         details.setObjectName("details")
         details.setMinimumWidth(285)
-        details.setMaximumWidth(430)
+        details.setMaximumWidth(480)
         d_outer = QVBoxLayout(details)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -1343,6 +1381,11 @@ class MainWindow(QMainWindow):
         self.current_reads.setMaximumHeight(155)
         self.current_reads.itemDoubleClicked.connect(self.open_current_read)
         layout.addWidget(self.current_reads)
+        layout.addWidget(label("Serialized stories with unread published chapters", "subheading"))
+        self.serial_backlog = QListWidget()
+        self.serial_backlog.setMaximumHeight(155)
+        self.serial_backlog.itemDoubleClicked.connect(self.open_current_read)
+        layout.addWidget(self.serial_backlog)
         layout.addWidget(label("Recent recorded activity", "subheading"))
         self.recent_list = QListWidget()
         self.recent_list.setMaximumHeight(190)
@@ -1354,6 +1397,276 @@ class MainWindow(QMainWindow):
         self.pages.addWidget(page)
         self.goal_year.valueChanged.connect(self.load_reading_goals)
         self.load_reading_goals()
+
+    def create_insights_page(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        top = QHBoxLayout()
+        top.addWidget(label("Reading insights", "headline"), stretch=1)
+        top.addWidget(label("Year:", "muted"))
+        self.insights_year = QSpinBox()
+        self.insights_year.setRange(1900, 2200)
+        self.insights_year.setValue(datetime.now().year)
+        self.insights_year.valueChanged.connect(self.refresh_insights_page)
+        top.addWidget(self.insights_year)
+        top.addWidget(button("Export monthly CSV", self.export_insights_csv))
+        layout.addLayout(top)
+        layout.addWidget(label(
+            "Measured reading milestones and known finish dates only. "
+            "Unknown historical dates are excluded.", "muted"
+        ))
+        self.insights_summary = label("", "subheading")
+        layout.addWidget(self.insights_summary)
+        self.monthly_table = QTableWidget(12, 6)
+        self.monthly_table.setHorizontalHeaderLabels(
+            ["Month", "Chapters", "Pages", "Activity days", "Events", "Completions"]
+        )
+        self.monthly_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.monthly_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.monthly_table.verticalHeader().setVisible(False)
+        self.monthly_table.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.Stretch
+        )
+        for col in range(1, 6):
+            self.monthly_table.horizontalHeader().setSectionResizeMode(
+                col, QHeaderView.ResizeMode.ResizeToContents
+            )
+        layout.addWidget(self.monthly_table, stretch=2)
+        layout.addWidget(label("Most represented authors", "subheading"))
+        self.insight_authors = QListWidget()
+        self.insight_authors.setMaximumHeight(170)
+        layout.addWidget(self.insight_authors)
+        self.pages.addWidget(page)
+
+    def export_insights_csv(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export monthly reading activity",
+            f"BookTracker-activity-{self.insights_year.value()}.csv",
+            "CSV files (*.csv)"
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w", newline="", encoding="utf-8-sig") as stream:
+                writer = csv.writer(stream)
+                writer.writerow(
+                    ["Year", "Month", "Chapters", "Pages", "Active days", "Events", "Completions"]
+                )
+                for item in self.library.monthly_activity(self.insights_year.value()):
+                    writer.writerow([
+                        self.insights_year.value(), item["month"], item["chapters"],
+                        item["pages"], item["reading_days"], item["events"], item["completed"],
+                    ])
+            self.statusBar().showMessage("Reading insights exported.", 7000)
+        except OSError as exc:
+            fail(self, exc)
+
+    def refresh_insights_page(self, *_args):
+        data = self.library.monthly_activity(self.insights_year.value())
+        names = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                 "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+        for row, item in enumerate(data):
+            values = [
+                names[row], f"{item['chapters']:,}", f"{item['pages']:,}",
+                str(item["reading_days"]), str(item["events"]), str(item["completed"]),
+            ]
+            for col, value in enumerate(values):
+                cell = QTableWidgetItem(value)
+                self.monthly_table.setItem(row, col, cell)
+            self.monthly_table.setRowHeight(row, 35)
+        self.insights_summary.setText(
+            f"{sum(m['chapters'] for m in data):,} chapters   ·   "
+            f"{sum(m['pages'] for m in data):,} pages   ·   "
+            f"{sum(m['reading_days'] for m in data):,} active days   ·   "
+            f"{sum(m['completed'] for m in data):,} dated completions"
+        )
+        self.insight_authors.clear()
+        for author in self.library.author_summary()[:12]:
+            self.insight_authors.addItem(
+                f"{author['author']}    ·    {author['total']} works "
+                f"({author['completed']} completed)"
+            )
+        if not self.insight_authors.count():
+            self.insight_authors.addItem("Add works with authors to see them here.")
+
+    def create_health_page(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.addWidget(label("Library health", "headline"))
+        layout.addWidget(label(
+            "Review potentially incomplete metadata and duplicates. "
+            "No books are deleted or merged automatically.", "muted"
+        ))
+        counts_grid = QGridLayout()
+        self.health_counts = {}
+        filters = [
+            ("Missing covers", "missing_cover"),
+            ("Missing authors", "missing_author"),
+            ("Missing descriptions", "missing_description"),
+            ("Missing source links", "missing_source"),
+            ("Unassigned series", "missing_series"),
+            ("Uncaught chapters", "serial_backlog"),
+            ("Completed without date", "unknown_dates"),
+        ]
+        for index, (caption, key) in enumerate(filters):
+            frame = QFrame()
+            frame.setObjectName("statCard")
+            column = QVBoxLayout(frame)
+            column.addWidget(label(caption, "muted"))
+            count = label("0", "value")
+            column.addWidget(count)
+            column.addWidget(button(
+                "Show affected books", lambda _checked=False, key=key: self.open_quality_filter(key)
+            ))
+            self.health_counts[key] = count
+            counts_grid.addWidget(frame, index // 4, index % 4)
+        layout.addLayout(counts_grid)
+
+        layout.addWidget(label("Possible duplicate works", "subheading"))
+        layout.addWidget(label(
+            "Matches are based on normalized title and author. "
+            "Review each match before changing or deleting anything.", "muted"
+        ))
+        self.duplicate_table = QTableWidget(0, 3)
+        self.duplicate_table.setHorizontalHeaderLabels(
+            ["Work", "Author", "Matching entries"]
+        )
+        self.duplicate_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.duplicate_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.duplicate_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.duplicate_table.verticalHeader().setVisible(False)
+        self.duplicate_table.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.Stretch
+        )
+        self.duplicate_table.horizontalHeader().setSectionResizeMode(
+            1, QHeaderView.ResizeMode.Stretch
+        )
+        self.duplicate_table.horizontalHeader().setSectionResizeMode(
+            2, QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.duplicate_table.itemDoubleClicked.connect(self.open_duplicate_book)
+        layout.addWidget(self.duplicate_table, stretch=1)
+        duplicate_actions = QHBoxLayout()
+        duplicate_actions.addWidget(button("Open selected book", self.open_duplicate_book))
+        self.duplicate_count = label("", "muted")
+        duplicate_actions.addWidget(self.duplicate_count, stretch=1)
+        layout.addLayout(duplicate_actions)
+
+        tags = QHBoxLayout()
+        tags.addWidget(label("Tag cleanup:", "subheading"))
+        self.health_tags = QComboBox()
+        tags.addWidget(self.health_tags, stretch=1)
+        tags.addWidget(button("Rename / merge", self.rename_selected_tag))
+        tags.addWidget(button("Delete tag", self.delete_selected_tag))
+        layout.addLayout(tags)
+        layout.addWidget(label(
+            "Renaming a tag merges duplicate spellings. Removing a tag "
+            "does not delete its books.", "muted"
+        ))
+        layout.addWidget(button("Check SQLite database integrity", self.show_integrity_result))
+        self.pages.addWidget(page)
+
+    def refresh_health_page(self):
+        counts = self.library.quality_counts()
+        for key, widget in self.health_counts.items():
+            widget.setText(str(counts[key]))
+        groups = self.library.duplicate_candidates()
+        self.duplicate_table.setRowCount(0)
+        row = 0
+        for entries in groups:
+            for work in entries:
+                self.duplicate_table.insertRow(row)
+                values = (work["title"], work["author"], str(len(entries)))
+                for col, value in enumerate(values):
+                    item = QTableWidgetItem(value)
+                    if col == 0:
+                        item.setData(Qt.ItemDataRole.UserRole, work["id"])
+                    self.duplicate_table.setItem(row, col, item)
+                self.duplicate_table.setRowHeight(row, 35)
+                row += 1
+        self.duplicate_count.setText(
+            f"{len(groups)} possible duplicate groups ({row} entries)"
+        )
+        current = self.health_tags.currentData()
+        self.health_tags.clear()
+        self.health_tags.addItem("Choose a tag…", None)
+        for tag in self.library.tag_summary():
+            self.health_tags.addItem(
+                f"{tag['tag']} ({tag['total']})", tag["tag"]
+            )
+        position = self.health_tags.findData(current)
+        if position >= 0:
+            self.health_tags.setCurrentIndex(position)
+
+    def open_quality_filter(self, key):
+        self.clear_library_filters()
+        index = self.quality_filter.findData(key)
+        if index >= 0:
+            self.quality_filter.setCurrentIndex(index)
+        self.navigate(0)
+        self.refresh_library()
+
+    def open_duplicate_book(self, item=None):
+        row = item.row() if item is not None else self.duplicate_table.currentRow()
+        if row < 0:
+            return
+        cell = self.duplicate_table.item(row, 0)
+        work_id = cell.data(Qt.ItemDataRole.UserRole) if cell else None
+        if not work_id:
+            return
+        self.clear_library_filters()
+        self.navigate(0)
+        self.refresh_library(select_id=work_id)
+
+    def rename_selected_tag(self):
+        old = self.health_tags.currentData()
+        if not old:
+            QMessageBox.information(self, "Select tag", "Choose a tag first.")
+            return
+        replacement, accepted = QInputDialog.getText(
+            self, "Rename or merge tag", f"Replace tag {old!r} with:", text=old
+        )
+        if not accepted:
+            return
+        try:
+            affected = self.library.rename_tag(old, replacement)
+            self.refresh_all()
+            self.refresh_health_page()
+            self.statusBar().showMessage(
+                f"Renamed tag in {affected} works.", 6500
+            )
+        except Exception as exc:
+            fail(self, exc)
+
+    def delete_selected_tag(self):
+        name = self.health_tags.currentData()
+        if not name:
+            QMessageBox.information(self, "Select tag", "Choose a tag first.")
+            return
+        if QMessageBox.question(
+            self, "Remove tag?", f"Remove {name!r} from every book? The books remain."
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            affected = self.library.delete_tag(name)
+            self.refresh_all()
+            self.refresh_health_page()
+            self.statusBar().showMessage(
+                f"Removed tag from {affected} works.", 6500
+            )
+        except Exception as exc:
+            fail(self, exc)
+
+    def show_integrity_result(self):
+        try:
+            status = self.library.integrity_check()
+            QMessageBox.information(
+                self, "SQLite integrity check",
+                "Database integrity: OK" if status == "ok" else
+                f"Database integrity check reported: {status}"
+            )
+        except Exception as exc:
+            fail(self, exc)
 
     def create_series_page(self):
         page = QWidget()
@@ -1519,6 +1832,17 @@ class MainWindow(QMainWindow):
             self.current_reads.addItem(tile)
         if not reading:
             self.current_reads.addItem("No current reads. Mark a book as Reading to see it here.")
+        self.serial_backlog.clear()
+        for work in self.library.list_works(quality="serial_backlog", sort="updated")[:30]:
+            remaining = work["total_units"] - work["progress"]
+            tile = QListWidgetItem(
+                f"{work['title']}  ·  {remaining} unread chapters "
+                f"({work['progress']}/{work['total_units']})"
+            )
+            tile.setData(Qt.ItemDataRole.UserRole, work["id"])
+            self.serial_backlog.addItem(tile)
+        if not self.serial_backlog.count():
+            self.serial_backlog.addItem("No known chapter backlogs.")
         self.recent_list.clear()
         for event in self.library.recent_activity(15):
             difference = event["new_progress"] - event["old_progress"]
@@ -1542,17 +1866,27 @@ class MainWindow(QMainWindow):
     def refresh_all(self, select_id=None):
         self.refresh_shelves()
         self.refresh_catalog_filters()
+        self.refresh_saved_views()
         self.refresh_library(select_id=select_id)
         self.refresh_history()
         self.refresh_stats()
 
     def refresh_library(self, *_args, select_id=None):
+        active_view = self.saved_view_combo.currentData()
+        if active_view:
+            selected = next(
+                (v for v in self.library.list_views() if v["id"] == active_view), None
+            )
+            if not selected or selected["filters"] != self.current_view_filters():
+                self.saved_view_combo.blockSignals(True)
+                self.saved_view_combo.setCurrentIndex(0)
+                self.saved_view_combo.blockSignals(False)
         books = self.library.list_works(
             self.search.text(), self.filter_status.currentData(),
             self.filter_kind.currentData(), self.only_fav.isChecked(),
             self.sort.currentData(), self.shelf_filter.currentData(),
             self.series_filter.currentData(), self.tag_filter.currentData(),
-            self.author_filter.currentData())
+            self.author_filter.currentData(), self.quality_filter.currentData())
         current = select_id or self.selected_id
         self.table.blockSignals(True)
         self.table.setRowCount(len(books))
@@ -1591,6 +1925,12 @@ class MainWindow(QMainWindow):
         for book in books:
             tile = QListWidgetItem(book["title"] + "\n" + book["author"])
             tile.setData(Qt.ItemDataRole.UserRole, book["id"])
+            tile.setToolTip(
+                f"{book['title']}\n{book['author']}\n"
+                f"Status: {name(book['status'])}\n"
+                f"Progress: {book['progress']} {book['progress_unit']}\n"
+                f"Rating: {book['rating'] if book['rating'] is not None else 'unrated'}"
+            )
             tile.setTextAlignment(Qt.AlignmentFlag.AlignHCenter)
             url = cover_url_for(book)
             cover = self.covers.get(url) if url else None
@@ -1688,6 +2028,32 @@ class MainWindow(QMainWindow):
                          (f"Progress: {progress} {book['progress_unit']}" +
                           (f" / {book['total_units']}" if book["total_units"] else "")))
         self.details.addWidget(label(progress_text, "subheading"))
+        available = book["total_units"] or (100 if book["progress_unit"] == "percent" else 0)
+        if available and progress >= 0:
+            progress_bar = QProgressBar()
+            progress_bar.setRange(0, available)
+            progress_bar.setValue(min(progress, available))
+            percentage = round(100 * progress / available)
+            progress_bar.setFormat(f"{percentage}% of known length")
+            self.details.addWidget(progress_bar)
+        if book["kind"] in ("fanfiction", "web_novel") and book["progress_unit"] == "chapters":
+            if book["total_units"]:
+                unread = max(0, book["total_units"] - progress)
+                self.details.addWidget(label(
+                    f"Published: {book['total_units']:,} chapters  ·  "
+                    f"{unread:,} remaining", "muted"
+                ))
+            self.details.addWidget(button(
+                "Update published chapters", self.edit_published_chapters
+            ))
+            row = QHBoxLayout()
+            row.addWidget(button("+1 chapter", lambda: self.advance_chapters(1)))
+            row.addWidget(button("+5 chapters", lambda: self.advance_chapters(5)))
+            self.details.addLayout(row)
+            if book["total_units"]:
+                self.details.addWidget(button(
+                    "Catch up to published chapters", self.catch_up_to_published
+                ))
         if book["notes"]:
             self.details.addWidget(label("Notes: " + book["notes"]))
         if book["description"]:
@@ -1808,10 +2174,95 @@ class MainWindow(QMainWindow):
     def clear_library_filters(self):
         self.search.clear()
         for combo in (self.filter_status, self.filter_kind, self.shelf_filter,
-                      self.series_filter, self.author_filter, self.tag_filter):
+                      self.series_filter, self.author_filter, self.tag_filter,
+                      self.quality_filter):
             combo.setCurrentIndex(0)
         self.only_fav.setChecked(False)
         self.refresh_library()
+
+    def current_view_filters(self):
+        return {
+            "search": self.search.text(),
+            "status": self.filter_status.currentData(),
+            "kind": self.filter_kind.currentData(),
+            "favorites": self.only_fav.isChecked(),
+            "sort": self.sort.currentData(),
+            "shelf_id": self.shelf_filter.currentData(),
+            "series": self.series_filter.currentData(),
+            "tag": self.tag_filter.currentData(),
+            "author": self.author_filter.currentData(),
+            "quality": self.quality_filter.currentData(),
+        }
+
+    def refresh_saved_views(self):
+        existing = self.saved_view_combo.currentData()
+        self.saved_view_combo.blockSignals(True)
+        self.saved_view_combo.clear()
+        self.saved_view_combo.addItem("Choose a saved filter…", None)
+        for saved in self.library.list_views():
+            self.saved_view_combo.addItem(saved["name"], saved["id"])
+        at = self.saved_view_combo.findData(existing)
+        self.saved_view_combo.setCurrentIndex(max(0, at))
+        self.saved_view_combo.blockSignals(False)
+
+    def save_current_view(self):
+        title, ok = QInputDialog.getText(
+            self, "Save library view", "Name these filters:"
+        )
+        if not ok:
+            return
+        try:
+            view_id = self.library.save_view(title, self.current_view_filters())
+            self.refresh_saved_views()
+            selected = self.saved_view_combo.findData(view_id)
+            self.saved_view_combo.blockSignals(True)
+            self.saved_view_combo.setCurrentIndex(selected)
+            self.saved_view_combo.blockSignals(False)
+            self.statusBar().showMessage(f"Saved library view: {title}", 6000)
+        except Exception as exc:
+            fail(self, exc)
+
+    def apply_saved_view(self, _index=None):
+        view_id = self.saved_view_combo.currentData()
+        if not view_id:
+            return
+        view = next((v for v in self.library.list_views() if v["id"] == view_id), None)
+        if not view:
+            return
+        values = view["filters"]
+        # Block dependent signal-driven refreshes while applying the snapshot.
+        inputs = (self.search, self.filter_status, self.filter_kind, self.sort,
+                  self.shelf_filter, self.series_filter, self.author_filter,
+                  self.tag_filter, self.quality_filter, self.only_fav)
+        previous = [widget.blockSignals(True) for widget in inputs]
+        try:
+            self.search.setText(values.get("search") or "")
+            for combo, key in (
+                (self.filter_status, "status"), (self.filter_kind, "kind"),
+                (self.sort, "sort"), (self.shelf_filter, "shelf_id"),
+                (self.series_filter, "series"), (self.author_filter, "author"),
+                (self.tag_filter, "tag"), (self.quality_filter, "quality"),
+            ):
+                found = combo.findData(values.get(key))
+                combo.setCurrentIndex(max(0, found))
+            self.only_fav.setChecked(bool(values.get("favorites")))
+        finally:
+            for widget, old in zip(inputs, previous):
+                widget.blockSignals(old)
+        self.refresh_library()
+
+    def delete_current_view(self):
+        view_id = self.saved_view_combo.currentData()
+        if not view_id:
+            QMessageBox.information(self, "Choose view", "Select a saved view to remove.")
+            return
+        name = self.saved_view_combo.currentText()
+        if QMessageBox.question(
+            self, "Delete saved view?", f"Delete the saved filter {name!r}? No books are deleted."
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        self.library.delete_view(view_id)
+        self.refresh_saved_views()
 
     def refresh_shelves(self):
         current = self.shelf_filter.currentData()
@@ -1918,13 +2369,33 @@ class MainWindow(QMainWindow):
         favorite.addItem("Leave favorites unchanged", None)
         favorite.addItem("Set favorites", True)
         favorite.addItem("Clear favorites", False)
+        publication = QComboBox()
+        publication.addItem("Leave publication status unchanged", None)
+        for value in PUBLICATION:
+            publication.addItem(name(value), value)
+        rating = QComboBox()
+        rating.addItem("Leave rating unchanged", None)
+        for n in range(11):
+            rating.addItem(f"{n / 2:g} stars", n / 2)
+        series_enabled = QCheckBox("Change series for all selected")
+        series = QLineEdit()
+        series.setPlaceholderText("Leave blank to clear series when checked")
+        series.setEnabled(False)
+        series_enabled.toggled.connect(series.setEnabled)
         tags = QLineEdit()
-        tags.setPlaceholderText("Optional tags separated by commas")
+        tags.setPlaceholderText("Tags to add, separated by commas")
+        remove_tags = QLineEdit()
+        remove_tags.setPlaceholderText("Tags to remove, separated by commas")
         form.addRow(f"Editing {len(ids)} selected books", label("Changes affect all selected entries."))
         form.addRow("Reading status", status)
+        form.addRow("Publication status", publication)
         form.addRow("Favorite", favorite)
+        form.addRow("Rating", rating)
+        form.addRow(series_enabled)
+        form.addRow("Series", series)
         form.addRow("Add tags", tags)
-        form.addRow(label("Historical completion dates will not be fabricated.", "muted"))
+        form.addRow("Remove tags", remove_tags)
+        form.addRow(label("Historical reading dates and progress will not be invented.", "muted"))
         controls = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
@@ -1936,6 +2407,10 @@ class MainWindow(QMainWindow):
                 self.library.batch_edit(
                     ids, status=status.currentData(), favorite=favorite.currentData(),
                     add_tags=[v.strip() for v in tags.text().split(",") if v.strip()],
+                    remove_tags=[v.strip() for v in remove_tags.text().split(",") if v.strip()],
+                    rating=rating.currentData(),
+                    publication_status=publication.currentData(),
+                    series=series.text() if series_enabled.isChecked() else None,
                 )
                 self.refresh_all()
             except Exception as exc:
@@ -2007,6 +2482,60 @@ class MainWindow(QMainWindow):
             if status != old_status:
                 self.library.set_status(work["id"], status)
             self.refresh_all(work["id"])
+        except Exception as exc:
+            fail(self, exc)
+
+    def edit_published_chapters(self):
+        work = self.selected_work()
+        if not work or work["kind"] not in ("fanfiction", "web_novel"):
+            return
+        count, ok = QInputDialog.getInt(
+            self, "Published chapters",
+            f"Total currently published chapters for {work['title']}:",
+            value=work["total_units"], min=0, max=10_000_000,
+        )
+        if not ok:
+            return
+        try:
+            self.library.set_published_units(work["id"], count)
+            self.refresh_all(work["id"])
+        except Exception as exc:
+            fail(self, exc)
+
+    def advance_chapters(self, count):
+        work = self.selected_work()
+        if not work or work["progress_unit"] != "chapters":
+            return
+        run = self.library.active_run(work["id"])
+        current = run["current_progress"] if run else 0
+        next_value = current + count
+        if work["total_units"] > 0 and next_value > work["total_units"]:
+            next_value = work["total_units"]
+        if next_value <= current:
+            self.statusBar().showMessage("Already at the known published chapter count.", 5000)
+            return
+        try:
+            self.library.set_progress(work["id"], next_value)
+            self.refresh_all(work["id"])
+        except Exception as exc:
+            fail(self, exc)
+
+    def catch_up_to_published(self):
+        work = self.selected_work()
+        if not work:
+            return
+        if QMessageBox.question(
+            self, "Catch up to published chapters?",
+            f"Log progress through chapter {work['total_units']:,} and mark "
+            f"{work['title']} caught up?"
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            advanced = self.library.catch_up_to_published(work["id"])
+            self.refresh_all(work["id"])
+            self.statusBar().showMessage(
+                f"Marked caught up. Advanced {advanced} chapters.", 7000
+            )
         except Exception as exc:
             fail(self, exc)
 
