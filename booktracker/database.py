@@ -66,17 +66,17 @@ class Library:
             raise
 
     def _snapshot_before_schema_migration(self):
-        """Save a WAL-consistent snapshot before an existing database moves to v10."""
+        """Save a WAL-consistent snapshot before an existing database moves to v11."""
         version = self.db.execute("PRAGMA user_version").fetchone()[0]
         exists = self.db.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='works'"
         ).fetchone()
-        if not exists or version >= 10:
+        if not exists or version >= 11:
             return
         folder = self.path.parent / "backups"
         folder.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-        target = folder / f"BookTracker-before-v014-{stamp}.sqlite3"
+        target = folder / f"BookTracker-before-v015-{stamp}.sqlite3"
         # sqlite3.backup copies committed WAL content safely.
         with sqlite3.connect(target) as destination:
             self.db.backup(destination)
@@ -305,6 +305,27 @@ class Library:
             checked_at TEXT NOT NULL DEFAULT ''
         );
         CREATE INDEX IF NOT EXISTS idx_audio_origin ON audio_metadata(origin);
+        CREATE TABLE IF NOT EXISTS epub_positions (
+            file_id TEXT PRIMARY KEY REFERENCES local_files(id) ON DELETE CASCADE,
+            work_id TEXT NOT NULL REFERENCES works(id) ON DELETE CASCADE,
+            section_index INTEGER NOT NULL DEFAULT 0 CHECK(section_index BETWEEN 0 AND 5000),
+            section_href TEXT NOT NULL DEFAULT '',
+            scroll_ratio INTEGER NOT NULL DEFAULT 0 CHECK(scroll_ratio BETWEEN 0 AND 10000),
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS epub_bookmarks (
+            id TEXT PRIMARY KEY,
+            file_id TEXT NOT NULL REFERENCES local_files(id) ON DELETE CASCADE,
+            work_id TEXT NOT NULL REFERENCES works(id) ON DELETE CASCADE,
+            section_index INTEGER NOT NULL CHECK(section_index BETWEEN 0 AND 5000),
+            section_href TEXT NOT NULL DEFAULT '',
+            scroll_ratio INTEGER NOT NULL DEFAULT 0 CHECK(scroll_ratio BETWEEN 0 AND 10000),
+            label TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_epub_bookmarks_work
+            ON epub_bookmarks(work_id,created_at DESC);
         CREATE TABLE IF NOT EXISTS sync_device (
             singleton INTEGER PRIMARY KEY CHECK(singleton=1),
             device_id TEXT NOT NULL UNIQUE,
@@ -325,7 +346,7 @@ class Library:
             (singleton,device_id,display_name,published_revision)
             VALUES(1,?,?,0)""",(new_id(),"This computer")
         )
-        self.db.execute("PRAGMA user_version=10")
+        self.db.execute("PRAGMA user_version=11")
         self._backfill_catalog_relationships()
         self.db.commit()
 
@@ -2685,6 +2706,84 @@ class Library:
             )
         return records
 
+    @staticmethod
+    def _epub_location(section_index, section_href="", scroll_ratio=0):
+        try:
+            index=int(section_index)
+            ratio=int(scroll_ratio)
+        except (TypeError,ValueError,OverflowError) as exc:
+            raise ValueError("Invalid EPUB reading position.") from exc
+        href=str(section_href or "")
+        if not 0 <= index <= 5000 or not 0 <= ratio <= 10000 or len(href)>1024:
+            raise ValueError("EPUB reading position exceeds supported limits.")
+        if "\x00" in href or href.startswith("/") or ".." in href.split("/"):
+            raise ValueError("Unsafe EPUB section reference.")
+        return index,href,ratio
+
+    @staticmethod
+    def _epub_bookmark_label(label):
+        label=str(label or "").strip()
+        if not label or len(label)>300 or "\x00" in label:
+            raise ValueError("Bookmark requires a label of 1–300 characters.")
+        return label
+
+    def _epub_file(self,file_id):
+        row=self.db.execute(
+            "SELECT id,work_id,format FROM local_files WHERE id=?",(file_id,)
+        ).fetchone()
+        if not row or row["format"]!="epub":
+            raise ValueError("Select a linked EPUB file.")
+        return row
+
+    def epub_position(self,file_id):
+        row=self.db.execute(
+            "SELECT * FROM epub_positions WHERE file_id=?",(file_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def save_epub_position(self,file_id,index,href="",ratio=0):
+        owned=self._epub_file(file_id)
+        index,href,ratio=self._epub_location(index,href,ratio)
+        with self.transaction():
+            self.db.execute(
+                """INSERT INTO epub_positions
+                (file_id,work_id,section_index,section_href,scroll_ratio,updated_at)
+                VALUES(?,?,?,?,?,?) ON CONFLICT(file_id) DO UPDATE SET
+                section_index=excluded.section_index,
+                section_href=excluded.section_href,
+                scroll_ratio=excluded.scroll_ratio,updated_at=excluded.updated_at""",
+                (file_id,owned["work_id"],index,href,ratio,now())
+            )
+
+    def list_epub_bookmarks(self,file_id):
+        self._epub_file(file_id)
+        return [dict(r) for r in self.db.execute(
+            """SELECT * FROM epub_bookmarks
+               WHERE file_id=? ORDER BY section_index,scroll_ratio,created_at""",
+            (file_id,)
+        )]
+
+    def add_epub_bookmark(self,file_id,index,href,ratio,label):
+        owned=self._epub_file(file_id)
+        index,href,ratio=self._epub_location(index,href,ratio)
+        label=self._epub_bookmark_label(label)
+        identifier=new_id()
+        with self.transaction():
+            self.db.execute(
+                """INSERT INTO epub_bookmarks
+                (id,file_id,work_id,section_index,section_href,scroll_ratio,
+                label,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)""",
+                (identifier,file_id,owned["work_id"],index,href,ratio,
+                 label,now(),now())
+            )
+        return identifier
+
+    def remove_epub_bookmark(self,identifier):
+        with self.transaction():
+            return bool(self.db.execute(
+                "DELETE FROM epub_bookmarks WHERE id=?",(identifier,)
+            ).rowcount)
+
     def get_local_file(self, file_id):
         row=self.db.execute(
             "SELECT * FROM local_files WHERE id=?",(file_id,)
@@ -3314,7 +3413,7 @@ class Library:
         return result
 
     def export_data(self):
-        return {"format": "booktracker", "schema_version": 10, "exported_at": now(),
+        return {"format": "booktracker", "schema_version": 11, "exported_at": now(),
                 "works": [dict(row) for row in self.db.execute("SELECT * FROM works")],
                 "reading_runs": [dict(row) for row in self.db.execute("SELECT * FROM reading_runs")],
                 "progress_events": [dict(row) for row in self.db.execute("SELECT * FROM progress_events")],
@@ -3343,11 +3442,17 @@ class Library:
                 )],
                 "audio_metadata": [dict(row) for row in self.db.execute(
                     "SELECT * FROM audio_metadata"
+                )],
+                "epub_positions": [dict(row) for row in self.db.execute(
+                    "SELECT * FROM epub_positions"
+                )],
+                "epub_bookmarks": [dict(row) for row in self.db.execute(
+                    "SELECT * FROM epub_bookmarks"
                 )]}
 
     def import_data(self, data, *, strategy="merge", postmerge=None, sync_mode=False):
         """Transactional import; duplicate event IDs are skipped when merging."""
-        if data.get("format") != "booktracker" or data.get("schema_version") not in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10):
+        if data.get("format") != "booktracker" or data.get("schema_version") not in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11):
             raise ValueError("Unsupported BookTracker backup format or schema version.")
         if data["schema_version"] >= 2 and (
             not isinstance(data.get("shelves"), list)
@@ -3380,6 +3485,11 @@ class Library:
             raise ValueError("Backup is missing serial subscriptions or release events.")
         if data["schema_version"] >= 9 and not isinstance(data.get("audio_metadata"),list):
             raise ValueError("Backup is missing audiobook metadata.")
+        if data["schema_version"] >= 11 and any(
+            not isinstance(data.get(key),list)
+            for key in ("epub_positions","epub_bookmarks")
+        ):
+            raise ValueError("Backup is missing EPUB reading positions or bookmarks.")
         for key in ("works", "reading_runs", "progress_events"):
             if not isinstance(data.get(key), list):
                 raise ValueError(f"Backup is missing {key}.")
@@ -3827,6 +3937,54 @@ class Library:
                     + ",".join(keys) + ") VALUES(?,"+
                     ",".join("?" for _ in keys)+")",
                     (file_id,*(fields[k] for k in keys))
+                )
+            for pos in data.get("epub_positions",[]):
+                if not isinstance(pos,dict):
+                    raise ValueError("Malformed EPUB position.")
+                file_id=str(pos.get("file_id") or "")
+                target=self.db.execute(
+                    "SELECT work_id,format FROM local_files WHERE id=?",(file_id,)
+                ).fetchone()
+                if not target or target["format"]!="epub" or target["work_id"]!=mapping.get(pos.get("work_id")):
+                    raise ValueError("Orphaned EPUB position.")
+                index,href,ratio=self._epub_location(
+                    pos.get("section_index"),pos.get("section_href"),
+                    pos.get("scroll_ratio")
+                )
+                self.db.execute(
+                    """INSERT OR IGNORE INTO epub_positions
+                    (file_id,work_id,section_index,section_href,scroll_ratio,updated_at)
+                    VALUES(?,?,?,?,?,?)""",
+                    (file_id,target["work_id"],index,href,ratio,
+                     str(pos.get("updated_at") or now())[:64])
+                )
+            for mark in data.get("epub_bookmarks",[]):
+                if not isinstance(mark,dict) or not mark.get("id"):
+                    raise ValueError("Malformed EPUB bookmark.")
+                file_id=str(mark.get("file_id") or "")
+                target=self.db.execute(
+                    "SELECT work_id,format FROM local_files WHERE id=?",(file_id,)
+                ).fetchone()
+                if not target or target["format"]!="epub" or target["work_id"]!=mapping.get(mark.get("work_id")):
+                    raise ValueError("Orphaned EPUB bookmark.")
+                index,href,ratio=self._epub_location(
+                    mark.get("section_index"),mark.get("section_href"),
+                    mark.get("scroll_ratio")
+                )
+                label=self._epub_bookmark_label(mark.get("label"))
+                existing=self.db.execute(
+                    "SELECT file_id FROM epub_bookmarks WHERE id=?",(mark["id"],)
+                ).fetchone()
+                if existing and existing["file_id"]!=file_id:
+                    raise ValueError("EPUB bookmark belongs to another file.")
+                self.db.execute(
+                    """INSERT OR IGNORE INTO epub_bookmarks
+                    (id,file_id,work_id,section_index,section_href,scroll_ratio,
+                     label,created_at,updated_at)
+                    VALUES(?,?,?,?,?,?,?,?,?)""",
+                    (mark["id"],file_id,target["work_id"],index,href,ratio,
+                     label,str(mark.get("created_at") or now())[:64],
+                     str(mark.get("updated_at") or now())[:64])
                 )
             self._backfill_catalog_relationships()
             if postmerge is not None:

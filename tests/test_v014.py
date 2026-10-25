@@ -51,7 +51,7 @@ def test_separate_device_ids_and_not_in_portable_export(pair,tmp_path):
     assert aa["published_revision"]==0
     assert "sync_device" not in a.export_data()
     assert "sync_peers" not in a.export_data()
-    assert a.export_data()["schema_version"]==10
+    assert a.export_data()["schema_version"]==11
     sync.set_device_name(a,"Gaming laptop")
     assert sync.device_info(a)["display_name"]=="Gaming laptop"
     with pytest.raises(ValueError):

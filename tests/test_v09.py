@@ -209,7 +209,7 @@ def test_v5_db_migrates_legacy_isbn_and_site_safely(tmp_path):
         con.execute("PRAGMA user_version=5")
     reloaded=Library(path)
     try:
-        assert reloaded.db.execute("PRAGMA user_version").fetchone()[0]==10
+        assert reloaded.db.execute("PRAGMA user_version").fetchone()[0]==11
         assert len(reloaded.list_sources(work))==1
         assert len(reloaded.list_editions(work))==1
         assert reloaded.list_editions(work)[0]["pages"]==600
@@ -288,7 +288,7 @@ def test_migration_backup_created_before_updating_schema(tmp_path):
         connection.execute("PRAGMA user_version=5")
     db=Library(path)
     try:
-        files=list((tmp_path/"backups").glob("BookTracker-before-v014-*.sqlite3"))
+        files=list((tmp_path/"backups").glob("BookTracker-before-v015-*.sqlite3"))
         assert files
         with sqlite3.connect(files[-1]) as raw:
             assert raw.execute("PRAGMA user_version").fetchone()[0]==5

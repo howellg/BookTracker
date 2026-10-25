@@ -420,9 +420,9 @@ def test_v8_schema_migration_creates_wal_safe_v013_snapshot(tmp_path):
         old.execute("PRAGMA user_version=8")
     upgraded=Library(path)
     try:
-        assert upgraded.db.execute("PRAGMA user_version").fetchone()[0]==10
+        assert upgraded.db.execute("PRAGMA user_version").fetchone()[0]==11
         assert upgraded.get_work(key)
-        snapshots=list((tmp_path/"backups").glob("BookTracker-before-v014-*.sqlite3"))
+        snapshots=list((tmp_path/"backups").glob("BookTracker-before-v015-*.sqlite3"))
         assert len(snapshots)==1
         with sqlite3.connect(snapshots[0]) as snap:
             assert snap.execute("PRAGMA user_version").fetchone()[0]==8
@@ -431,7 +431,7 @@ def test_v8_schema_migration_creates_wal_safe_v013_snapshot(tmp_path):
         upgraded.close()
     again=Library(path)
     try:
-        assert len(list((tmp_path/"backups").glob("BookTracker-before-v014-*.sqlite3")))==1
+        assert len(list((tmp_path/"backups").glob("BookTracker-before-v015-*.sqlite3")))==1
     finally:
         again.close()
 

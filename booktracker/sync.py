@@ -36,7 +36,7 @@ RELEVANT_TABLES = (
     "annotations", "shelves", "work_shelves", "reading_goals",
     "saved_views", "work_sources", "work_editions", "source_checks",
     "reading_queue", "local_files", "serial_follows", "serial_releases",
-    "audio_metadata",
+    "audio_metadata", "epub_positions", "epub_bookmarks",
 )
 KEYS = {
     "works": ("id",), "reading_runs": ("id",), "progress_events": ("id",),
@@ -46,6 +46,7 @@ KEYS = {
     "source_checks": ("id",), "reading_queue": ("id",),
     "local_files": ("id",), "serial_follows": ("work_id",),
     "serial_releases": ("id",), "audio_metadata": ("file_id",),
+    "epub_positions": ("file_id",), "epub_bookmarks": ("id",),
 }
 # DB must still validate and import these rows; only non-identity fields
 # explicitly supported here may be updated in place after safe comparison.
@@ -57,6 +58,7 @@ EDITABLE = {
     "reading_goals": {"books_target","chapters_target","pages_target"},
     "serial_follows": {"notify","seen_units"},
     "saved_views": {"filters_json"},
+    "epub_positions": {"section_index","section_href","scroll_ratio"},
 }
 IGNORE = {"updated_at","created_at","added_at","followed_at","checked_at"}
 
@@ -230,9 +232,13 @@ def read_snapshot(path):
         data=json.loads(raw)
         if not isinstance(data,dict) or data.get("format")!="booktracker":
             raise ValueError("Invalid BookTracker content.")
-        if data.get("schema_version") not in (9,10):
+        if data.get("schema_version") not in (9,10,11):
             raise ValueError("Peer snapshot requires BookTracker v0.13+.")
         for table in RELEVANT_TABLES:
+            if data.get("schema_version")<11 and table in (
+                "epub_positions","epub_bookmarks"
+            ):
+                data.setdefault(table,[])
             if not isinstance(data.get(table),list):
                 raise ValueError(f"Invalid sync table: {table}.")
         return PeerSnapshot(file,uid,label,revision,_file_hash(file),data)
@@ -375,7 +381,7 @@ def plan(library:Library,peer:PeerSnapshot):
             if table=="serial_releases" and row.get("source_id") and (
                 str(row["source_id"]),) in exclusions["work_sources"]:
                 continue
-            if table=="audio_metadata" and (
+            if table in ("audio_metadata","epub_positions","epub_bookmarks") and (
                 str(row.get("file_id")),) in exclusions["local_files"]:
                 continue
             if table=="work_shelves" and (
@@ -485,6 +491,12 @@ def _row_update(library, change, mapping, data):
             raise ValueError("Invalid following preference.")
         if field=="seen_units" and not 0<=value<=10_000_000:
             raise ValueError("Invalid acknowledged chapter count.")
+    elif table=="epub_positions":
+        row=next(row for row in data[table] if _key(table,row)==key)
+        idx,href,ratio=library._epub_location(
+            row.get("section_index"),row.get("section_href"),row.get("scroll_ratio")
+        )
+        value={"section_index":idx,"section_href":href,"scroll_ratio":ratio}[field]
     elif table=="saved_views":
         library.validate_view_filters(json.loads(change.remote))
         value=change.remote
