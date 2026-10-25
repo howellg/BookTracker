@@ -6,8 +6,9 @@ Opening and scrolling never creates reading-history or timed-session records.
 from __future__ import annotations
 
 from pathlib import Path
+from threading import Event
 
-from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QSettings, Qt, QTimer, QUrl
+from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QSettings, Qt, QThread, QTimer, QUrl, Signal
 from PySide6.QtGui import QAction, QImageReader, QTextDocument
 from PySide6.QtWidgets import (
     QComboBox,
@@ -27,12 +28,34 @@ from PySide6.QtWidgets import (
 )
 
 from .epub_reader import EpubBook
+from .epub_search import search_book
 
 
 def _action_button(text, callback):
     button=QPushButton(text)
     button.clicked.connect(callback)
     return button
+
+
+class _BookSearchThread(QThread):
+    """Read a separate EPUB handle so book-wide searches never block Qt."""
+
+    found = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, path, term, parent=None):
+        super().__init__(parent)
+        self.path = str(path)
+        self.term = term
+        self.cancel = Event()
+
+    def run(self):
+        try:
+            report = search_book(EpubBook(self.path), self.term, cancel=self.cancel)
+            self.found.emit(report)
+        except Exception as exc:
+            # A damaged or replaced file must report an error, not take down Qt.
+            self.failed.emit(str(exc))
 
 
 class EpubReader(QDialog):
@@ -51,6 +74,8 @@ class EpubReader(QDialog):
         self.index=0
         self._restoring=False
         self._closed=False
+        self._search_thread=None
+        self._search_term=""
         self.settings=settings or QSettings("BookTracker","BookTracker")
         self.setWindowTitle(f"Reading: {self.work['title']} — BookTracker")
         self.resize(1130,800)
@@ -78,6 +103,10 @@ class EpubReader(QDialog):
         side=QVBoxLayout(sidebar)
         side.setContentsMargins(0,0,0,0)
         side.addWidget(QLabel("Contents"))
+        self.toc_filter=QLineEdit()
+        self.toc_filter.setPlaceholderText("Filter contents by title…")
+        self.toc_filter.textChanged.connect(self.filter_contents)
+        side.addWidget(self.toc_filter)
         self.sections=QListWidget()
         self.sections.setMinimumWidth(155)
         self.sections.setTextElideMode(Qt.TextElideMode.ElideRight)
@@ -87,7 +116,13 @@ class EpubReader(QDialog):
             chapter.setData(Qt.ItemDataRole.UserRole,i)
             self.sections.addItem(chapter)
         self.sections.currentRowChanged.connect(self.go_section)
-        side.addWidget(self.sections,stretch=1)
+        side.addWidget(self.sections,stretch=2)
+        side.addWidget(QLabel("Book-wide search results"))
+        self.book_matches=QListWidget()
+        self.book_matches.setWordWrap(True)
+        self.book_matches.setMinimumHeight(95)
+        self.book_matches.itemDoubleClicked.connect(self.jump_to_search_hit)
+        side.addWidget(self.book_matches,stretch=1)
         side.addWidget(QLabel("Bookmarks"))
         self.marks=QListWidget()
         self.marks.itemDoubleClicked.connect(self.goto_bookmark)
@@ -103,6 +138,11 @@ class EpubReader(QDialog):
         self.search.returnPressed.connect(self.find_next)
         find_row.addWidget(self.search,stretch=1)
         find_row.addWidget(_action_button("Find next",self.find_next))
+        self.book_search_button=_action_button("Find in book",self.find_in_book)
+        find_row.addWidget(self.book_search_button)
+        self.cancel_search_button=_action_button("Cancel",self.cancel_book_search)
+        self.cancel_search_button.setEnabled(False)
+        find_row.addWidget(self.cancel_search_button)
         reading_layout.addLayout(find_row)
         self.viewer=QTextBrowser()
         self.viewer.setOpenLinks(False)
@@ -155,7 +195,11 @@ class EpubReader(QDialog):
         self.refresh_bookmarks()
         # Avoid QDialog keyboard defaults reinterpreting arrow keys as accept.
         for key,call in (("Alt+Left",lambda:self.step(-1)),
-                         ("Alt+Right",lambda:self.step(1))):
+                         ("Alt+Right",lambda:self.step(1)),
+                         ("Alt+Home",lambda:self.load_section(0)),
+                         ("Alt+End",lambda:self.load_section(len(self.book)-1)),
+                         ("Ctrl+F",self.focus_section_search),
+                         ("Ctrl+Shift+F",self.focus_book_search)):
             action=QAction(self)
             action.setShortcut(key)
             action.triggered.connect(call)
@@ -220,6 +264,8 @@ class EpubReader(QDialog):
         self.sections.item(index).setText(
             f"{index+1:>3}  {content['title']}"
         )
+        if self.toc_filter.text().strip():
+            self.filter_contents(self.toc_filter.text())
         self.viewer.clear()
         # Add each *internal* image via a data-bound Qt document resource.
         image_budget=12_000_000
@@ -282,6 +328,103 @@ class EpubReader(QDialog):
             self.viewer.setTextCursor(cursor)
             if not self.viewer.find(term):
                 self.message.setText("No match in this section.")
+
+    def filter_contents(self, term):
+        """Narrow long EPUB tables of contents without changing positions."""
+        needle=term.strip().casefold()
+        for index in range(self.sections.count()):
+            item=self.sections.item(index)
+            item.setHidden(bool(needle and needle not in item.text().casefold()))
+
+    def focus_section_search(self):
+        self.search.setFocus()
+        self.search.selectAll()
+
+    def focus_book_search(self):
+        if self.search.text().strip():
+            self.find_in_book()
+        else:
+            self.focus_section_search()
+
+    def find_in_book(self):
+        term=self.search.text().strip()
+        if not 2<=len(term)<=80:
+            self.message.setText("Enter 2–80 characters to search the entire EPUB.")
+            self.search.setFocus()
+            return
+        if self._search_thread is not None:
+            self.message.setText("A book-wide search is already running; cancel it first.")
+            return
+        self._search_term=term
+        self.book_matches.clear()
+        self.book_search_button.setEnabled(False)
+        self.cancel_search_button.setEnabled(True)
+        self.message.setText(f"Searching all EPUB sections for ‘{term}’…")
+        worker=_BookSearchThread(self.book.path,term,self)
+        self._search_thread=worker
+        worker.found.connect(self.show_book_results)
+        worker.failed.connect(self.book_search_failed)
+        worker.finished.connect(self.book_search_finished)
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+
+    def cancel_book_search(self):
+        if self._search_thread is not None:
+            self._search_thread.cancel.set()
+            self.cancel_search_button.setEnabled(False)
+            self.message.setText("Stopping book-wide search…")
+
+    def show_book_results(self, report):
+        if self._closed:
+            return
+        for hit in report.hits:
+            item=QListWidgetItem(
+                f"§ {hit.section_index+1} · {hit.title}\n…{hit.excerpt}…"
+            )
+            item.setData(Qt.ItemDataRole.UserRole,hit)
+            self.book_matches.addItem(item)
+        state=("Cancelled" if report.cancelled else "Search complete")
+        detail=(f"{len(report.hits)} matches across {report.sections_scanned} "
+                f"EPUB sections")
+        if report.truncated:
+            detail+=" · results limited (narrow your search)"
+        if report.skipped_sections:
+            detail+=f" · {report.skipped_sections} unreadable sections skipped"
+        self.message.setText(f"{state}: {detail}. Double-click a result to jump.")
+
+    def book_search_failed(self, error):
+        if not self._closed:
+            self.message.setText(f"Book search could not finish: {error}")
+
+    def book_search_finished(self):
+        if self._closed:
+            return
+        self.book_search_button.setEnabled(True)
+        self.cancel_search_button.setEnabled(False)
+        self._search_thread=None
+
+    def jump_to_search_hit(self, item):
+        hit=item.data(Qt.ItemDataRole.UserRole)
+        if hit is None:
+            return
+        self.load_section(hit.section_index)
+        self.search.setText(self._search_term)
+
+        # Deferred until the reader's scroll restoration has completed.
+        def show_match():
+            if self._closed:
+                return
+            cursor=self.viewer.textCursor()
+            cursor.movePosition(cursor.MoveOperation.Start)
+            self.viewer.setTextCursor(cursor)
+            for _ in range(hit.occurrence):
+                if not self.viewer.find(self._search_term):
+                    self.message.setText("Passage not found in rendered section.")
+                    return
+            self.message.setText(
+                f"Found in section {hit.section_index+1}: {hit.title}."
+            )
+        QTimer.singleShot(55,show_match)
 
     def refresh_bookmarks(self):
         self.marks.clear()
@@ -394,4 +537,8 @@ class EpubReader(QDialog):
             self._save_timer.stop()
         self.save_position()
         self._closed=True
+        if self._search_thread is not None and self._search_thread.isRunning():
+            # Never destroy a running Qt thread when a reader dialog closes.
+            self._search_thread.cancel.set()
+            self._search_thread.wait()
         super().closeEvent(event)
