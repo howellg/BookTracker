@@ -50,6 +50,16 @@ Built with Python, PySide6, and SQLite. No account, cloud subscription, or alway
 - All data is saved locally in an SQLite database; portable JSON/XML import uses stable UUIDs for merge.
 - Use **Device sync** to exchange portable snapshots via a dedicated shared folder with per-field conflict review and recovery backups.
 
+## Fix in v0.14.1
+
+- Fixed a sidebar navigation regression introduced when **Device sync** moved
+  above **Series** in v0.14.0. Pages now select their sidebar button by its
+  explicit destination index instead of the button's visual list position.
+- Clicking any sidebar entry opens and highlights the correct page, including
+  repeated clicks and switching between pages. No schema or backup changes.
+- Added regression tests that click every sidebar button forwards, backwards
+  and twice in succession.
+
 ## New in v0.14.0
 
 **Device sync (shared-folder edition)** lets multiple computers exchange

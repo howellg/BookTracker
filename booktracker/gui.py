@@ -2320,6 +2320,9 @@ class MainWindow(QMainWindow):
             nav = button(title, lambda _, i=index: self.navigate(i))
             nav.setObjectName("nav")
             nav.setCheckable(True)
+            # Sidebar display order is independent of QStackedWidget page order.
+            # Device sync is positioned near the top, but its page is index 13.
+            nav.setProperty("page_index", index)
             nav_layout.addWidget(nav)
             self.nav_buttons.append(nav)
         nav_layout.addStretch()
@@ -2415,8 +2418,8 @@ class MainWindow(QMainWindow):
 
     def navigate(self, index):
         self.pages.setCurrentIndex(index)
-        for i, nav in enumerate(self.nav_buttons):
-            nav.setChecked(i == index)
+        for nav in self.nav_buttons:
+            nav.setChecked(nav.property("page_index") == index)
         if index == 1:
             self.refresh_history()
         elif index == 2:
