@@ -6,6 +6,7 @@ import re
 import sqlite3
 import uuid
 from contextlib import contextmanager
+from datetime import date as date_class
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -219,7 +220,7 @@ class Library:
         return work
 
     def list_works(self, search="", status="all", kind="all", favorites=False, sort="updated",
-                   shelf_id=None, series=None, tag=None) -> list[dict]:
+                   shelf_id=None, series=None, tag=None, author=None) -> list[dict]:
         sql = """SELECT w.*, COALESCE((
             SELECT current_progress FROM reading_runs
             WHERE work_id=w.id ORDER BY started_at DESC, rowid DESC LIMIT 1
@@ -247,6 +248,9 @@ class Library:
         if series:
             sql += " AND w.series=? COLLATE NOCASE"
             args.append(series)
+        if author:
+            sql += " AND w.author=? COLLATE NOCASE"
+            args.append(author)
         if tag:
             sql += (" AND EXISTS (SELECT 1 FROM json_each(w.tags) t "
                     "WHERE t.value=? COLLATE NOCASE)")
@@ -263,6 +267,20 @@ class Library:
         for r in rows:
             r["tags"] = json.loads(r["tags"])
         return rows
+
+    def author_summary(self):
+        """Author credits as entered, including unknown and multi-author credits."""
+        rows = self.db.execute(
+            """SELECT author, COUNT(*) AS total,
+                SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) AS completed,
+                SUM(CASE WHEN status IN ('reading','caught_up') THEN 1 ELSE 0 END) AS active,
+                SUM(CASE WHEN favorite=1 THEN 1 ELSE 0 END) AS favorites,
+                ROUND(AVG(rating), 2) AS average_rating
+            FROM works WHERE TRIM(author)!=''
+            GROUP BY author COLLATE NOCASE
+            ORDER BY total DESC, author COLLATE NOCASE"""
+        )
+        return [dict(row) for row in rows]
 
     def delete_work(self, work_id):
         with self.transaction():
@@ -350,6 +368,181 @@ class Library:
                                 (date or now(), status, now(), work_id))
             else:
                 self.db.execute("UPDATE works SET status=?,updated_at=? WHERE id=?", (status, now(), work_id))
+
+    @staticmethod
+    def _reading_date(value) -> str:
+        """Normalize explicit historical dates, never infer missing timestamps."""
+        if isinstance(value, datetime):
+            if value.tzinfo is not None:
+                return value.isoformat(timespec="seconds")
+            return value.isoformat(timespec="seconds")
+        if isinstance(value, date_class):
+            return value.isoformat()
+        text = str(value or "").strip()
+        if not text:
+            raise ValueError("Choose a date for this reading milestone.")
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError as exc:
+            raise ValueError("Enter a date in YYYY-MM-DD format.") from exc
+        if not 1900 <= parsed.year <= 2200:
+            raise ValueError("Milestone year must be between 1900 and 2200.")
+        if "T" in text or " " in text:
+            return parsed.isoformat(timespec="seconds")
+        return parsed.date().isoformat()
+
+    def _reconcile_run_events(self, run_id):
+        """Recalculate deltas chronologically after editing a past milestone.
+
+        Event progress means the absolute position reached at that point,
+        so each successor's previous value must follow the predecessor.
+        """
+        entries = list(self.db.execute(
+            """SELECT id,new_progress FROM progress_events WHERE run_id=?
+            ORDER BY recorded_at ASC,rowid ASC""", (run_id,),
+        ))
+        previous = 0
+        for event in entries:
+            if previous != self.db.execute(
+                "SELECT old_progress FROM progress_events WHERE id=?", (event["id"],)
+            ).fetchone()[0]:
+                self.db.execute(
+                    "UPDATE progress_events SET old_progress=? WHERE id=?",
+                    (previous, event["id"]),
+                )
+            previous = event["new_progress"]
+        self.db.execute(
+            "UPDATE reading_runs SET current_progress=? WHERE id=?",
+            (previous, run_id),
+        )
+
+    def get_progress_event(self, event_id):
+        row = self.db.execute(
+            """SELECT e.*, w.title,w.progress_unit,w.total_units
+            FROM progress_events e JOIN works w ON w.id=e.work_id WHERE e.id=?""",
+            (event_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def update_progress_event(self, event_id, *, date=None, progress=None, note=None):
+        """Correct a milestone without creating a new reading session."""
+        event = self.get_progress_event(event_id)
+        if not event:
+            raise ValueError("Progress event not found.")
+        changes = {}
+        if date is not None:
+            changes["recorded_at"] = self._reading_date(date)
+        if progress is not None:
+            progress = int(progress)
+            if progress < 0 or (event["progress_unit"] == "percent" and progress > 100):
+                raise ValueError("Progress is outside the allowed range.")
+            changes["new_progress"] = progress
+        if note is not None:
+            changes["note"] = str(note).strip()
+        if not changes:
+            return
+        with self.transaction():
+            pairs = ", ".join(f"{key}=?" for key in changes)
+            self.db.execute(
+                f"UPDATE progress_events SET {pairs} WHERE id=?",
+                (*changes.values(), event_id),
+            )
+            self._reconcile_run_events(event["run_id"])
+            first = self.db.execute(
+                "SELECT MIN(recorded_at) AS first FROM progress_events WHERE run_id=?",
+                (event["run_id"],),
+            ).fetchone()["first"]
+            if first:
+                run = self.db.execute(
+                    "SELECT started_at FROM reading_runs WHERE id=?",
+                    (event["run_id"],),
+                ).fetchone()
+                if run and (not run["started_at"] or first < run["started_at"]):
+                    self.db.execute(
+                        "UPDATE reading_runs SET started_at=? WHERE id=?",
+                        (first, event["run_id"]),
+                    )
+            self.db.execute(
+                "UPDATE works SET updated_at=? WHERE id=?",
+                (now(), event["work_id"]),
+            )
+
+    def record_progress_on(self, work_id, progress: int, *, date, note=""):
+        """Log an event on a historical date and recalculate future deltas.
+
+        Unlike ordinary set_progress, inserting an older milestone won't
+        replace today's latest progress in the active reading run.
+        """
+        recorded_at = self._reading_date(date)
+        work = self.get_work(work_id)
+        if not work:
+            raise KeyError(work_id)
+        progress = int(progress)
+        if progress < 0 or (work["progress_unit"] == "percent" and progress > 100):
+            raise ValueError("Progress is outside the allowed range.")
+        with self.transaction():
+            run = self.active_run(work_id)
+            if run is None:
+                run_id = self._begin_run(work_id, recorded_at)
+            else:
+                run_id = run["id"]
+            self.db.execute(
+                """INSERT INTO progress_events
+                (id,work_id,run_id,recorded_at,old_progress,new_progress,note)
+                VALUES(?,?,?,?,?,?,?)""",
+                (new_id(), work_id, run_id, recorded_at, 0, progress, str(note).strip()),
+            )
+            self._reconcile_run_events(run_id)
+            run_date = self.db.execute(
+                "SELECT started_at FROM reading_runs WHERE id=?", (run_id,)
+            ).fetchone()["started_at"]
+            if recorded_at < run_date:
+                self.db.execute(
+                    "UPDATE reading_runs SET started_at=? WHERE id=?", (recorded_at, run_id)
+                )
+            if not work["started_at"] or recorded_at < work["started_at"]:
+                self.db.execute(
+                    "UPDATE works SET started_at=? WHERE id=?",
+                    (recorded_at, work_id),
+                )
+            new_status = (
+                "reading" if work["status"] in ("plan_to_read", "paused", "dropped")
+                else work["status"]
+            )
+            self.db.execute(
+                "UPDATE works SET status=?,updated_at=? WHERE id=?",
+                (new_status, now(), work_id),
+            )
+
+    def history_filtered(self, *, search="", year=None, work_id=None, limit=2000):
+        """Search notes, titles and author with optional date-year filter."""
+        sql = """SELECT e.*, w.title,w.author,w.progress_unit FROM progress_events e
+            JOIN works w ON w.id=e.work_id WHERE 1=1"""
+        args = []
+        if work_id:
+            sql += " AND e.work_id=?"
+            args.append(work_id)
+        if search.strip():
+            escaped = search.strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            sql += (" AND (w.title LIKE ? ESCAPE '\\' OR w.author LIKE ? ESCAPE '\\'"
+                    " OR e.note LIKE ? ESCAPE '\\')")
+            args.extend(["%" + escaped + "%"] * 3)
+        if year is not None:
+            year = int(year)
+            if not 1900 <= year <= 2200:
+                raise ValueError("History year is outside the supported range.")
+            sql += " AND SUBSTR(e.recorded_at,1,4)=?"
+            args.append(str(year))
+        sql += " ORDER BY e.recorded_at DESC,e.rowid DESC LIMIT ?"
+        args.append(max(1, min(10000, int(limit))))
+        return [dict(r) for r in self.db.execute(sql, args)]
+
+    def history_years(self):
+        return [int(row["year"]) for row in self.db.execute(
+            """SELECT DISTINCT SUBSTR(recorded_at,1,4) AS year
+            FROM progress_events WHERE LENGTH(recorded_at)>=4
+            ORDER BY year DESC"""
+        ) if row["year"].isdigit()]
 
     def history(self, work_id=None, limit=500):
         if work_id:
@@ -619,13 +812,9 @@ class Library:
             if not event:
                 raise ValueError("Progress event not found.")
             self.db.execute("DELETE FROM progress_events WHERE id=?", (event_id,))
-            recent = self.db.execute(
-                "SELECT new_progress FROM progress_events WHERE run_id=? "
-                "ORDER BY recorded_at DESC,rowid DESC LIMIT 1", (event["run_id"],)
-            ).fetchone()
+            self._reconcile_run_events(event["run_id"])
             self.db.execute(
-                "UPDATE reading_runs SET current_progress=? WHERE id=?",
-                (recent["new_progress"] if recent else 0, event["run_id"])
+                "UPDATE works SET updated_at=? WHERE id=?", (now(), event["work_id"])
             )
 
     def integrity_check(self):

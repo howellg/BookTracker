@@ -1,18 +1,20 @@
 """PySide6 desktop interface. All user data stays in the local SQLite database."""
 from __future__ import annotations
 
+import csv
 import sys
 import webbrowser
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QSettings, QSize, Qt, QThread, QUrl, Signal
+from PySide6.QtCore import QDate, QSettings, QSize, Qt, QThread, QUrl, Signal
 from PySide6.QtGui import QAction, QColor, QFont, QIcon, QPainter, QPalette, QPixmap
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDateEdit,
     QDialog,
     QDialogButtonBox,
     QDoubleSpinBox,
@@ -83,11 +85,11 @@ QLabel#headline { font-size: 25px; font-weight: 700; }
 QLabel#subheading { font-size: 16px; font-weight: 650; }
 QLabel#muted { color: #9ba9bf; }
 QLabel#value { color: #7bb6ff; font-size: 26px; font-weight: 700; }
-QLineEdit, QTextEdit, QComboBox, QSpinBox, QDoubleSpinBox, QTableWidget, QListWidget {
+QLineEdit, QTextEdit, QComboBox, QSpinBox, QDoubleSpinBox, QDateEdit, QTableWidget, QListWidget {
  background: #202c3c; border: 1px solid #34445a; border-radius: 7px;
  padding: 7px; selection-background-color: #305c8f;
 }
-QLineEdit:focus, QTextEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus {
+QLineEdit:focus, QTextEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus, QDateEdit:focus {
  border: 1px solid #7bb6ff;
 }
 QPushButton { background: #2b3d54; border: 1px solid #38506a; border-radius: 8px;
@@ -900,11 +902,61 @@ class ProgressDialog(QDialog):
         self.progress.setValue(work.get("progress", 0))
         self.note = QLineEdit()
         self.note.setPlaceholderText("Optional reading note")
+        self.use_historical_date = QCheckBox("Set a specific reading date")
+        self.when = QDateEdit()
+        self.when.setCalendarPopup(True)
+        self.when.setDisplayFormat("yyyy-MM-dd")
+        self.when.setDate(QDate.currentDate())
+        self.when.setMinimumDate(QDate(1900, 1, 1))
+        self.when.setMaximumDate(QDate(2200, 12, 31))
+        self.when.setEnabled(False)
+        self.use_historical_date.toggled.connect(self.when.setEnabled)
         form.addRow(name(work["progress_unit"]) + " reached", self.progress)
         form.addRow("Note", self.note)
+        form.addRow(self.use_historical_date)
+        form.addRow("Date", self.when)
         layout.addLayout(form)
         actions = QDialogButtonBox(QDialogButtonBox.StandardButton.Save |
                                    QDialogButtonBox.StandardButton.Cancel)
+        actions.accepted.connect(self.accept)
+        actions.rejected.connect(self.reject)
+        layout.addWidget(actions)
+
+
+class MilestoneEditor(QDialog):
+    """Correct an existing progress event, including past dates and absolute progress."""
+
+    def __init__(self, parent, event):
+        super().__init__(parent)
+        self.setWindowTitle("Edit reading milestone")
+        self.resize(460, 270)
+        layout = QVBoxLayout(self)
+        layout.addWidget(label(event["title"], "subheading"))
+        layout.addWidget(label(
+            "Editing a previous milestone recalculates later progress differences.", "muted"
+        ))
+        form = QFormLayout()
+        self.date = QDateEdit()
+        self.date.setDisplayFormat("yyyy-MM-dd")
+        self.date.setCalendarPopup(True)
+        self.date.setMinimumDate(QDate(1900, 1, 1))
+        self.date.setMaximumDate(QDate(2200, 12, 31))
+        parsed = QDate.fromString(event["recorded_at"][:10], "yyyy-MM-dd")
+        self.date.setDate(parsed if parsed.isValid() else QDate.currentDate())
+        self.progress = QSpinBox()
+        self.progress.setRange(
+            0, 100 if event["progress_unit"] == "percent" else 10_000_000
+        )
+        self.progress.setValue(event["new_progress"])
+        self.note = QLineEdit(event["note"])
+        self.note.setPlaceholderText("Optional note")
+        form.addRow("Date", self.date)
+        form.addRow(name(event["progress_unit"]) + " reached", self.progress)
+        form.addRow("Note", self.note)
+        layout.addLayout(form)
+        actions = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
+        )
         actions.accepted.connect(self.accept)
         actions.rejected.connect(self.reject)
         layout.addWidget(actions)
@@ -944,7 +996,8 @@ class MainWindow(QMainWindow):
         sidebar.addSpacing(24)
         self.nav_buttons = []
         for title, index in (("▤   Library", 0), ("◷   Reading history", 1),
-                             ("▥   Dashboard", 2), ("▦   Series", 3)):
+                             ("▥   Dashboard", 2), ("▦   Series", 3),
+                             ("♧   Authors", 4)):
             nav = button(title, lambda _, i=index: self.navigate(i))
             nav.setObjectName("nav")
             nav.setCheckable(True)
@@ -964,6 +1017,7 @@ class MainWindow(QMainWindow):
         self.create_history_page()
         self.create_stats_page()
         self.create_series_page()
+        self.create_authors_page()
         geometry = self.settings.value("window_geometry")
         if geometry:
             self.restoreGeometry(geometry)
@@ -987,6 +1041,9 @@ class MainWindow(QMainWindow):
             ("Import BookTracker file", self.import_library, ""),
             ("Export BookTracker file", self.export_library, "Ctrl+Shift+S"),
             ("Back up database", self.manual_backup, "Ctrl+B"),
+            ("Focus library search", self.focus_library_search, "Ctrl+F"),
+            ("Reading history", lambda: self.navigate(1), "Ctrl+H"),
+            ("Authors", lambda: self.navigate(4), "Ctrl+Shift+A"),
         ):
             action = QAction(title, self)
             action.triggered.connect(callback)
@@ -1008,6 +1065,13 @@ class MainWindow(QMainWindow):
             self.refresh_stats()
         elif index == 3:
             self.refresh_series_page()
+        elif index == 4:
+            self.refresh_authors_page()
+
+    def focus_library_search(self):
+        self.navigate(0)
+        self.search.setFocus()
+        self.search.selectAll()
 
     def create_library_page(self):
         page = QWidget()
@@ -1037,7 +1101,8 @@ class MainWindow(QMainWindow):
         self.filter_kind.currentIndexChanged.connect(self.refresh_library)
         self.sort = QComboBox()
         for title, key in (("Recently updated", "updated"), ("Title", "title"),
-                           ("Author", "author"), ("Recently added", "added"), ("Rating", "rating")):
+                           ("Author", "author"), ("Recently added", "added"), ("Rating", "rating"),
+                           ("Recently finished", "finished"), ("Series", "series")):
             self.sort.addItem(title, key)
         self.sort.currentIndexChanged.connect(self.refresh_library)
         self.shelf_filter = QComboBox()
@@ -1046,6 +1111,9 @@ class MainWindow(QMainWindow):
         self.series_filter = QComboBox()
         self.series_filter.addItem("All series", None)
         self.series_filter.currentIndexChanged.connect(self.refresh_library)
+        self.author_filter = QComboBox()
+        self.author_filter.addItem("All authors", None)
+        self.author_filter.currentIndexChanged.connect(self.refresh_library)
         self.tag_filter = QComboBox()
         self.tag_filter.addItem("All tags", None)
         self.tag_filter.currentIndexChanged.connect(self.refresh_library)
@@ -1061,6 +1129,7 @@ class MainWindow(QMainWindow):
         secondary_filters.addWidget(label("Collections:", "muted"))
         secondary_filters.addWidget(self.shelf_filter, stretch=1)
         secondary_filters.addWidget(self.series_filter, stretch=1)
+        secondary_filters.addWidget(self.author_filter, stretch=1)
         secondary_filters.addWidget(self.tag_filter, stretch=1)
         secondary_filters.addWidget(button("Clear filters", self.clear_library_filters))
         layout.addLayout(secondary_filters)
@@ -1144,16 +1213,46 @@ class MainWindow(QMainWindow):
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.addWidget(label("Reading history", "headline"))
-        layout.addWidget(label("Chapter and page milestones across every work and reread.", "muted"))
-        layout.addWidget(button("Delete selected mistaken milestone", self.delete_history_event))
+        layout.addWidget(label(
+            "Find and correct chapter/page milestones across all reading runs.", "muted"
+        ))
+        filter_row = QHBoxLayout()
+        self.history_search = QLineEdit()
+        self.history_search.setPlaceholderText("Search book, author or note…")
+        self.history_search.textChanged.connect(self.refresh_history)
+        filter_row.addWidget(self.history_search, stretch=1)
+        self.history_year = QComboBox()
+        self.history_year.addItem("All years", None)
+        self.history_year.currentIndexChanged.connect(self.refresh_history)
+        filter_row.addWidget(self.history_year)
+        filter_row.addWidget(button("Edit selected", self.edit_history_event))
+        filter_row.addWidget(button("Open book", self.open_history_book))
+        filter_row.addWidget(button("Export CSV", self.export_history_csv))
+        layout.addLayout(filter_row)
+        actions = QHBoxLayout()
+        actions.addWidget(button("Delete selected mistaken milestone", self.delete_history_event))
+        self.history_count = label("", "muted")
+        actions.addWidget(self.history_count)
+        actions.addStretch()
+        layout.addLayout(actions)
         self.history_table = QTableWidget(0, 4)
         self.history_table.setHorizontalHeaderLabels(["Date", "Work", "Progress", "Note"])
         self.history_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.history_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.history_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         self.history_table.verticalHeader().setVisible(False)
-        self.history_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        self.history_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        self.history_table.horizontalHeader().setSectionResizeMode(
+            1, QHeaderView.ResizeMode.Stretch
+        )
+        self.history_table.horizontalHeader().setSectionResizeMode(
+            2, QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.history_table.horizontalHeader().setSectionResizeMode(
+            3, QHeaderView.ResizeMode.Stretch
+        )
+        self.history_table.itemDoubleClicked.connect(
+            lambda _: self.edit_history_event()
+        )
         layout.addWidget(self.history_table)
         self.pages.addWidget(page)
 
@@ -1281,6 +1380,81 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.series_table)
         self.pages.addWidget(page)
 
+    def create_authors_page(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.addWidget(label("Browse authors", "headline"))
+        layout.addWidget(label(
+            "Every author credit in your library, including fanfiction writers. "
+            "A combined coauthor credit is shown as entered.", "muted"
+        ))
+        controls = QHBoxLayout()
+        self.author_search = QLineEdit()
+        self.author_search.setPlaceholderText("Filter author names…")
+        self.author_search.textChanged.connect(self.refresh_authors_page)
+        controls.addWidget(self.author_search, stretch=1)
+        controls.addWidget(button("View author's books", self.open_author_from_table))
+        layout.addLayout(controls)
+        self.authors_table = QTableWidget(0, 6)
+        self.authors_table.setHorizontalHeaderLabels(
+            ["Author credit", "Works", "Completed", "Active", "Favorites", "Avg. rating"]
+        )
+        self.authors_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.authors_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.authors_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.authors_table.verticalHeader().setVisible(False)
+        self.authors_table.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.Stretch
+        )
+        for col in range(1, 6):
+            self.authors_table.horizontalHeader().setSectionResizeMode(
+                col, QHeaderView.ResizeMode.ResizeToContents
+            )
+        self.authors_table.itemDoubleClicked.connect(self.open_author_from_table)
+        layout.addWidget(self.authors_table)
+        self.author_count = label("", "muted")
+        layout.addWidget(self.author_count)
+        self.pages.addWidget(page)
+
+    def refresh_authors_page(self, *_args):
+        search = self.author_search.text().casefold().strip()
+        authors = [
+            item for item in self.library.author_summary()
+            if search in item["author"].casefold()
+        ]
+        self.authors_table.setRowCount(len(authors))
+        for row, entry in enumerate(authors):
+            values = (
+                entry["author"], str(entry["total"]), str(entry["completed"]),
+                str(entry["active"]), str(entry["favorites"]),
+                f"{entry['average_rating']:g} / 5"
+                if entry["average_rating"] is not None else "—",
+            )
+            for col, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if col == 0:
+                    item.setData(Qt.ItemDataRole.UserRole, entry["author"])
+                self.authors_table.setItem(row, col, item)
+            self.authors_table.setRowHeight(row, 38)
+        self.author_count.setText(f"{len(authors)} author credits shown")
+
+    def open_author_from_table(self, item=None):
+        if item is None:
+            row = self.authors_table.currentRow()
+        else:
+            row = item.row()
+        if row < 0:
+            return
+        author = self.authors_table.item(row, 0)
+        if not author:
+            return
+        self.clear_library_filters()
+        target = self.author_filter.findData(author.data(Qt.ItemDataRole.UserRole))
+        if target >= 0:
+            self.author_filter.setCurrentIndex(target)
+        self.navigate(0)
+        self.refresh_library()
+
     def refresh_series_page(self):
         series = self.library.series_summary()
         self.series_table.setRowCount(len(series))
@@ -1377,7 +1551,8 @@ class MainWindow(QMainWindow):
             self.search.text(), self.filter_status.currentData(),
             self.filter_kind.currentData(), self.only_fav.isChecked(),
             self.sort.currentData(), self.shelf_filter.currentData(),
-            self.series_filter.currentData(), self.tag_filter.currentData())
+            self.series_filter.currentData(), self.tag_filter.currentData(),
+            self.author_filter.currentData())
         current = select_id or self.selected_id
         self.table.blockSignals(True)
         self.table.setRowCount(len(books))
@@ -1489,10 +1664,23 @@ class MainWindow(QMainWindow):
             f"Words: {book['word_count']:,}" if book["word_count"] else "",
             f"Fandom: {book['fandom']}" if book["fandom"] else "",
             f"Series: {book['series']}" if book["series"] else "",
-            f"Tags: {', '.join(book['tags'])}" if book["tags"] else "",
         ):
             if text:
                 self.details.addWidget(label(text))
+        if book["tags"]:
+            tags = book["tags"]
+            summary = ", ".join(tags[:4])
+            if len(tags) > 4:
+                summary += f"  (+{len(tags) - 4} more)"
+            self.details.addWidget(label("Tags: " + summary, "muted"))
+            if len(tags) > 4:
+                expanded = label(", ".join(tags), "muted")
+                expanded.setVisible(False)
+                self.details.addWidget(expanded)
+                toggle = button(
+                    "Show all tags", lambda: self.toggle_tag_details(expanded, toggle)
+                )
+                self.details.addWidget(toggle)
         runs = self.library.runs(work_id)
         progress = runs[0]["current_progress"] if runs else 0
         progress_text = ("Completed · progress not recorded"
@@ -1507,6 +1695,7 @@ class MainWindow(QMainWindow):
             self.details.addWidget(label(summary + ("…" if len(book["description"]) > 300 else ""), "muted"))
         self.details.addSpacing(10)
         self.details.addWidget(button("Log progress", self.log_progress, primary=True))
+        self.details.addWidget(button("View this book's history", self.show_work_history))
         self.details.addWidget(button("Edit details", self.edit_work))
         if book["kind"] == "book":
             self.details.addWidget(button("Fill missing metadata / cover", self.refresh_selected_metadata))
@@ -1526,6 +1715,12 @@ class MainWindow(QMainWindow):
             self.details.addWidget(label(
                 f"• {run['started_at'][:10]} → {run['finished_at'][:10] or 'in progress'}", "muted"))
         self.details.addStretch(1)
+
+    @staticmethod
+    def toggle_tag_details(tag_label, control):
+        expanded = not tag_label.isVisible()
+        tag_label.setVisible(expanded)
+        control.setText("Hide full tag list" if expanded else "Show all tags")
 
     def cover_available(self, url):
         pixmap = self.covers.get(url)
@@ -1597,6 +1792,7 @@ class MainWindow(QMainWindow):
     def refresh_catalog_filters(self):
         for combo, entries, title, key in (
             (self.series_filter, self.library.series_summary(), "All series", "series"),
+            (self.author_filter, self.library.author_summary(), "All authors", "author"),
             (self.tag_filter, self.library.tag_summary(), "All tags", "tag"),
         ):
             current = combo.currentData()
@@ -1612,7 +1808,7 @@ class MainWindow(QMainWindow):
     def clear_library_filters(self):
         self.search.clear()
         for combo in (self.filter_status, self.filter_kind, self.shelf_filter,
-                      self.series_filter, self.tag_filter):
+                      self.series_filter, self.author_filter, self.tag_filter):
             combo.setCurrentIndex(0)
         self.only_fav.setChecked(False)
         self.refresh_library()
@@ -1821,11 +2017,23 @@ class MainWindow(QMainWindow):
         runs = self.library.runs(work["id"])
         work["progress"] = runs[0]["current_progress"] if runs else 0
         dialog = ProgressDialog(self, work)
+        latest = self.library.active_run(work["id"])
+        if latest:
+            dialog.progress.setValue(latest["current_progress"])
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         try:
-            self.library.set_progress(work["id"], dialog.progress.value(),
-                                      note=dialog.note.text().strip())
+            if dialog.use_historical_date.isChecked():
+                self.library.record_progress_on(
+                    work["id"], dialog.progress.value(),
+                    date=dialog.when.date().toString("yyyy-MM-dd"),
+                    note=dialog.note.text().strip()
+                )
+            else:
+                self.library.set_progress(
+                    work["id"], dialog.progress.value(),
+                    note=dialog.note.text().strip()
+                )
             self.refresh_all(work["id"])
         except Exception as exc:
             fail(self, exc)
@@ -1864,29 +2072,145 @@ class MainWindow(QMainWindow):
             self.selected_id = None
             self.refresh_all()
 
-    def refresh_history(self):
-        events = self.library.history(limit=1000)
+    def refresh_history(self, *_args):
+        current_year = self.history_year.currentData()
+        self.history_year.blockSignals(True)
+        self.history_year.clear()
+        self.history_year.addItem("All years", None)
+        for year in self.library.history_years():
+            self.history_year.addItem(str(year), year)
+        at = self.history_year.findData(current_year)
+        self.history_year.setCurrentIndex(max(0, at))
+        self.history_year.blockSignals(False)
+
+        events = self.library.history_filtered(
+            search=self.history_search.text(),
+            year=self.history_year.currentData(),
+            limit=5000
+        )
+        selected = self.selected_history_event_id()
+        self.history_table.blockSignals(True)
         self.history_table.setRowCount(len(events))
+        selected_row = -1
         for row, event in enumerate(events):
             delta = event["new_progress"] - event["old_progress"]
-            values = (event["recorded_at"][:16].replace("T", " "), event["title"],
-                      f"{event['old_progress']} → {event['new_progress']} {event['progress_unit']} ({delta:+d})",
-                      event["note"])
+            values = (
+                event["recorded_at"][:16].replace("T", " "),
+                event["title"],
+                (f"{event['old_progress']} → {event['new_progress']} "
+                 f"{event['progress_unit']} ({delta:+d})"),
+                event["note"],
+            )
+            if event["id"] == selected:
+                selected_row = row
             for col, value in enumerate(values):
                 cell = QTableWidgetItem(value)
                 if col == 0:
                     cell.setData(Qt.ItemDataRole.UserRole, event["id"])
+                    cell.setData(Qt.ItemDataRole.UserRole + 1, event["work_id"])
                 self.history_table.setItem(row, col, cell)
             self.history_table.setRowHeight(row, 38)
+        self.history_table.blockSignals(False)
+        if selected_row >= 0:
+            self.history_table.selectRow(selected_row)
+        self.history_count.setText(
+            f"{len(events)} milestones shown"
+            + (" (first 5,000)" if len(events) == 5000 else "")
+        )
+
+    def selected_history_event_id(self):
+        if not hasattr(self, "history_table"):
+            return None
+        selection = self.history_table.selectionModel()
+        rows = selection.selectedRows() if selection else []
+        if not rows:
+            return None
+        item = self.history_table.item(rows[0].row(), 0)
+        return item.data(Qt.ItemDataRole.UserRole) if item else None
+
+    def edit_history_event(self):
+        event_id = self.selected_history_event_id()
+        if not event_id:
+            QMessageBox.information(self, "Choose milestone", "Select a reading event to edit.")
+            return
+        event = self.library.get_progress_event(event_id)
+        if not event:
+            self.refresh_history()
+            return
+        dialog = MilestoneEditor(self, event)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        try:
+            self.library.update_progress_event(
+                event_id, date=dialog.date.date().toString("yyyy-MM-dd"),
+                progress=dialog.progress.value(), note=dialog.note.text()
+            )
+            self.refresh_all(event["work_id"])
+        except Exception as exc:
+            fail(self, exc)
+
+    def show_work_history(self):
+        work = self.selected_work()
+        if not work:
+            return
+        self.history_year.setCurrentIndex(0)
+        self.history_search.setText(work["title"])
+        self.navigate(1)
+
+    def open_history_book(self):
+        event_id = self.selected_history_event_id()
+        if not event_id:
+            QMessageBox.information(self, "Select milestone", "Choose an event first.")
+            return
+        event = self.library.get_progress_event(event_id)
+        if not event:
+            return
+        self.clear_library_filters()
+        self.navigate(0)
+        self.refresh_library(select_id=event["work_id"])
+
+    def export_history_csv(self):
+        events = self.library.history_filtered(
+            search=self.history_search.text(),
+            year=self.history_year.currentData(), limit=10000
+        )
+        if not events:
+            QMessageBox.information(self, "No history", "No milestones match the current filters.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export selected history", "BookTracker-reading-history.csv",
+            "CSV files (*.csv)"
+        )
+        if not path:
+            return
+        try:
+            # Prefix strings beginning with spreadsheet formula operators.
+            # This keeps CSV safe for opening in spreadsheet applications.
+            def safe(value):
+                text = str(value if value is not None else "")
+                return "'" + text if text.lstrip().startswith(("=", "+", "-", "@")) else text
+
+            with open(path, "w", encoding="utf-8-sig", newline="") as output:
+                writer = csv.writer(output)
+                writer.writerow([
+                    "Date", "Work", "Author", "Previous progress",
+                    "New progress", "Unit", "Note",
+                ])
+                for event in events:
+                    writer.writerow([
+                        safe(event["recorded_at"]), safe(event["title"]),
+                        safe(event["author"]), event["old_progress"],
+                        event["new_progress"], safe(event["progress_unit"]),
+                        safe(event["note"]),
+                    ])
+            self.statusBar().showMessage(f"Exported {len(events)} reading milestones.", 8000)
+        except OSError as exc:
+            fail(self, exc)
 
     def delete_history_event(self):
-        indexes = self.history_table.selectionModel().selectedRows()
-        if not indexes:
-            QMessageBox.information(self, "Select an entry", "Choose a reading milestone first.")
-            return
-        item = self.history_table.item(indexes[0].row(), 0)
-        event_id = item.data(Qt.ItemDataRole.UserRole) if item else None
+        event_id = self.selected_history_event_id()
         if not event_id:
+            QMessageBox.information(self, "Select an entry", "Choose a reading milestone first.")
             return
         if QMessageBox.question(
             self, "Remove milestone?",

@@ -11,7 +11,7 @@ Built with Python, PySide6, and SQLite. No account, cloud subscription, or alway
 - Distinguish **caught up with an ongoing story** from **completed the work**.
 - Track **rereads** as independent reading runs without losing previous history.
 - Search titles, authors, fandoms, series and tags; filter by type, reading status, shelves, exact series, exact tags and favorites.
-- Store personal star ratings (0.5 increments), notes, publication status, word counts, source URLs and more.
+- Store personal star ratings (0.5 increments), notes, publication status, word counts, source URLs and more. Imported tag lists in the book details panel collapse when long.
 - Import a **Goodreads library CSV** (from Goodreads → My Books → Import and export).
 - Search by **title/ISBN or author** from **+ Add work → Find online**. Author search returns many matching works, with checkboxes and an **Add N selected** action.
 - Paste a list of book titles using **+ Add work → Paste titles**. Enter an author once and import every pasted line as a book, even when catalog services are unavailable.
@@ -24,10 +24,25 @@ Built with Python, PySide6, and SQLite. No account, cloud subscription, or alway
 - Export and import **portable .btbackup files** containing the entire reading history, shelves, goals, and locally imported EPUB covers. JSON/XML remain available for structured-data portability without images.
 - Export and import **CSV catalogs** for spreadsheets (CSV does *not* preserve reading-history events).
 - Use a **Reading dashboard** with goals for books, chapters and pages, a Continue Reading list, and recent milestones. Double-click a current book to open it.
-- Browse a **Series explorer** with progress counts and open its books directly.
+- Browse **Series** and **Authors** explorers; double-click to filter your library by that series or author.
 - **Import local EPUB metadata** offline, individually or in bulk, including embedded covers, authors, series, ISBNs, language, description, and tags where available. Recognize supported fanfiction source links embedded in EPUB metadata.
+- Search and filter your reading-event history by book, author, note and year. Edit milestones and backdate progress without corrupting the most recent reading position. Export the filtered history as CSV.
 - Review library statistics, recent progress history, reading goals and series progress.
 - All data is saved locally in an SQLite database; portable JSON/XML import uses stable UUIDs for merge.
+
+## New in v0.6.0
+
+- **Author explorer:** The **Authors** sidebar screen groups books and fanfiction by author credit. Search names, view completed/active/favorite counts and average ratings, and double-click an author to filter the library. Coauthor credits are grouped as entered; they are not automatically split into separate people.
+- **Author filter:** The library's Collections row now includes an exact **All authors** filter alongside shelves, series and tags.
+- **Backdated reading progress:** When logging a chapter or page, check **Set a specific reading date** to record a past date. Leave it unchecked to use the current timestamp. Earlier milestones are placed in chronological order without replacing a more recent current position.
+- **Correct historical milestones:** In **Reading history**, select a record and click **Edit selected** (or double-click it) to correct its date, chapter/page number, or note. All following previous-progress values in that reading run are reconciled, keeping statistics consistent.
+- **History search and year filters:** Find reading events by work title, author, or note, then optionally select a particular year. **Open book** jumps to its library entry, and **Export CSV** exports the filtered history to a spreadsheet-friendly file. CSV text fields are protected against spreadsheet-formula injection.
+- **Author and series navigation:** Use Ctrl+F to focus library search, Ctrl+H to open reading history and Ctrl+Shift+A for author browsing. Additional library sorts include recently finished and series.
+- **Smarter book details:** Long lists of imported tags are collapsed by default. A book-specific **View this book's history** button provides quick navigation.
+- **Progress dialog usability:** The suggested progress starts at the active reading run's current position, rather than zero.
+- **Data integrity:** Removing or correcting an early milestone recalculates subsequent event deltas and run progress, instead of leaving inconsistent old-progress values.
+
+**Upgrade:** v0.6.0 does not change the SQLite database schema or the v3 JSON/XML/portable backup format. Your existing library, locally imported EPUB covers and reading history remain compatible. Export a portable backup before updating as a precaution.
 
 ## New in v0.5.0
 
@@ -98,7 +113,8 @@ The database is stored in your OS's user-data directory (platformdirs), not insi
 7. Select a work and click **Log progress**. Enter the **chapter/page reached**, not the number read in that session. Each change becomes a dated history event.
 8. Use **Mark caught up** for ongoing serials you've reached the latest chapter; **Mark completed** for a finished read; **Start a reread** to begin a new reading run.
 9. Use **Import library** / **Export library** in the sidebar to move reading history between computers. For EPUB cover images, choose a **.btbackup** portable full backup.
-10. Set annual reading goals and double-click current reads on the **Dashboard**. Browse series from the **Series** sidebar page.
+10. Set annual reading goals and double-click current reads on the **Dashboard**. Browse series from **Series** or writers from **Authors**.
+11. To record something you read last year, choose **Log progress**, check **Set a specific reading date**, then select the historical date. To correct an older log, use **Reading history → Edit selected**.
 
 For existing Goodreads history, use **File → Import Goodreads CSV**. It imports Goodreads shelves and ratings; it does not create a detailed historical progress log that Goodreads never exported.
 

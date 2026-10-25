@@ -23,7 +23,7 @@ wheels = [
 
 [[package]]
 name = "booktracker"
-version = "0.5.0"
+version = "0.6.0"
 source = { editable = "." }
 dependencies = [
     { name = "beautifulsoup4" },
