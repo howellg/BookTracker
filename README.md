@@ -39,6 +39,13 @@ Built with Python, PySide6, and SQLite. No account, cloud subscription, or alway
 - Review library statistics, recent progress history, reading goals, time spent and series progress.
 - All data is saved locally in an SQLite database; portable JSON/XML import uses stable UUIDs for merge.
 
+## Fixed in v0.8.1
+
+- **Bookmark/quote locations are editable immediately.** When adding a bookmark, passage or personal note, the Position and Unit fields now start enabled. BookTracker automatically suggests the selected book's chapter/page/percent unit and, when available, the current reading position.
+- **Locations are still optional.** Uncheck **Include a position (uncheck if unknown)** to omit the chapter/page value. Editing an older note without a location keeps that checkbox unchecked until you choose to attach one.
+- **Switching books** in the Add dialog suggests the newly selected book's tracking unit and current reading position.
+- No database migration is needed. Existing bookmarks, saved notes, progress and cover images are unaffected.
+
 ## New in v0.8.0
 
 BookTracker v0.8 adds an optional **personal reading journal** without disturbing the existing books, history, shelves or progress model.

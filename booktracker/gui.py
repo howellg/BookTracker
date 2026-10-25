@@ -1099,28 +1099,56 @@ class AnnotationDialog(QDialog):
             self.kind.addItem(display, item)
         if existing:
             self.kind.setCurrentIndex(self.kind.findData(existing["kind"]))
-        self.has_location = QCheckBox("Attach a chapter / page number")
+        # New bookmarks and quotes should not open with their location controls
+        # mysteriously disabled. Location can still be omitted explicitly.
+        self.has_location = QCheckBox("Include a position (uncheck if unknown)")
+        self.has_location.setToolTip(
+            "Uncheck to save this entry without a chapter, page, or percentage."
+        )
         self.location = QSpinBox()
         self.location.setRange(0, 10000000)
-        self.location.setEnabled(False)
+        self.location.setToolTip("The chapter, page or percentage for this entry.")
         self.unit = QComboBox()
         for key in UNITS:
             self.unit.addItem(name(key), key)
-        self.unit.setEnabled(False)
+        self.unit.setToolTip("Choose whether the position refers to chapters, pages or percent.")
         self.has_location.toggled.connect(self.location.setEnabled)
         self.has_location.toggled.connect(self.unit.setEnabled)
-        if existing and existing["location"] is not None:
+
+        # When the dialog opens on a selected book, suggest that book's actual
+        # tracking unit and current position. Never write progress automatically.
+        def suggest_location():
+            work = library.get_work(self.book.currentData())
+            if not work:
+                return
+            self.unit.setCurrentIndex(
+                max(0, self.unit.findData(work["progress_unit"]))
+            )
+            run = library.active_run(work["id"])
+            latest = run["current_progress"] if run else 0
+            self.location.setValue(
+                min(100 if work["progress_unit"] == "percent" else 10000000,
+                    latest or (0 if work["progress_unit"] == "percent" else 1))
+            )
+
+        if existing:
+            if existing["location"] is not None:
+                self.has_location.setChecked(True)
+                self.location.setValue(existing["location"])
+                index = self.unit.findData(existing["location_unit"])
+                if index >= 0:
+                    self.unit.setCurrentIndex(index)
+            else:
+                self.has_location.setChecked(False)
+                suggest_location()
+        else:
+            suggest_location()
             self.has_location.setChecked(True)
-            self.location.setValue(existing["location"])
-            index = self.unit.findData(existing["location_unit"])
-            if index >= 0:
-                self.unit.setCurrentIndex(index)
-        elif target:
-            work = library.get_work(target)
-            if work:
-                self.unit.setCurrentIndex(
-                    max(0, self.unit.findData(work["progress_unit"]))
-                )
+            self.book.currentIndexChanged.connect(lambda _index: suggest_location())
+        # Both controls must faithfully follow the checkbox, including for an
+        # existing annotation which was deliberately saved without a location.
+        self.location.setEnabled(self.has_location.isChecked())
+        self.unit.setEnabled(self.has_location.isChecked())
         self.body = QTextEdit()
         self.body.setPlaceholderText(
             "Quote, personal reaction, bookmark label, or something to remember…"
@@ -1130,7 +1158,7 @@ class AnnotationDialog(QDialog):
         self.body.setMinimumHeight(130)
         form.addRow("Book", self.book)
         form.addRow("Type", self.kind)
-        form.addRow(self.has_location)
+        form.addRow("Location", self.has_location)
         form.addRow("Position", self.location)
         form.addRow("Unit", self.unit)
         form.addRow("Text", self.body)

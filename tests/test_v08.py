@@ -489,3 +489,92 @@ def test_upgrade_from_v4_database_preserves_books_and_saved_views(tmp_path):
         assert len(reopened.list_annotations(work_id=key)) == 1
     finally:
         reopened.close()
+
+
+def test_new_annotation_has_editable_position_and_correct_book_unit(app, lib):
+    book = make_work(lib, progress_unit="chapters")
+    lib.record_progress_on(book, 19, date="2026-09-02")
+    dialog = AnnotationDialog(None, lib, work_id=book)
+    try:
+        assert dialog.has_location.isChecked()
+        assert dialog.location.isEnabled()
+        assert dialog.unit.isEnabled()
+        assert dialog.location.value() == 19
+        assert dialog.unit.currentData() == "chapters"
+        dialog.kind.setCurrentIndex(dialog.kind.findData("quote"))
+        dialog.body.setPlainText("This is a test.")
+        dialog.location.setValue(27)
+        assert dialog.values() == {
+            "kind": "quote", "location": 27, "location_unit": "chapters",
+            "body": "This is a test.",
+        }
+    finally:
+        dialog.close()
+
+
+def test_annotation_position_can_be_omitted_and_reenabled(app, lib):
+    book = make_work(lib, progress_unit="pages")
+    dialog = AnnotationDialog(None, lib, work_id=book)
+    try:
+        assert dialog.location.isEnabled() and dialog.unit.isEnabled()
+        assert dialog.unit.currentData() == "pages"
+        dialog.has_location.setChecked(False)
+        assert not dialog.location.isEnabled() and not dialog.unit.isEnabled()
+        assert dialog.values()["location"] is None
+        assert dialog.values()["location_unit"] == ""
+        dialog.has_location.setChecked(True)
+        assert dialog.location.isEnabled() and dialog.unit.isEnabled()
+        dialog.location.setValue(85)
+        assert dialog.values()["location"] == 85
+        assert dialog.values()["location_unit"] == "pages"
+    finally:
+        dialog.close()
+
+
+def test_edit_annotation_without_position_stays_optional(app, lib):
+    book = make_work(lib, progress_unit="pages")
+    record = lib.add_annotation(book, kind="note", body="No location known.")
+    current = lib.get_annotation(record)
+    dialog = AnnotationDialog(None, lib, existing=current)
+    try:
+        assert not dialog.has_location.isChecked()
+        assert not dialog.location.isEnabled()
+        assert not dialog.unit.isEnabled()
+        assert dialog.values()["location"] is None
+        dialog.has_location.setChecked(True)
+        dialog.location.setValue(84)
+        lib.update_annotation(record, **dialog.values())
+        assert lib.get_annotation(record)["location"] == 84
+        assert lib.get_annotation(record)["location_unit"] == "pages"
+    finally:
+        dialog.close()
+
+
+def test_new_annotation_changes_default_unit_when_book_changes(app, lib):
+    chapters = make_work(lib, title="Chapter Work", progress_unit="chapters")
+    pages = make_work(lib, title="Page Work", progress_unit="pages")
+    dialog = AnnotationDialog(None, lib, work_id=chapters)
+    try:
+        assert dialog.unit.currentData() == "chapters"
+        index = dialog.book.findData(pages)
+        assert index >= 0
+        dialog.book.setCurrentIndex(index)
+        assert dialog.unit.currentData() == "pages"
+        assert dialog.location.isEnabled()
+        assert dialog.unit.isEnabled()
+        assert dialog.location.value() == 1
+    finally:
+        dialog.close()
+
+
+def test_percent_book_location_defaults_without_exceeding_bounds(app, lib):
+    book = make_work(lib, title="Progress Percent", progress_unit="percent")
+    lib.record_progress_on(book, 66, date="2026-09-02")
+    dialog = AnnotationDialog(None, lib, work_id=book)
+    try:
+        assert dialog.unit.currentData() == "percent"
+        assert dialog.location.value() == 66
+        assert dialog.location.isEnabled()
+        assert dialog.values()["location"] == 66
+    finally:
+        dialog.close()
