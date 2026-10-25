@@ -43,9 +43,9 @@ def reader(app, db, tmp_path):
 
 def test_display_controls_and_reader_tabs(reader, app):
     view, db, work, _file_id, settings, _ = reader
-    assert view.sidebar_tabs.count() == 3
-    assert [view.sidebar_tabs.tabText(i) for i in range(3)] == [
-        "Contents", "Search", "Saved"
+    assert view.sidebar_tabs.count() == 4
+    assert [view.sidebar_tabs.tabText(i) for i in range(4)] == [
+        "Contents", "Search", "Saved", "Audio links"
     ]
     view.font_family.setCurrentText("Mono")
     view.line_spacing.setCurrentText("Relaxed")

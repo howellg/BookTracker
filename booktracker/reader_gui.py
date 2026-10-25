@@ -216,6 +216,29 @@ class EpubReader(QDialog):
             note_actions.addWidget(_action_button(title,callback),index//2,index%2)
         saved_layout.addLayout(note_actions)
         self.sidebar_tabs.addTab(saved_page,"Saved")
+        links_page=QWidget()
+        links_layout=QVBoxLayout(links_page)
+        link_explanation=QLabel(
+            "Link the current EPUB section with a specific audiobook time. "
+            "No automatic chapter matching."
+        )
+        link_explanation.setWordWrap(True)
+        links_layout.addWidget(link_explanation)
+        self.audio_links_list=QListWidget()
+        self.audio_links_list.itemDoubleClicked.connect(self.open_audio_text_link)
+        links_layout.addWidget(self.audio_links_list,stretch=1)
+        links_layout.addWidget(_action_button(
+            "Save section ↔ time",self.add_audio_text_link
+        ))
+        link_actions=QHBoxLayout()
+        link_actions.addWidget(_action_button(
+            "Open saved link",self.open_audio_text_link
+        ))
+        link_actions.addWidget(_action_button(
+            "Remove link",self.remove_audio_text_link
+        ))
+        links_layout.addLayout(link_actions)
+        self.sidebar_tabs.addTab(links_page,"Audio links")
         self.splitter.addWidget(sidebar)
         reading=QWidget()
         reading_layout=QVBoxLayout(reading)
@@ -296,6 +319,7 @@ class EpubReader(QDialog):
         self.load_section(start,ratio)
         self.refresh_bookmarks()
         self.refresh_notes()
+        self.refresh_audio_text_links()
         # Avoid QDialog keyboard defaults reinterpreting arrow keys as accept.
         for key,call in (("Alt+Left",lambda:self.step(-1)),
                          ("Alt+Right",lambda:self.step(1)),
@@ -645,6 +669,95 @@ class EpubReader(QDialog):
             return
         self.library.remove_epub_bookmark(row["id"])
         self.refresh_bookmarks()
+
+    def refresh_audio_text_links(self):
+        from .audio_gui import fmt_duration
+        from .audio_text_links import AudioTextAnchors
+
+        self.audio_links_list.clear()
+        self.audio_anchors=AudioTextAnchors(self.settings)
+        files=self.library.list_audio_files(work_id=self.work["id"])
+        valid=self.audio_anchors.list_links(
+            self.work["id"],self.file_id,self.link["path"],files
+        )
+        by_id={row["id"]:row for row in files}
+        for entry in valid:
+            audio=by_id[entry["audio_id"]]
+            title=entry["section_title"]
+            item=QListWidgetItem(
+                f"{title} ↔ {audio['filename']} at {fmt_duration(entry['position_ms'])}"
+            )
+            item.setData(Qt.ItemDataRole.UserRole,entry)
+            self.audio_links_list.addItem(item)
+
+    def add_audio_text_link(self):
+        owner=self.parent()
+        player=(getattr(getattr(owner,"audio_page",None),"_player_dialog",None)
+                if owner is not None else None)
+        if player is None or player.current["work_id"] != self.work["id"]:
+            self.message.setText("Start an audiobook for this book before linking positions.")
+            return
+        if not player.current.get("available"):
+            self.message.setText("Audio file is not available here.")
+            return
+        section=self.book.spine[self.index]
+        try:
+            self.audio_anchors.add(
+                self.work["id"],self.file_id,self.link["path"],player.current,
+                section_href=section.href,section_title=section.title,
+                scroll_ratio=self.scroll_ratio(),position_ms=player.player.position(),
+                audio_files=self.library.list_audio_files(work_id=self.work["id"])
+            )
+        except (ValueError,OSError) as exc:
+            self.message.setText(str(exc))
+            return
+        self.refresh_audio_text_links()
+        self.sidebar_tabs.setCurrentIndex(3)
+        self.message.setText(
+            "Saved an explicit local audio ↔ EPUB link. No reading progress was logged."
+        )
+
+    def _selected_audio_text_link(self):
+        item=self.audio_links_list.currentItem()
+        return item.data(Qt.ItemDataRole.UserRole) if item else None
+
+    def open_audio_text_link(self,*_args):
+        link=self._selected_audio_text_link()
+        if not link:
+            return
+        # Revalidate file identities at click time, not only on list refresh.
+        files=self.library.list_audio_files(work_id=self.work["id"])
+        if not any(item["id"]==link["id"] for item in self.audio_anchors.list_links(
+            self.work["id"],self.file_id,self.link["path"],files
+        )):
+            self.refresh_audio_text_links()
+            self.message.setText("Linked file has changed or is unavailable.")
+            return
+        index=next(
+            (i for i,section in enumerate(self.book.spine)
+             if section.href==link["section_href"]),None
+        )
+        if index is None:
+            self.message.setText("EPUB section no longer exists in this edition.")
+            return
+        self.load_section(index,int(link["scroll_ratio"]))
+        owner=self.parent()
+        if owner is not None and hasattr(owner,"seek_audio_text_link"):
+            if owner.seek_audio_text_link(self.work["id"],link):
+                self.message.setText("Opened explicitly linked EPUB and audio positions.")
+            else:
+                self.message.setText("EPUB position opened. Audio link unavailable.")
+
+    def remove_audio_text_link(self):
+        link=self._selected_audio_text_link()
+        if not link:
+            return
+        if QMessageBox.question(
+            self,"Remove position link?","Remove this EPUB/audio timestamp pairing?"
+        )!=QMessageBox.StandardButton.Yes:
+            return
+        self.audio_anchors.remove(self.work["id"],self.file_id,link["id"])
+        self.refresh_audio_text_links()
 
     def listen_to_work(self):
         owner=self.parent()

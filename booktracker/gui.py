@@ -2404,12 +2404,43 @@ class MainWindow(QMainWindow):
             ("+30s",lambda:self.audio_transport("forward")),
             ("Part ▶",lambda:self.audio_transport("next")),
             ("Show player",self.show_audio_player),
+            ("Shortcuts",self.show_audio_shortcuts),
             ("Close audio",self.close_audio_player),
         ):
             action=self.audio_toolbar.addAction(title)
             action.triggered.connect(callback)
         self.addToolBar(Qt.ToolBarArea.BottomToolBarArea,self.audio_toolbar)
         self.audio_toolbar.hide()
+        # Application-wide shortcuts also work with the modeless audio window
+        # and with the EPUB reader; they are inert if no player is open.
+        hotkeys=(
+            ("Ctrl+Alt+Space","play"),
+            ("Ctrl+Alt+J","back"),
+            ("Ctrl+Alt+L","forward"),
+            ("Ctrl+Alt+PgUp","previous"),
+            ("Ctrl+Alt+PgDown","next"),
+        )
+        self._audio_shortcuts=[]
+        for key,command in hotkeys:
+            action=QAction(self)
+            action.setShortcut(key)
+            action.setShortcutContext(Qt.ShortcutContext.ApplicationShortcut)
+            action.triggered.connect(
+                lambda _checked=False, cmd=command:self.audio_transport(cmd)
+            )
+            self.addAction(action)
+            self._audio_shortcuts.append(action)
+
+    def show_audio_shortcuts(self):
+        QMessageBox.information(
+            self,"Audiobook keyboard shortcuts",
+            "Ctrl+Alt+Space — Play / pause\n"
+            "Ctrl+Alt+J — Skip back 30 seconds\n"
+            "Ctrl+Alt+L — Skip forward 30 seconds\n"
+            "Ctrl+Alt+Page Up — Previous audiobook part\n"
+            "Ctrl+Alt+Page Down — Next audiobook part\n\n"
+            "These shortcuts work in BookTracker while the audio player is open."
+        )
 
     def audio_transport(self, command):
         player=self.audio_page._player_dialog
@@ -2482,6 +2513,34 @@ class MainWindow(QMainWindow):
                 return
             selected=available[labels.index(label)]
         self.audio_page.launch_audio_file(selected)
+
+    def seek_audio_text_link(self, work_id, link):
+        """Only follow a user-created mapping to an existing, unchanged audio link."""
+        target=next(
+            (row for row in self.library.list_audio_files(work_id=work_id)
+             if row["id"]==link.get("audio_id") and row["available"]),None
+        )
+        if target is None:
+            return False
+        from .audio_player import AudioResumeStore
+
+        try:
+            if (AudioResumeStore._stamp(AudioResumeStore._identity(target["path"]))
+                    !=link["audio_stamp"]):
+                return False
+        except (ValueError,OSError,KeyError):
+            return False
+        player=self.audio_page._player_dialog
+        if player is not None and player.current["id"]!=target["id"]:
+            player.close()
+            player=None
+        if player is None:
+            self.audio_page.launch_audio_file(target)
+            player=self.audio_page._player_dialog
+        if player is None or player.current["id"]!=target["id"]:
+            return False
+        player.seek_to_position(link["position_ms"])
+        return True
 
     def make_menu(self):
         menu = self.menuBar().addMenu("&File")
