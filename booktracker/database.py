@@ -66,17 +66,17 @@ class Library:
             raise
 
     def _snapshot_before_schema_migration(self):
-        """Save a WAL-consistent snapshot before an existing database moves to v7."""
+        """Save a WAL-consistent snapshot before an existing database moves to v8."""
         version = self.db.execute("PRAGMA user_version").fetchone()[0]
         exists = self.db.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='works'"
         ).fetchone()
-        if not exists or version >= 7:
+        if not exists or version >= 8:
             return
         folder = self.path.parent / "backups"
         folder.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-        target = folder / f"BookTracker-before-v010-{stamp}.sqlite3"
+        target = folder / f"BookTracker-before-v012-{stamp}.sqlite3"
         # sqlite3.backup copies committed WAL content safely.
         with sqlite3.connect(target) as destination:
             self.db.backup(destination)
@@ -266,8 +266,28 @@ class Library:
         CREATE UNIQUE INDEX IF NOT EXISTS idx_local_files_unique_path
             ON local_files(work_id,path) WHERE path!='';
         CREATE INDEX IF NOT EXISTS idx_local_files_work ON local_files(work_id);
+        CREATE TABLE IF NOT EXISTS serial_follows (
+            work_id TEXT PRIMARY KEY REFERENCES works(id) ON DELETE CASCADE,
+            notify INTEGER NOT NULL DEFAULT 0 CHECK(notify IN (0,1)),
+            seen_units INTEGER NOT NULL DEFAULT 0 CHECK(seen_units>=0),
+            followed_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS serial_releases (
+            id TEXT PRIMARY KEY,
+            work_id TEXT NOT NULL REFERENCES works(id) ON DELETE CASCADE,
+            source_id TEXT REFERENCES work_sources(id) ON DELETE SET NULL,
+            old_units INTEGER NOT NULL CHECK(old_units>=0),
+            new_units INTEGER NOT NULL CHECK(new_units>old_units),
+            observed_at TEXT NOT NULL,
+            note TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_serial_releases_work
+            ON serial_releases(work_id,observed_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_serial_releases_observed
+            ON serial_releases(observed_at DESC);
         """)
-        self.db.execute("PRAGMA user_version=7")
+        self.db.execute("PRAGMA user_version=8")
         self._backfill_catalog_relationships()
         self.db.commit()
 
@@ -2158,6 +2178,11 @@ class Library:
         err = str(error or "").strip()[:500]
         note = str(message or err)[:500]
         previous = source["published_units"]
+        work = self.get_work(source["work_id"])
+        # Separate first observations from genuine newly-observed releases.
+        before = max([work["total_units"]] + [
+            item["published_units"] for item in self.list_sources(source["work_id"])
+        ])
         if err:
             outcome = "error"
             observed = previous
@@ -2195,6 +2220,27 @@ class Library:
                 """INSERT INTO source_checks VALUES(?,?,?,?,?,?,?)""",
                 (new_id(), source_id, timestamp, outcome, previous, observed, note)
             )
+            if (
+                not err and observed > before and
+                work["kind"] in ("fanfiction","web_novel")
+                and work["progress_unit"] == "chapters"
+            ):
+                if before:
+                    self.db.execute(
+                        """INSERT INTO serial_releases
+                           (id,work_id,source_id,old_units,new_units,observed_at,note)
+                           VALUES(?,?,?,?,?,?,?)""",
+                        (new_id(),source["work_id"],source_id,before,observed,
+                         timestamp,note),
+                    )
+                else:
+                    # First ever count establishes a baseline rather than
+                    # alerting about every existing chapter.
+                    self.db.execute(
+                        """UPDATE serial_follows SET seen_units=?,
+                           updated_at=? WHERE work_id=? AND seen_units=0""",
+                        (observed,timestamp,source["work_id"]),
+                    )
         return outcome
 
     def source_update_summary(self):
@@ -2209,7 +2255,34 @@ class Library:
             known = max([work["total_units"]] + [
                 source["published_units"] for source in sources
             ])
+            follow = self.get_follow(work["id"])
+            latest = self.db.execute(
+                """SELECT MAX(observed_at) FROM serial_releases
+                   WHERE work_id=?""", (work["id"],)
+            ).fetchone()[0] or ""
+            last_good = self.db.execute(
+                """SELECT MAX(c.checked_at) FROM source_checks c
+                   JOIN work_sources s ON s.id=c.source_id
+                   WHERE s.work_id=? AND c.outcome IN ('updated','unchanged')""",
+                (work["id"],),
+            ).fetchone()[0] or ""
+            # A recently successful recheck is required before calling a work
+            # "quiet"; errors, no checks and missing history are inconclusive.
+            quiet_days = 0
+            if latest and last_good:
+                growth_day = self.activity_day(latest)
+                checked_day = self.activity_day(last_good)
+                if growth_day and checked_day:
+                    age = (date_class.today()-date_class.fromisoformat(growth_day)).days
+                    freshness = (date_class.today()-date_class.fromisoformat(checked_day)).days
+                    if age >= 90 and 0 <= freshness <= 14:
+                        quiet_days=age
             entries.append({
+                "following": bool(follow),
+                "notify": bool(follow["notify"]) if follow else False,
+                "new_since_seen": max(0,known-follow["seen_units"]) if follow else 0,
+                "last_release_at": latest,
+                "quiet_days": quiet_days,
                 "work_id": work["id"], "title": work["title"],
                 "author": work["author"], "progress": work["progress"],
                 "known_chapters": known,
@@ -2222,6 +2295,154 @@ class Library:
         return sorted(entries, key=lambda item: (
             item["unread"] == 0, -item["unread"], item["title"].casefold()
         ))
+
+    def get_follow(self, work_id):
+        row = self.db.execute(
+            "SELECT * FROM serial_follows WHERE work_id=?", (work_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def follow_work(self, work_id, *, notify=False):
+        work = self.get_work(work_id)
+        if not work:
+            raise KeyError(work_id)
+        if work["kind"] not in ("fanfiction", "web_novel"):
+            raise ValueError("Only fanfiction and web novels can be followed.")
+        known = max([work["total_units"]] + [
+            item["published_units"] for item in self.list_sources(work_id)
+        ])
+        with self.transaction():
+            existing = self.get_follow(work_id)
+            if existing:
+                self.db.execute(
+                    "UPDATE serial_follows SET notify=?,updated_at=? WHERE work_id=?",
+                    (int(bool(notify)), now(), work_id),
+                )
+            else:
+                self.db.execute(
+                    """INSERT INTO serial_follows
+                       (work_id,notify,seen_units,followed_at,updated_at)
+                       VALUES(?,?,?,?,?)""",
+                    (work_id,int(bool(notify)),known,now(),now())
+                )
+        return self.get_follow(work_id)
+
+    def set_follow_notification(self, work_id, enabled):
+        with self.transaction():
+            cursor = self.db.execute(
+                "UPDATE serial_follows SET notify=?,updated_at=? WHERE work_id=?",
+                (int(bool(enabled)),now(),work_id)
+            )
+            if not cursor.rowcount:
+                raise KeyError(work_id)
+
+    def unfollow_work(self, work_id):
+        with self.transaction():
+            return bool(self.db.execute(
+                "DELETE FROM serial_follows WHERE work_id=?", (work_id,)
+            ).rowcount)
+
+    def acknowledge_releases(self, work_id):
+        with self.transaction():
+            row = self.get_follow(work_id)
+            if not row:
+                raise KeyError(work_id)
+            work = self.get_work(work_id)
+            known = max([work["total_units"]] + [
+                item["published_units"] for item in self.list_sources(work_id)
+            ])
+            self.db.execute(
+                "UPDATE serial_follows SET seen_units=?,updated_at=? WHERE work_id=?",
+                (max(row["seen_units"],known),now(),work_id)
+            )
+
+    def list_serial_releases(self, *, work_id=None, limit=1000):
+        count = max(1,min(10000,int(limit)))
+        sql = """SELECT r.*,w.title,w.author,s.site,s.url
+                 FROM serial_releases r JOIN works w ON w.id=r.work_id
+                 LEFT JOIN work_sources s ON s.id=r.source_id"""
+        args = []
+        if work_id:
+            sql += " WHERE r.work_id=?"
+            args.append(work_id)
+        sql += " ORDER BY r.observed_at DESC,r.rowid DESC LIMIT ?"
+        args.append(count)
+        return [dict(row) for row in self.db.execute(sql,args)]
+
+    def source_reliability(self):
+        """All stored check observations, including failed and unknown checks."""
+        return [dict(row) for row in self.db.execute(
+            """SELECT s.site,COUNT(c.id) AS checks,
+               SUM(CASE WHEN c.outcome='error' THEN 1 ELSE 0 END) AS failures,
+               SUM(CASE WHEN c.outcome='updated' THEN 1 ELSE 0 END) AS increases,
+               SUM(CASE WHEN c.outcome IN ('updated','unchanged')
+                   THEN 1 ELSE 0 END) AS successful_counts,
+               MAX(c.checked_at) AS last_checked_at
+               FROM source_checks c JOIN work_sources s ON s.id=c.source_id
+               GROUP BY s.site ORDER BY checks DESC,s.site COLLATE NOCASE"""
+        )]
+
+    def batch_source_candidates(self, *, followed_only=True, minimum_hours=12,
+                                limit=20, current_time=None):
+        """Select at most one supported source per work for manual/opt-in checks.
+
+        Honor a provider-friendly minimum interval, prefer a supported primary
+        source, and never request arbitrary domains or untrusted custom links.
+        """
+        from .integrations import source_from_url
+
+        minimum_hours = int(minimum_hours)
+        limit = int(limit)
+        if not 0 <= minimum_hours <= 720 or not 1 <= limit <= 50:
+            raise ValueError("Invalid bulk-check interval or batch limit.")
+        clock = current_time or datetime.now(timezone.utc)
+        if clock.tzinfo is None:
+            clock = clock.replace(tzinfo=timezone.utc)
+        candidates = []
+        cooldown = 0
+        unsupported = 0
+        for work in self.list_works(sort="title"):
+            if work["kind"] not in ("fanfiction","web_novel"):
+                continue
+            if work["status"] in ("completed","dropped") or work["publication_status"]=="completed":
+                continue
+            if followed_only and not self.get_follow(work["id"]):
+                continue
+            sources = self.list_sources(work["id"])
+            supported = []
+            for source in sources:
+                try:
+                    source_from_url(source["url"])
+                except ValueError:
+                    continue
+                supported.append(source)
+            if not supported:
+                unsupported += 1
+                continue
+            # Sources are already ordered with primary first.
+            chosen = supported[0]
+            stamp = chosen["last_checked_at"]
+            if stamp and minimum_hours:
+                try:
+                    checked = datetime.fromisoformat(stamp.replace("Z","+00:00"))
+                    if checked.tzinfo is None:
+                        checked = checked.replace(tzinfo=timezone.utc)
+                    age = (clock-checked.astimezone(timezone.utc)).total_seconds()/3600
+                    if age < minimum_hours:
+                        cooldown += 1
+                        continue
+                except ValueError:
+                    pass
+            candidates.append({
+                "source_id":chosen["id"],"work_id":work["id"],
+                "title":work["title"],"url":chosen["url"],"site":chosen["site"],
+                "last_checked_at":stamp
+            })
+        return {
+            "candidates":candidates[:limit],
+            "remaining":max(0,len(candidates)-limit),
+            "cooldown":cooldown,"unsupported":unsupported,
+        }
 
     @staticmethod
     def _queue_values(priority="normal", target_date="", note=""):
@@ -2766,7 +2987,7 @@ class Library:
         return result
 
     def export_data(self):
-        return {"format": "booktracker", "schema_version": 7, "exported_at": now(),
+        return {"format": "booktracker", "schema_version": 8, "exported_at": now(),
                 "works": [dict(row) for row in self.db.execute("SELECT * FROM works")],
                 "reading_runs": [dict(row) for row in self.db.execute("SELECT * FROM reading_runs")],
                 "progress_events": [dict(row) for row in self.db.execute("SELECT * FROM progress_events")],
@@ -2786,11 +3007,17 @@ class Library:
                 # Portable metadata can be relinked on the destination computer.
                 "local_files": [dict(row, path="") for row in self.db.execute(
                     "SELECT * FROM local_files"
+                )],
+                "serial_follows": [dict(row) for row in self.db.execute(
+                    "SELECT * FROM serial_follows"
+                )],
+                "serial_releases": [dict(row) for row in self.db.execute(
+                    "SELECT * FROM serial_releases"
                 )]}
 
     def import_data(self, data, *, strategy="merge"):
         """Transactional import; duplicate event IDs are skipped when merging."""
-        if data.get("format") != "booktracker" or data.get("schema_version") not in (1, 2, 3, 4, 5, 6, 7):
+        if data.get("format") != "booktracker" or data.get("schema_version") not in (1, 2, 3, 4, 5, 6, 7, 8):
             raise ValueError("Unsupported BookTracker backup format or schema version.")
         if data["schema_version"] >= 2 and (
             not isinstance(data.get("shelves"), list)
@@ -2816,6 +3043,11 @@ class Library:
             or not isinstance(data.get("local_files"), list)
         ):
             raise ValueError("Backup is missing reading queue or local-file metadata.")
+        if data["schema_version"] >= 8 and (
+            not isinstance(data.get("serial_follows"), list)
+            or not isinstance(data.get("serial_releases"), list)
+        ):
+            raise ValueError("Backup is missing serial subscriptions or release events.")
         for key in ("works", "reading_runs", "progress_events"):
             if not isinstance(data.get(key), list):
                 raise ValueError(f"Backup is missing {key}.")
@@ -3182,6 +3414,61 @@ class Library:
                     VALUES(?,?,'',?,?,?,?,?,?)""",
                     (row["id"],work_id,filename,fmt,label,size,
                      row.get("created_at") or now(),row.get("updated_at") or now())
+                )
+            for follow in data.get("serial_follows", []):
+                if not isinstance(follow,dict):
+                    raise ValueError("Malformed serial follow in backup.")
+                target=mapping.get(follow.get("work_id"))
+                if not target:
+                    raise ValueError("Orphaned serial follow.")
+                work=self.get_work(target)
+                if work["kind"] not in ("fanfiction","web_novel"):
+                    raise ValueError("Serial follow refers to a non-serial work.")
+                try:
+                    seen=int(follow.get("seen_units",0))
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("Invalid acknowledged chapter count.") from exc
+                if not 0<=seen<=10_000_000 or follow.get("notify") not in (0,1,False,True):
+                    raise ValueError("Invalid serial follow preferences.")
+                self.db.execute(
+                    """INSERT OR IGNORE INTO serial_follows
+                    (work_id,notify,seen_units,followed_at,updated_at)
+                    VALUES(?,?,?,?,?)""",
+                    (target,int(follow["notify"]),seen,
+                     follow.get("followed_at") or now(),
+                     follow.get("updated_at") or now())
+                )
+            for release in data.get("serial_releases", []):
+                if not isinstance(release,dict) or not release.get("id"):
+                    raise ValueError("Malformed serial release in backup.")
+                target=mapping.get(release.get("work_id"))
+                if not target:
+                    raise ValueError("Orphaned serialized release.")
+                original_source=release.get("source_id")
+                target_source=source_mapping.get(original_source) if original_source else None
+                # A deleted crosspost source is intentionally nullable in history.
+                if original_source and not target_source:
+                    raise ValueError("Release references a source missing from backup.")
+                try:
+                    old=int(release.get("old_units"))
+                    new=int(release.get("new_units"))
+                except (TypeError,ValueError) as exc:
+                    raise ValueError("Malformed release chapter counts.") from exc
+                if not 0<=old<new<=10_000_000:
+                    raise ValueError("Invalid release chapter range.")
+                other=self.db.execute(
+                    "SELECT work_id FROM serial_releases WHERE id=?",
+                    (release["id"],)
+                ).fetchone()
+                if other and other["work_id"]!=target:
+                    raise ValueError("Release ID belongs to another book.")
+                self.db.execute(
+                    """INSERT OR IGNORE INTO serial_releases
+                    (id,work_id,source_id,old_units,new_units,observed_at,note)
+                    VALUES(?,?,?,?,?,?,?)""",
+                    (release["id"],target,target_source,old,new,
+                     str(release.get("observed_at") or now()),
+                     str(release.get("note") or "")[:500]),
                 )
             self._backfill_catalog_relationships()
         return count

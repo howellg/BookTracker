@@ -15,7 +15,7 @@ Built with Python, PySide6, and SQLite. No account, cloud subscription, or alway
 - Associate existing EPUB/M4B/PDF and other reading files with a book; bulk-relink missing files from a folder across computers.
 - Associate **multiple crossposted story sources** with the same work, instead of creating duplicate reading histories.
 - Track **print, ebook, web, and audiobook editions** under one work; choose which edition should supply the main ISBN and page count.
-- Use the **Update center** to review known unread chapters and previously failed checks, and check supported sites manually.
+- Use the **Update center** to follow ongoing stories, distinguish newly detected vs unread chapters, inspect release history, and run bounded manual or opt-in checks.
 - Track **rereads** as independent reading runs without losing previous history.
 - Search titles, authors, fandoms, series, ISBNs, descriptions, personal notes and tags. Filter by type, status, shelves, exact author/series/tag, favorites and metadata completeness.
 - Store personal star ratings (0.5 increments), notes, publication status, word counts, source URLs and more. Imported tag lists in the book details panel collapse when long.
@@ -45,8 +45,46 @@ Built with Python, PySide6, and SQLite. No account, cloud subscription, or alway
 - **Import Kindle highlights and notes** from My Clippings.txt, with preview, explicit matching and deduplication.
 - Search the **Notes & quotes** journal, copy selections to the clipboard and export selected annotations to Markdown.
 - Review library statistics, recent progress history, reading goals, time spent and series progress.
-- Manage crosspost source URLs, editions, and manually triggered chapter checks without altering work-level reading history.
+- Manage crosspost URLs, editions, followed stories, observed releases, and safe manual/opt-in chapter checks without altering work-level reading history.
 - All data is saved locally in an SQLite database; portable JSON/XML import uses stable UUIDs for merge.
+
+## New in v0.12.0
+
+**Serialized Fiction 2.0** expands the Update Center into a home for followed fanfiction, LitRPG and web novels. It distinguishes **unread chapters**, **newly detected releases**, and **chapter-count baselines**.
+
+### Followed stories and release observations
+
+- **Follow / Unfollow:** In Update Center, select a serial and choose Follow story. You can also follow linked serialized works from their book detail panel. Following does not affect reading progress, status, rereads or shelves.
+- **Unread versus new:** Unread chapters equal the known published total minus the recorded reading position. Newly observed chapters show an increase since you last acknowledged new releases. A first successful observation of a previously unknown count establishes a baseline instead of claiming every existing chapter was newly released.
+- **Acknowledge new:** Clear the newly observed indicator without modifying reading history. Mark caught up, by contrast, explicitly records a new progress milestone after confirmation.
+- **Release history:** Recorded increases show prior and new known chapter totals and the date and source of the *observation*. This is not necessarily the actual publication date.
+- **Export observed release history:** CSV exports include dates, titles, sources, amounts and notes, with untrusted text escaped for safe spreadsheet viewing.
+- **Provider reliability:** Review site check successes and failures. HTTP errors never delete a story or decrease its known published chapter count.
+- **Conservative inactivity filter:** No growth observed in 90+ days is shown only when an actual past increase was recorded and another successful check occurred in the last 14 days. This does not declare a story on hiatus or abandoned.
+
+### Batch checking and optional notifications
+
+- **Check eligible stories:** Visit up to 20 supported source pages per batch, one per story, sequentially with a 1.5-second gap and a default 12-hour per-source cooldown. Override cooldown only when deliberately checking again. Cancel stops between requests.
+- **Following filter:** The default batch checks followed stories only. Completed/dropped works and unsupported domains are excluded.
+- **Startup checking:** Optionally enable a small check on app launch, limited to 8 followed stories and a 24-hour minimum between checks of the same source. Automatic checking is **off by default** and there is no always-running background agent.
+- **Desktop notifications:** Both global Desktop alerts and the individual story's alert preference must be turned on. BookTracker alerts only for newly observed increases after a previously known total, never for initial baselines, unknown counts, or failed requests.
+- **Manual fallback:** Continue to use Sources & editions for individual site checks, saved HTML imports, manual chapter counts and check history. Provider access can be blocked by Cloudflare, login walls or other site restrictions.
+
+### Supported source metadata
+
+- AO3 parsing remains available.
+- Royal Road, FanFiction.net and Scribble Hub chapter counts can now be read from recognizable public chapter-list or explicitly labeled count elements, where available.
+- Forum threadmark counts are only used when a total is explicitly present. Some sites paginate or dynamically load lists; BookTracker leaves uncertain counts unknown rather than inventing a total. Provider HTML changes can require parser updates.
+
+### Safe upgrade and file portability
+
+- SQLite schema v8 adds only two new tables, serial_follows and serial_releases, leaving the existing history and catalog records intact.
+- A WAL-aware pre-upgrade snapshot is made in the database's adjacent backups folder as BookTracker-before-v012-*.sqlite3.
+- JSON, XML and portable .btbackup v8 include following preferences, acknowledged totals and release history as well as existing reading records and cover portability. Repeated merges do not duplicate release entries and preserve the local follow preferences of existing records.
+- Older v1-v7 exports remain importable.
+- To upgrade, close BookTracker, export a .btbackup precautionary copy, run git pull and uv sync in your repository, and start with uv run python -m booktracker.
+
+**Limitations:** Checks are best-effort, not guaranteed realtime release monitoring. They do not bypass Cloudflare/CAPTCHAs, scrape chapter text, or infer actual release dates from when metadata was observed.
 
 ## New in v0.11.0
 
@@ -342,11 +380,11 @@ For existing Goodreads history, use **File → Import Goodreads CSV**. It import
 
 ## Backup and portability
 
-| Format | Works & history | Queue, editions, journal, file-link metadata | Local EPUB covers |
+| Format | Works & history | Follows, releases, queue, editions, journal | Local EPUB covers |
 |---|---|---|---|
 | **.btbackup** portable bundle | Yes | Yes (including time, notes and saved views) | **Yes** |
-| JSON (schema v7) | Yes | Yes (including time, notes and saved views) | No |
-| XML (schema v7) | Yes | Yes (including time, notes and saved views) | No |
+| JSON (schema v8) | Yes | Yes (including time, notes and saved views) | No |
+| XML (schema v8) | Yes | Yes (including time, notes and saved views) | No |
 | CSV catalog | Works/metadata only | No | No |
 | Goodreads CSV (import) | Imported work fields | No | No |
 

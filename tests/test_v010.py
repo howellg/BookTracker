@@ -272,11 +272,11 @@ def test_migration_snapshot_and_idempotence(tmp_path):
         old.execute("PRAGMA user_version=6")
     migrated=Library(path)
     try:
-        snapshots=list((tmp_path/"backups").glob("BookTracker-before-v010-*.sqlite3"))
+        snapshots=list((tmp_path/"backups").glob("BookTracker-before-v012-*.sqlite3"))
         assert len(snapshots)==1
         with sqlite3.connect(snapshots[0]) as read:
             assert read.execute("PRAGMA user_version").fetchone()[0]==6
-        assert migrated.db.execute("PRAGMA user_version").fetchone()[0]==7
+        assert migrated.db.execute("PRAGMA user_version").fetchone()[0]==8
         assert migrated.get_work(book)["notes"]=="Important existing notes"
         migrated.enqueue_work(book)
     finally:
@@ -284,7 +284,7 @@ def test_migration_snapshot_and_idempotence(tmp_path):
     again=Library(path)
     try:
         assert len(again.list_queue())==1
-        assert len(list((tmp_path/"backups").glob("BookTracker-before-v010-*.sqlite3")))==1
+        assert len(list((tmp_path/"backups").glob("BookTracker-before-v012-*.sqlite3")))==1
     finally:
         again.close()
 
