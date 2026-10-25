@@ -5,7 +5,7 @@ import sys
 import webbrowser
 
 from PySide6.QtCore import QSize, Qt, QThread, QUrl, Signal
-from PySide6.QtGui import QAction, QColor, QFont, QIcon, QPalette, QPixmap
+from PySide6.QtGui import QAction, QColor, QFont, QIcon, QPainter, QPalette, QPixmap
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
 from PySide6.QtWidgets import (
     QApplication,
@@ -20,7 +20,9 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QLabel,
+    QLayout,
     QLineEdit,
     QListWidget,
     QListWidgetItem,
@@ -39,6 +41,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .backups import automatic_backup
 from .book_search import _normalize, cached_book_search
 from .covers import CoverCache, cover_url_for
 from .database import KINDS, PUBLICATION, STATUSES, UNITS, Library
@@ -119,12 +122,25 @@ def label(text, style=""):
 
 def button(text, callback, primary=False, danger=False):
     result = QPushButton(text)
+    result.setMinimumHeight(34)
     if primary:
         result.setObjectName("primary")
     elif danger:
         result.setObjectName("danger")
     result.clicked.connect(callback)
     return result
+
+
+def placeholder_cover(title):
+    pixmap = QPixmap(116, 164)
+    pixmap.fill(QColor('#263a55'))
+    painter = QPainter(pixmap)
+    painter.setPen(QColor('#e7eef9'))
+    font = QFont('Noto Sans', 10, QFont.Weight.DemiBold)
+    painter.setFont(font)
+    painter.drawText(10, 12, 96, 140, Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap, title)
+    painter.end()
+    return pixmap
 
 
 def fail(parent, message):
@@ -861,6 +877,7 @@ class MainWindow(QMainWindow):
         self.covers.cover_ready.connect(self.cover_available)
         self.current_cover_label = None
         self.current_cover_url = ""
+        self.gallery_books = []
         self.metadata_worker = None
         self.setWindowTitle("BookTracker — Your reading, remembered")
         self.resize(1360, 840)
@@ -891,6 +908,7 @@ class MainWindow(QMainWindow):
         sidebar.addStretch()
         sidebar.addWidget(button("Import library", self.import_library))
         sidebar.addWidget(button("Export library", self.export_library))
+        sidebar.addWidget(button("Back up database", self.manual_backup))
         sidebar.addWidget(label("Offline-first · SQLite", "muted"))
         outer.addWidget(side)
 
@@ -903,6 +921,10 @@ class MainWindow(QMainWindow):
         self.refresh_all()
         self.statusBar().showMessage(f"Local database: {self.library.path}")
         self.make_menu()
+        try:
+            automatic_backup(self.library, destination=self.library.path.parent / 'backups')
+        except Exception as exc:
+            self.statusBar().showMessage(f"Automatic backup warning: {exc}", 25000)
 
     def make_menu(self):
         menu = self.menuBar().addMenu("&File")
@@ -958,21 +980,37 @@ class MainWindow(QMainWindow):
                            ("Author", "author"), ("Recently added", "added"), ("Rating", "rating")):
             self.sort.addItem(title, key)
         self.sort.currentIndexChanged.connect(self.refresh_library)
+        self.shelf_filter = QComboBox()
+        self.shelf_filter.addItem("All shelves", None)
+        self.shelf_filter.currentIndexChanged.connect(self.refresh_library)
         self.only_fav = QCheckBox("★ Favorites")
         self.only_fav.toggled.connect(self.refresh_library)
         filters.addWidget(self.search, stretch=3)
         filters.addWidget(self.filter_status, stretch=1)
         filters.addWidget(self.filter_kind, stretch=1)
         filters.addWidget(self.sort, stretch=1)
+        filters.addWidget(self.shelf_filter)
         filters.addWidget(self.only_fav)
         layout.addLayout(filters)
+        commands = QHBoxLayout()
+        self.view_selector = QComboBox()
+        self.view_selector.addItem("Detailed list", "list")
+        self.view_selector.addItem("Cover gallery", "gallery")
+        self.view_selector.currentIndexChanged.connect(self.toggle_library_view)
+        commands.addWidget(self.view_selector)
+        commands.addWidget(button("Select all", self.select_all_visible))
+        commands.addWidget(button("Bulk edit", self.bulk_edit_selected))
+        commands.addWidget(button("Add to shelf", self.add_selected_to_shelf))
+        commands.addWidget(button("New shelf", self.create_shelf))
+        commands.addStretch()
+        layout.addLayout(commands)
         layout.addSpacing(10)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         self.table = QTableWidget(0, 6)
         self.table.setHorizontalHeaderLabels(["Title", "Author", "Type", "Reading", "Progress", "Rating"])
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        self.table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.table.setSelectionMode(QTableWidget.SelectionMode.ExtendedSelection)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setAlternatingRowColors(False)
         self.table.setIconSize(QSize(37, 53))
@@ -983,7 +1021,22 @@ class MainWindow(QMainWindow):
             self.table.horizontalHeader().setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
         self.table.itemSelectionChanged.connect(self.show_selected)
         self.table.itemDoubleClicked.connect(lambda _: self.edit_work())
-        splitter.addWidget(self.table)
+        self.library_views = QStackedWidget()
+        self.library_views.addWidget(self.table)
+        self.gallery = QListWidget()
+        self.gallery.setViewMode(QListWidget.ViewMode.IconMode)
+        self.gallery.setMovement(QListWidget.Movement.Static)
+        self.gallery.setResizeMode(QListWidget.ResizeMode.Adjust)
+        self.gallery.setWrapping(True)
+        self.gallery.setWordWrap(True)
+        self.gallery.setSpacing(14)
+        self.gallery.setGridSize(QSize(164, 226))
+        self.gallery.setIconSize(QSize(116, 164))
+        self.gallery.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
+        self.gallery.itemSelectionChanged.connect(self.show_selected)
+        self.gallery.itemDoubleClicked.connect(lambda _: self.edit_work())
+        self.library_views.addWidget(self.gallery)
+        splitter.addWidget(self.library_views)
 
         details = QFrame()
         details.setObjectName("details")
@@ -993,15 +1046,18 @@ class MainWindow(QMainWindow):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll.setStyleSheet("QScrollArea { border: none; }")
+        scroll.setStyleSheet("QScrollArea { background: #192231; border: none; }")
         detail_content = QWidget()
+        detail_content.setObjectName("detailContent")
+        detail_content.setStyleSheet("QWidget#detailContent { background-color: #192231; }")
         for surface in (scroll.viewport(), detail_content):
             palette = surface.palette()
             palette.setColor(QPalette.ColorRole.Window, QColor("#192231"))
             surface.setPalette(palette)
             surface.setAutoFillBackground(True)
         self.details = QVBoxLayout(detail_content)
-        self.details.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self.details.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
+        self.details.setSpacing(10)
         scroll.setWidget(detail_content)
         d_outer.addWidget(scroll)
         splitter.addWidget(details)
@@ -1016,9 +1072,12 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(page)
         layout.addWidget(label("Reading history", "headline"))
         layout.addWidget(label("Chapter and page milestones across every work and reread.", "muted"))
+        layout.addWidget(button("Delete selected mistaken milestone", self.delete_history_event))
         self.history_table = QTableWidget(0, 4)
         self.history_table.setHorizontalHeaderLabels(["Date", "Work", "Progress", "Note"])
         self.history_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.history_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.history_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         self.history_table.verticalHeader().setVisible(False)
         self.history_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.history_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
@@ -1054,6 +1113,7 @@ class MainWindow(QMainWindow):
         self.pages.addWidget(page)
 
     def refresh_all(self, select_id=None):
+        self.refresh_shelves()
         self.refresh_library(select_id=select_id)
         self.refresh_history()
         self.refresh_stats()
@@ -1061,7 +1121,8 @@ class MainWindow(QMainWindow):
     def refresh_library(self, *_args, select_id=None):
         books = self.library.list_works(
             self.search.text(), self.filter_status.currentData(),
-            self.filter_kind.currentData(), self.only_fav.isChecked(), self.sort.currentData())
+            self.filter_kind.currentData(), self.only_fav.isChecked(),
+            self.sort.currentData(), self.shelf_filter.currentData())
         current = select_id or self.selected_id
         self.table.blockSignals(True)
         self.table.setRowCount(len(books))
@@ -1070,7 +1131,9 @@ class MainWindow(QMainWindow):
             if book["id"] == current:
                 chosen = row
             total = book["total_units"] or (100 if book["progress_unit"] == "percent" else 0)
-            progress = f"{book['progress']} / {total}" if total else str(book["progress"])
+            progress = ("Finished · history unknown" if book["status"] == "completed"
+                        and not self.library.runs(book["id"]) else
+                        (f"{book['progress']} / {total}" if total else str(book["progress"])))
             if book["status"] == "caught_up":
                 progress += " ✓"
             values = (("★ " if book["favorite"] else "") + book["title"], book["author"],
@@ -1092,10 +1155,24 @@ class MainWindow(QMainWindow):
                 self.table.setItem(row, col, item)
             self.table.setRowHeight(row, 62)
         self.table.blockSignals(False)
+        self.gallery.blockSignals(True)
+        self.gallery.clear()
+        self.gallery_books = books
+        for book in books:
+            tile = QListWidgetItem(book["title"] + "\n" + book["author"])
+            tile.setData(Qt.ItemDataRole.UserRole, book["id"])
+            tile.setTextAlignment(Qt.AlignmentFlag.AlignHCenter)
+            url = cover_url_for(book)
+            cover = self.covers.get(url) if url else None
+            tile.setIcon(QIcon(cover if cover is not None else placeholder_cover(book['title'])))
+            self.gallery.addItem(tile)
+        self.gallery.blockSignals(False)
         if chosen >= 0:
             self.table.selectRow(chosen)
+            self.gallery.setCurrentRow(chosen)
         elif books:
             self.table.selectRow(0)
+            self.gallery.setCurrentRow(0)
         else:
             self.selected_id = None
             self.clear_layout(self.details)
@@ -1107,15 +1184,24 @@ class MainWindow(QMainWindow):
         while layout.count():
             item = layout.takeAt(0)
             if item.widget():
-                item.widget().deleteLater()
+                widget = item.widget()
+                widget.hide()
+                widget.setParent(None)
+                widget.deleteLater()
             elif item.layout():
                 MainWindow.clear_layout(item.layout())
 
     def show_selected(self):
-        items = self.table.selectedItems()
-        if not items:
-            return
-        work_id = self.table.item(items[0].row(), 0).data(Qt.ItemDataRole.UserRole)
+        if self.library_views.currentIndex() == 1:
+            chosen = self.gallery.selectedItems()
+            if not chosen:
+                return
+            work_id = chosen[0].data(Qt.ItemDataRole.UserRole)
+        else:
+            rows = self.table.selectionModel().selectedRows()
+            if not rows:
+                return
+            work_id = self.table.item(rows[0].row(), 0).data(Qt.ItemDataRole.UserRole)
         self.selected_id = work_id
         book = self.library.get_work(work_id)
         if not book:
@@ -1174,10 +1260,15 @@ class MainWindow(QMainWindow):
             self.details.addWidget(button("Open source ↗", lambda: webbrowser.open(book["source_url"])))
         self.details.addWidget(button("Delete work", self.delete_work, danger=True))
         self.details.addSpacing(10)
+        shelves = [s["name"] for s in self.library.list_shelves()
+                   if s["id"] in self.library.shelves_for_work(work_id)]
+        if shelves:
+            self.details.addWidget(label("Shelves: " + ", ".join(shelves), "muted"))
         self.details.addWidget(label(f"Reading runs: {len(runs)}", "muted"))
         for run in runs[:5]:
             self.details.addWidget(label(
                 f"• {run['started_at'][:10]} → {run['finished_at'][:10] or 'in progress'}", "muted"))
+        self.details.addStretch(1)
 
     def cover_available(self, url):
         pixmap = self.covers.get(url)
@@ -1187,6 +1278,9 @@ class MainWindow(QMainWindow):
             item = self.table.item(row, 0)
             if item and item.data(Qt.ItemDataRole.UserRole + 1) == url:
                 item.setIcon(QIcon(pixmap))
+        for i, work in enumerate(self.gallery_books):
+            if cover_url_for(work) == url and i < self.gallery.count():
+                self.gallery.item(i).setIcon(QIcon(pixmap))
         if self.current_cover_url == url and self.current_cover_label is not None:
             self.current_cover_label.setText("")
             self.current_cover_label.setPixmap(pixmap.scaled(
@@ -1226,6 +1320,120 @@ class MainWindow(QMainWindow):
         else:
             message = "This book already has all metadata available from the catalog."
         self.statusBar().showMessage(message, 15000)
+
+    def toggle_library_view(self, *_args):
+        self.library_views.setCurrentIndex(self.view_selector.currentIndex())
+        self.show_selected()
+
+    def selected_ids(self):
+        if self.library_views.currentIndex() == 1:
+            return [item.data(Qt.ItemDataRole.UserRole) for item in self.gallery.selectedItems()]
+        return [self.table.item(index.row(), 0).data(Qt.ItemDataRole.UserRole)
+                for index in self.table.selectionModel().selectedRows()]
+
+    def select_all_visible(self):
+        if self.library_views.currentIndex() == 1:
+            self.gallery.selectAll()
+        else:
+            self.table.selectAll()
+
+    def refresh_shelves(self):
+        current = self.shelf_filter.currentData()
+        self.shelf_filter.blockSignals(True)
+        self.shelf_filter.clear()
+        self.shelf_filter.addItem("All shelves", None)
+        for shelf in self.library.list_shelves():
+            self.shelf_filter.addItem(f"{shelf['name']} ({shelf['total']})", shelf["id"])
+        at = self.shelf_filter.findData(current)
+        self.shelf_filter.setCurrentIndex(max(0, at))
+        self.shelf_filter.blockSignals(False)
+
+    def create_shelf(self):
+        name, ok = QInputDialog.getText(self, "Create shelf", "Shelf name:")
+        if not ok:
+            return
+        try:
+            self.library.create_shelf(name)
+            self.refresh_all()
+        except Exception as exc:
+            fail(self, exc)
+
+    def add_selected_to_shelf(self):
+        ids = self.selected_ids()
+        if not ids:
+            QMessageBox.information(self, "Choose books", "Select one or more books first.")
+            return
+        shelves = self.library.list_shelves()
+        if not shelves:
+            self.create_shelf()
+            shelves = self.library.list_shelves()
+        if not shelves:
+            return
+        labels = [item["name"] for item in shelves]
+        choice, ok = QInputDialog.getItem(
+            self, "Add to shelf", f"Put {len(ids)} selected books on:", labels, 0, False
+        )
+        if ok:
+            try:
+                self.library.set_shelf_membership(
+                    ids, next(item["id"] for item in shelves if item["name"] == choice)
+                )
+                self.refresh_all()
+            except Exception as exc:
+                fail(self, exc)
+
+    def bulk_edit_selected(self):
+        ids = self.selected_ids()
+        if not ids:
+            QMessageBox.information(self, "Choose books", "Select one or more books first.")
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Bulk edit {len(ids)} books")
+        form = QFormLayout(dialog)
+        status = QComboBox()
+        status.addItem("Leave reading status unchanged", None)
+        for value in STATUSES:
+            status.addItem(name(value), value)
+        favorite = QComboBox()
+        favorite.addItem("Leave favorites unchanged", None)
+        favorite.addItem("Set favorites", True)
+        favorite.addItem("Clear favorites", False)
+        tags = QLineEdit()
+        tags.setPlaceholderText("Optional tags separated by commas")
+        form.addRow(f"Editing {len(ids)} selected books", label("Changes affect all selected entries."))
+        form.addRow("Reading status", status)
+        form.addRow("Favorite", favorite)
+        form.addRow("Add tags", tags)
+        form.addRow(label("Historical completion dates will not be fabricated.", "muted"))
+        controls = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        controls.accepted.connect(dialog.accept)
+        controls.rejected.connect(dialog.reject)
+        form.addRow(controls)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            try:
+                self.library.batch_edit(
+                    ids, status=status.currentData(), favorite=favorite.currentData(),
+                    add_tags=[v.strip() for v in tags.text().split(",") if v.strip()],
+                )
+                self.refresh_all()
+            except Exception as exc:
+                fail(self, exc)
+
+    def manual_backup(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save database snapshot",
+            str(self.library.path.parent / "backups" / "BookTracker-manual.sqlite3"),
+            "SQLite database (*.sqlite3)"
+        )
+        if not path:
+            return
+        try:
+            self.library.backup_to(path)
+            QMessageBox.information(self, "Backup complete", f"Verified backup saved to:\n{path}")
+        except Exception as exc:
+            fail(self, exc)
 
     def selected_work(self):
         return self.library.get_work(self.selected_id) if self.selected_id else None
@@ -1341,8 +1549,32 @@ class MainWindow(QMainWindow):
                       f"{event['old_progress']} → {event['new_progress']} {event['progress_unit']} ({delta:+d})",
                       event["note"])
             for col, value in enumerate(values):
-                self.history_table.setItem(row, col, QTableWidgetItem(value))
+                cell = QTableWidgetItem(value)
+                if col == 0:
+                    cell.setData(Qt.ItemDataRole.UserRole, event["id"])
+                self.history_table.setItem(row, col, cell)
             self.history_table.setRowHeight(row, 38)
+
+    def delete_history_event(self):
+        indexes = self.history_table.selectionModel().selectedRows()
+        if not indexes:
+            QMessageBox.information(self, "Select an entry", "Choose a reading milestone first.")
+            return
+        item = self.history_table.item(indexes[0].row(), 0)
+        event_id = item.data(Qt.ItemDataRole.UserRole) if item else None
+        if not event_id:
+            return
+        if QMessageBox.question(
+            self, "Remove milestone?",
+            "Remove this mistaken reading milestone? The reading run's progress "
+            "will be recalculated from its remaining events."
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self.library.delete_progress_event(event_id)
+            self.refresh_all()
+        except Exception as exc:
+            fail(self, exc)
 
     def refresh_stats(self):
         stats = self.library.stats()
