@@ -15,7 +15,7 @@ from urllib.parse import urlparse
 from .database import WORK_FIELDS, Library
 from .story_metadata import parse_story_html
 
-USER_AGENT = "BookTracker/0.13 (personal reading-library metadata client)"
+USER_AGENT = "BookTracker/0.14 (personal reading-library metadata client)"
 KNOWN_HOSTS = {
     "archiveofourown.org": ("AO3", "fanfiction", r"/works/(\d+)"),
     "www.archiveofourown.org": ("AO3", "fanfiction", r"/works/(\d+)"),

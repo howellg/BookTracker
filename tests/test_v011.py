@@ -285,7 +285,7 @@ def test_habits_gui_and_stopwatch_controls(app,library,monkeypatch):
     key=book(library)
     win=MainWindow(library)
     try:
-        assert len(win.nav_buttons)==13
+        assert len(win.nav_buttons)==14
         win.navigate(11)
         assert win.pages.currentIndex()==11
         assert win.habits_cards["active_days"].text()=="0"

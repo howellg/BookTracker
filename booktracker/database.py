@@ -66,17 +66,17 @@ class Library:
             raise
 
     def _snapshot_before_schema_migration(self):
-        """Save a WAL-consistent snapshot before an existing database moves to v9."""
+        """Save a WAL-consistent snapshot before an existing database moves to v10."""
         version = self.db.execute("PRAGMA user_version").fetchone()[0]
         exists = self.db.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='works'"
         ).fetchone()
-        if not exists or version >= 9:
+        if not exists or version >= 10:
             return
         folder = self.path.parent / "backups"
         folder.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-        target = folder / f"BookTracker-before-v013-{stamp}.sqlite3"
+        target = folder / f"BookTracker-before-v014-{stamp}.sqlite3"
         # sqlite3.backup copies committed WAL content safely.
         with sqlite3.connect(target) as destination:
             self.db.backup(destination)
@@ -305,8 +305,27 @@ class Library:
             checked_at TEXT NOT NULL DEFAULT ''
         );
         CREATE INDEX IF NOT EXISTS idx_audio_origin ON audio_metadata(origin);
+        CREATE TABLE IF NOT EXISTS sync_device (
+            singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+            device_id TEXT NOT NULL UNIQUE,
+            display_name TEXT NOT NULL,
+            published_revision INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS sync_peers (
+            device_id TEXT PRIMARY KEY,
+            display_name TEXT NOT NULL,
+            revision INTEGER NOT NULL DEFAULT 0,
+            remote_baseline BLOB NOT NULL,
+            local_baseline BLOB NOT NULL,
+            last_applied_at TEXT NOT NULL
+        );
         """)
-        self.db.execute("PRAGMA user_version=9")
+        self.db.execute(
+            """INSERT OR IGNORE INTO sync_device
+            (singleton,device_id,display_name,published_revision)
+            VALUES(1,?,?,0)""",(new_id(),"This computer")
+        )
+        self.db.execute("PRAGMA user_version=10")
         self._backfill_catalog_relationships()
         self.db.commit()
 
@@ -3295,7 +3314,7 @@ class Library:
         return result
 
     def export_data(self):
-        return {"format": "booktracker", "schema_version": 9, "exported_at": now(),
+        return {"format": "booktracker", "schema_version": 10, "exported_at": now(),
                 "works": [dict(row) for row in self.db.execute("SELECT * FROM works")],
                 "reading_runs": [dict(row) for row in self.db.execute("SELECT * FROM reading_runs")],
                 "progress_events": [dict(row) for row in self.db.execute("SELECT * FROM progress_events")],
@@ -3326,9 +3345,9 @@ class Library:
                     "SELECT * FROM audio_metadata"
                 )]}
 
-    def import_data(self, data, *, strategy="merge"):
+    def import_data(self, data, *, strategy="merge", postmerge=None, sync_mode=False):
         """Transactional import; duplicate event IDs are skipped when merging."""
-        if data.get("format") != "booktracker" or data.get("schema_version") not in (1, 2, 3, 4, 5, 6, 7, 8, 9):
+        if data.get("format") != "booktracker" or data.get("schema_version") not in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10):
             raise ValueError("Unsupported BookTracker backup format or schema version.")
         if data["schema_version"] >= 2 and (
             not isinstance(data.get("shelves"), list)
@@ -3370,6 +3389,9 @@ class Library:
         count = 0
         with self.transaction():
             if strategy == "replace":
+                # A replaced library no longer shares its old peer baselines.
+                # Keep this computer's identity but require a fresh review.
+                self.db.execute("DELETE FROM sync_peers")
                 self.db.execute("DELETE FROM works")
                 self.db.execute("DELETE FROM shelves")
                 self.db.execute("DELETE FROM reading_goals")
@@ -3397,7 +3419,10 @@ class Library:
                             patches[field] = incoming
                     if not current["tags"] and fields.get("tags") not in (None, "[]"):
                         patches["tags"] = fields["tags"]
-                    if patches:
+                    if patches and (not sync_mode or target_id!=item["id"]):
+                        # A first-time title/author match with a different ID
+                        # may fill missing public metadata. Same-ID synced
+                        # records require explicit three-way field review.
                         patches["updated_at"] = now()
                         keys = ", ".join(f"{k}=?" for k in patches)
                         self.db.execute(f"UPDATE works SET {keys} WHERE id=?",
@@ -3804,4 +3829,6 @@ class Library:
                     (file_id,*(fields[k] for k in keys))
                 )
             self._backfill_catalog_relationships()
+            if postmerge is not None:
+                postmerge(mapping)
         return count
