@@ -139,8 +139,14 @@ class Library:
         );
         CREATE INDEX IF NOT EXISTS idx_works_series ON works(series COLLATE NOCASE);
         CREATE INDEX IF NOT EXISTS idx_works_finished_at ON works(finished_at);
+        CREATE TABLE IF NOT EXISTS saved_views (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+            filters_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
         """)
-        self.db.execute("PRAGMA user_version=3")
+        self.db.execute("PRAGMA user_version=4")
         self.db.commit()
 
     @staticmethod
@@ -220,7 +226,8 @@ class Library:
         return work
 
     def list_works(self, search="", status="all", kind="all", favorites=False, sort="updated",
-                   shelf_id=None, series=None, tag=None, author=None) -> list[dict]:
+                   shelf_id=None, series=None, tag=None, author=None,
+                   quality=None) -> list[dict]:
         sql = """SELECT w.*, COALESCE((
             SELECT current_progress FROM reading_runs
             WHERE work_id=w.id ORDER BY started_at DESC, rowid DESC LIMIT 1
@@ -232,8 +239,9 @@ class Library:
             escaped = search.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
             sql += (" AND (w.title LIKE ? ESCAPE '\\' OR w.author LIKE ? ESCAPE '\\'"
                     " OR w.fandom LIKE ? ESCAPE '\\' OR w.tags LIKE ? ESCAPE '\\'"
-                    " OR w.series LIKE ? ESCAPE '\\')")
-            args.extend([f"%{escaped}%"] * 5)
+                    " OR w.series LIKE ? ESCAPE '\\' OR w.notes LIKE ? ESCAPE '\\'"
+                    " OR w.description LIKE ? ESCAPE '\\' OR w.isbn LIKE ? ESCAPE '\\')")
+            args.extend([f"%{escaped}%"] * 8)
         if status != "all":
             sql += " AND w.status=?"
             args.append(status)
@@ -255,12 +263,33 @@ class Library:
             sql += (" AND EXISTS (SELECT 1 FROM json_each(w.tags) t "
                     "WHERE t.value=? COLLATE NOCASE)")
             args.append(tag)
+        quality_sql = {
+            "missing_cover": "w.cover_url=''",
+            "missing_author": "w.author=''",
+            "missing_description": "w.description=''",
+            "missing_source": "w.source_url=''",
+            "missing_series": "w.series=''",
+            "unknown_dates": "w.status='completed' AND w.finished_at=''",
+        }
+        if quality in quality_sql:
+            sql += " AND (" + quality_sql[quality] + ")"
+        if quality == "serial_backlog":
+            sql += (""" AND w.kind IN ('fanfiction','web_novel')
+                AND w.progress_unit='chapters' AND w.total_units>0
+                AND w.status IN ('reading','caught_up') AND (
+                SELECT COALESCE(current_progress,0) FROM reading_runs r
+                WHERE r.work_id=w.id ORDER BY started_at DESC,rowid DESC LIMIT 1
+                ) BETWEEN 1 AND w.total_units-1""")
+        if quality == "incomplete":
+            sql += (" AND (w.cover_url='' OR w.author='' OR w.description=''"
+                    " OR w.source_url='')")
         order = {
             "updated": "w.updated_at DESC", "title": "w.title COLLATE NOCASE",
             "author": "w.author COLLATE NOCASE", "added": "w.added_at DESC",
             "rating": "w.rating DESC NULLS LAST",
             "finished": "w.finished_at DESC",
             "series": "w.series COLLATE NOCASE, w.title COLLATE NOCASE",
+            "progress": "progress DESC, w.title COLLATE NOCASE",
         }
         sql += " ORDER BY " + order.get(sort, order["updated"])
         rows = [dict(r) for r in self.db.execute(sql, args)]
@@ -771,7 +800,9 @@ class Library:
             "SELECT shelf_id AS id FROM work_shelves WHERE work_id=?", (work_id,)
         )]
 
-    def batch_edit(self, work_ids, *, status=None, favorite=None, add_tags=None):
+    def batch_edit(self, work_ids, *, status=None, favorite=None, add_tags=None,
+                   remove_tags=None, rating=None, publication_status=None,
+                   series=None):
         """Edit several works atomically without manufacturing reading dates or runs."""
         work_ids = list(dict.fromkeys(work_ids))
         if status is not None and status not in STATUSES:
@@ -779,6 +810,16 @@ class Library:
         if favorite is not None and not isinstance(favorite, bool):
             raise ValueError("Favorite must be True or False.")
         tags = [str(tag).strip() for tag in (add_tags or []) if str(tag).strip()]
+        removed = [str(tag).strip().casefold() for tag in (remove_tags or [])
+                   if str(tag).strip()]
+        if rating is not None:
+            rating = float(rating)
+            if not 0 <= rating <= 5:
+                raise ValueError("Rating must be between 0 and 5.")
+        if publication_status is not None and publication_status not in PUBLICATION:
+            raise ValueError("Unsupported publication status.")
+        if series is not None and len(str(series).strip()) > 200:
+            raise ValueError("Series name cannot exceed 200 characters.")
         with self.transaction():
             for work_id in work_ids:
                 book = self.get_work(work_id)
@@ -789,8 +830,16 @@ class Library:
                     changes["status"] = status
                 if favorite is not None:
                     changes["favorite"] = int(favorite)
-                if tags:
-                    changes["tags"] = json.dumps(list(dict.fromkeys(book["tags"] + tags)))
+                if tags or removed:
+                    result = [tag for tag in book["tags"] if tag.casefold() not in removed]
+                    result = list(dict.fromkeys(result + tags))
+                    changes["tags"] = json.dumps(result, ensure_ascii=False)
+                if rating is not None:
+                    changes["rating"] = rating
+                if publication_status is not None:
+                    changes["publication_status"] = publication_status
+                if series is not None:
+                    changes["series"] = str(series).strip()
                 if changes:
                     changes["updated_at"] = now()
                     sql = ", ".join(f"{key}=?" for key in changes)
@@ -923,26 +972,266 @@ class Library:
             (max(1, min(100, int(limit))),)
         )]
 
+    # Versioned custom saved library filters; they travel with JSON/XML backups.
+    VIEW_FILTERS = (
+        "search", "status", "kind", "favorites", "sort",
+        "shelf_id", "series", "tag", "author", "quality"
+    )
+
+    @classmethod
+    def validate_view_filters(cls, raw):
+        if not isinstance(raw, dict):
+            raise ValueError("Saved view filters must be a dictionary.")
+        unknown = set(raw) - set(cls.VIEW_FILTERS)
+        if unknown:
+            raise ValueError(f"Unknown saved view filter: {min(unknown)}")
+        result = {}
+        for key in cls.VIEW_FILTERS:
+            value = raw.get(key)
+            if key == "favorites":
+                if value is not None and not isinstance(value, bool):
+                    raise ValueError("Favorites filter must be true or false.")
+            elif value is not None and not isinstance(value, str):
+                raise ValueError(f"Saved view {key} must be text.")
+            if isinstance(value, str) and len(value) > 512:
+                raise ValueError("Saved view filter is too long.")
+            result[key] = value
+        if result["status"] not in (None, "all", *STATUSES):
+            raise ValueError("Unsupported saved status filter.")
+        if result["kind"] not in (None, "all", *KINDS):
+            raise ValueError("Unsupported saved type filter.")
+        if result["sort"] not in (None, "updated", "title", "author", "added",
+                                  "rating", "finished", "series", "progress"):
+            raise ValueError("Unsupported saved sorting.")
+        if result["quality"] not in (None, "all", "missing_cover", "missing_author",
+                                     "missing_description", "missing_source",
+                                     "missing_series", "incomplete",
+                                     "serial_backlog", "unknown_dates"):
+            raise ValueError("Unsupported quality filter.")
+        return result
+
+    def save_view(self, name, filters):
+        name = str(name).strip()
+        if not 1 <= len(name) <= 80:
+            raise ValueError("View name must contain between 1 and 80 characters.")
+        values = self.validate_view_filters(filters)
+        if self.db.execute(
+            "SELECT 1 FROM saved_views WHERE name=? COLLATE NOCASE", (name,)
+        ).fetchone():
+            raise ValueError("A saved view already uses this name.")
+        view_id = new_id()
+        with self.transaction():
+            self.db.execute(
+                "INSERT INTO saved_views VALUES(?,?,?,?)",
+                (view_id, name, json.dumps(values, ensure_ascii=False), now())
+            )
+        return view_id
+
+    def list_views(self):
+        return [
+            {**dict(row), "filters": json.loads(row["filters_json"])}
+            for row in self.db.execute(
+                "SELECT * FROM saved_views ORDER BY name COLLATE NOCASE"
+            )
+        ]
+
+    def delete_view(self, view_id):
+        with self.transaction():
+            self.db.execute("DELETE FROM saved_views WHERE id=?", (view_id,))
+
+    def set_published_units(self, work_id, count, *, publication_status=None):
+        count = int(count)
+        if not 0 <= count <= 10_000_000:
+            raise ValueError("Published units must be between 0 and 10 million.")
+        if publication_status is not None and publication_status not in PUBLICATION:
+            raise ValueError("Unknown publication status.")
+        with self.transaction():
+            values = {"total_units": count, "updated_at": now()}
+            if publication_status is not None:
+                values["publication_status"] = publication_status
+            set_sql = ", ".join(f"{field}=?" for field in values)
+            cursor = self.db.execute(
+                f"UPDATE works SET {set_sql} WHERE id=?",
+                (*values.values(), work_id),
+            )
+            if cursor.rowcount == 0:
+                raise KeyError(work_id)
+
+    def catch_up_to_published(self, work_id):
+        work = self.get_work(work_id)
+        if not work:
+            raise KeyError(work_id)
+        if work["progress_unit"] not in ("chapters", "pages"):
+            raise ValueError("This work isn't tracked by chapters or pages.")
+        if work["total_units"] <= 0:
+            raise ValueError("Set a known published chapter/page count first.")
+        run = self.active_run(work_id)
+        progress = run["current_progress"] if run else 0
+        if progress > work["total_units"]:
+            raise ValueError("Published count is less than current progress.")
+        if progress < work["total_units"]:
+            self.set_progress(work_id, work["total_units"])
+        self.set_status(work_id, "caught_up")
+        return work["total_units"] - progress
+
+    def quality_counts(self):
+        works = self.list_works()
+        counts = {key: 0 for key in (
+            "missing_cover", "missing_author", "missing_description",
+            "missing_source", "missing_series", "serial_backlog", "unknown_dates",
+        )}
+        for work in works:
+            if not work["cover_url"]:
+                counts["missing_cover"] += 1
+            if not work["author"]:
+                counts["missing_author"] += 1
+            if not work["description"]:
+                counts["missing_description"] += 1
+            if not work["source_url"]:
+                counts["missing_source"] += 1
+            if not work["series"]:
+                counts["missing_series"] += 1
+            if self._is_serial_backlog(work):
+                counts["serial_backlog"] += 1
+            if work["status"] == "completed" and not work["finished_at"]:
+                counts["unknown_dates"] += 1
+        counts["total"] = len(works)
+        return counts
+
+    @staticmethod
+    def _is_serial_backlog(work):
+        return (
+            work["kind"] in ("fanfiction", "web_novel")
+            and work["progress_unit"] == "chapters"
+            and work["total_units"] > 0
+            and 0 < work["progress"] < work["total_units"]
+            and work["status"] in ("reading", "caught_up")
+        )
+
+    def duplicate_candidates(self):
+        """Potential duplicates for review only; never automatically delete works."""
+        groups = {}
+        for work in self.list_works():
+            if work["title"] and work["author"]:
+                key = (_book_identity(work["title"]), _book_identity(work["author"]))
+                groups.setdefault(key, []).append(work)
+        return [
+            sorted(works, key=lambda w: w["added_at"])
+            for works in groups.values() if len(works) > 1
+        ]
+
+    def rename_tag(self, old, new):
+        old, new = str(old).strip(), str(new).strip()
+        if not old or not new or len(new) > 100:
+            raise ValueError("Tag names must contain 1–100 characters.")
+        changed = 0
+        with self.transaction():
+            for work in self.list_works():
+                tags = work["tags"]
+                if not any(tag.casefold() == old.casefold() for tag in tags):
+                    continue
+                result = []
+                keys = set()
+                for tag in tags:
+                    target = new if tag.casefold() == old.casefold() else tag
+                    if target.casefold() not in keys:
+                        result.append(target)
+                        keys.add(target.casefold())
+                self.db.execute(
+                    "UPDATE works SET tags=?,updated_at=? WHERE id=?",
+                    (json.dumps(result, ensure_ascii=False), now(), work["id"])
+                )
+                changed += 1
+        return changed
+
+    def delete_tag(self, name):
+        name = str(name).strip()
+        if not name:
+            raise ValueError("Choose a tag to remove.")
+        count = 0
+        with self.transaction():
+            for work in self.list_works():
+                result = [tag for tag in work["tags"] if tag.casefold() != name.casefold()]
+                if len(result) != len(work["tags"]):
+                    self.db.execute(
+                        "UPDATE works SET tags=?,updated_at=? WHERE id=?",
+                        (json.dumps(result, ensure_ascii=False), now(), work["id"])
+                    )
+                    count += 1
+        return count
+
+    def monthly_activity(self, year):
+        """Known dated milestones; missing historical dates remain excluded."""
+        year = int(year)
+        if not 1900 <= year <= 2200:
+            raise ValueError("Choose a valid statistics year.")
+        months = [
+            {"month": n, "chapters": 0, "pages": 0, "reading_days": 0,
+             "events": 0, "completed": 0}
+            for n in range(1, 13)
+        ]
+        readings = [set() for _ in range(12)]
+        events = self.db.execute(
+            """SELECT e.recorded_at,e.old_progress,e.new_progress,w.progress_unit
+               FROM progress_events e JOIN works w ON w.id=e.work_id
+               WHERE SUBSTR(e.recorded_at,1,4)=? ORDER BY e.recorded_at""",
+            (str(year),)
+        )
+        for event in events:
+            date = event["recorded_at"][:10]
+            if len(date) != 10:
+                continue
+            try:
+                index = datetime.fromisoformat(date).month - 1
+            except ValueError:
+                continue
+            bucket = months[index]
+            amount = max(0, event["new_progress"] - event["old_progress"])
+            if event["progress_unit"] in ("pages", "chapters"):
+                bucket[event["progress_unit"]] += amount
+            bucket["events"] += 1
+            readings[index].add(date)
+        for index, dates in enumerate(readings):
+            months[index]["reading_days"] = len(dates)
+        # A distinct work counts once per month for each known completion date.
+        for work in self.list_works():
+            dates = {run["finished_at"][:10] for run in self.runs(work["id"])
+                     if run["finished_at"]}
+            if work["status"] == "completed" and work["finished_at"]:
+                dates.add(work["finished_at"][:10])
+            for finished in dates:
+                if finished[:4] != str(year):
+                    continue
+                try:
+                    month = datetime.fromisoformat(finished).month - 1
+                    months[month]["completed"] += 1
+                except ValueError:
+                    continue
+        return months
+
     def export_data(self):
-        return {"format": "booktracker", "schema_version": 3, "exported_at": now(),
+        return {"format": "booktracker", "schema_version": 4, "exported_at": now(),
                 "works": [dict(row) for row in self.db.execute("SELECT * FROM works")],
                 "reading_runs": [dict(row) for row in self.db.execute("SELECT * FROM reading_runs")],
                 "progress_events": [dict(row) for row in self.db.execute("SELECT * FROM progress_events")],
                 "shelves": [dict(row) for row in self.db.execute("SELECT * FROM shelves")],
                 "work_shelves": [dict(row) for row in self.db.execute("SELECT * FROM work_shelves")],
-                "reading_goals": [dict(row) for row in self.db.execute("SELECT * FROM reading_goals")]}
+                "reading_goals": [dict(row) for row in self.db.execute("SELECT * FROM reading_goals")],
+                "saved_views": [dict(row) for row in self.db.execute("SELECT * FROM saved_views")]}
 
     def import_data(self, data, *, strategy="merge"):
         """Transactional import; duplicate event IDs are skipped when merging."""
-        if data.get("format") != "booktracker" or data.get("schema_version") not in (1, 2, 3):
+        if data.get("format") != "booktracker" or data.get("schema_version") not in (1, 2, 3, 4):
             raise ValueError("Unsupported BookTracker backup format or schema version.")
         if data["schema_version"] >= 2 and (
             not isinstance(data.get("shelves"), list)
             or not isinstance(data.get("work_shelves"), list)
         ):
             raise ValueError("Backup is missing shelf information.")
-        if data["schema_version"] == 3 and not isinstance(data.get("reading_goals"), list):
+        if data["schema_version"] >= 3 and not isinstance(data.get("reading_goals"), list):
             raise ValueError("Backup is missing reading goals.")
+        if data["schema_version"] >= 4 and not isinstance(data.get("saved_views"), list):
+            raise ValueError("Backup is missing saved library views.")
         for key in ("works", "reading_runs", "progress_events"):
             if not isinstance(data.get(key), list):
                 raise ValueError(f"Backup is missing {key}.")
@@ -955,6 +1244,7 @@ class Library:
                 self.db.execute("DELETE FROM works")
                 self.db.execute("DELETE FROM shelves")
                 self.db.execute("DELETE FROM reading_goals")
+                self.db.execute("DELETE FROM saved_views")
             for item in data["works"]:
                 if not isinstance(item, dict) or not item.get("id"):
                     raise ValueError("Invalid work in backup.")
@@ -1051,5 +1341,21 @@ class Library:
                     (year,books_target,chapters_target,pages_target,updated_at)
                     VALUES(?,?,?,?,?)""",
                     (year, books, chapters, pages, goal.get("updated_at") or now()),
+                )
+            for item in data.get("saved_views", []):
+                try:
+                    view_id = str(item["id"]).strip()
+                    name = str(item["name"]).strip()
+                    filters = self.validate_view_filters(json.loads(item["filters_json"]))
+                    if filters["shelf_id"] in shelf_map:
+                        filters["shelf_id"] = shelf_map[filters["shelf_id"]]
+                except (TypeError, ValueError, KeyError, json.JSONDecodeError) as exc:
+                    raise ValueError("Malformed saved view in backup.") from exc
+                if not view_id or not 1 <= len(name) <= 80:
+                    raise ValueError("Malformed saved view name or ID.")
+                self.db.execute(
+                    "INSERT OR IGNORE INTO saved_views VALUES(?,?,?,?)",
+                    (view_id, name, json.dumps(filters, ensure_ascii=False),
+                     item.get("created_at") or now()),
                 )
         return count
