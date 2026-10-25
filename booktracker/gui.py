@@ -8,10 +8,20 @@ from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QDate, QSettings, QSize, Qt, QThread, QUrl, Signal
-from PySide6.QtGui import QAction, QColor, QFont, QIcon, QPainter, QPalette, QPixmap
+from PySide6.QtGui import (
+    QAction,
+    QColor,
+    QFont,
+    QIcon,
+    QPainter,
+    QPalette,
+    QPixmap,
+    QTextCharFormat,
+)
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
 from PySide6.QtWidgets import (
     QApplication,
+    QCalendarWidget,
     QCheckBox,
     QComboBox,
     QDateEdit,
@@ -85,7 +95,8 @@ QLabel#headline { font-size: 25px; font-weight: 700; }
 QLabel#subheading { font-size: 16px; font-weight: 650; }
 QLabel#muted { color: #9ba9bf; }
 QLabel#value { color: #7bb6ff; font-size: 26px; font-weight: 700; }
-QLineEdit, QTextEdit, QComboBox, QSpinBox, QDoubleSpinBox, QDateEdit, QTableWidget, QListWidget {
+QLineEdit, QTextEdit, QComboBox, QSpinBox, QDoubleSpinBox, QDateEdit, QCalendarWidget,
+QTableWidget, QListWidget {
  background: #202c3c; border: 1px solid #34445a; border-radius: 7px;
  padding: 7px; selection-background-color: #305c8f;
 }
@@ -119,6 +130,19 @@ QMessageBox { background: #192231; }
 
 def name(value):
     return LABELS.get(value, str(value).replace("_", " ").title())
+
+
+def local_timestamp(value):
+    """Display UTC-offset timestamps in the computer's local timezone."""
+    text = str(value or "")
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return text
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone()
+    return (parsed.strftime("%Y-%m-%d %H:%M")
+            if "T" in text or " " in text else parsed.date().isoformat())
 
 
 def label(text, style=""):
@@ -941,7 +965,10 @@ class MilestoneEditor(QDialog):
         self.date.setCalendarPopup(True)
         self.date.setMinimumDate(QDate(1900, 1, 1))
         self.date.setMaximumDate(QDate(2200, 12, 31))
-        parsed = QDate.fromString(event["recorded_at"][:10], "yyyy-MM-dd")
+        parsed = QDate.fromString(
+            Library.activity_day(event["recorded_at"]) or "",
+            "yyyy-MM-dd",
+        )
         self.date.setDate(parsed if parsed.isValid() else QDate.currentDate())
         self.progress = QSpinBox()
         self.progress.setRange(
@@ -960,6 +987,180 @@ class MilestoneEditor(QDialog):
         actions.accepted.connect(self.accept)
         actions.rejected.connect(self.reject)
         layout.addWidget(actions)
+
+
+class ReadingSessionDialog(QDialog):
+    """Log explicit reading/listening time; never infer it from chapter progress."""
+
+    def __init__(self, parent, library, *, existing=None, work_id=None, day=None):
+        super().__init__(parent)
+        self.setWindowTitle("Edit reading time" if existing else "Log reading time")
+        self.resize(535, 345)
+        layout = QVBoxLayout(self)
+        layout.addWidget(label(
+            "Reading and listening time is separate from chapter/page milestones.",
+            "muted"
+        ))
+        form = QFormLayout()
+        self.book = QComboBox()
+        self.book.setMaxVisibleItems(20)
+        for entry in library.list_works(sort="title"):
+            self.book.addItem(
+                f"{entry['title']}  —  {entry['author'] or 'Unknown author'}",
+                entry["id"]
+            )
+        target = existing["work_id"] if existing else work_id
+        if target:
+            choice = self.book.findData(target)
+            if choice >= 0:
+                self.book.setCurrentIndex(choice)
+        self.book.setEnabled(not existing)
+        self.date = QDateEdit()
+        self.date.setCalendarPopup(True)
+        self.date.setDisplayFormat("yyyy-MM-dd")
+        self.date.setDate(QDate.fromString(
+            existing["read_date"] if existing else
+            (day or QDate.currentDate().toString("yyyy-MM-dd")), "yyyy-MM-dd"
+        ))
+        self.date.setMinimumDate(QDate(1900, 1, 1))
+        self.date.setMaximumDate(QDate(2200, 12, 31))
+        self.minutes = QSpinBox()
+        self.minutes.setRange(1, 1440)
+        self.minutes.setValue(existing["minutes"] if existing else 30)
+        self.minutes.setSuffix(" minutes")
+        self.mode = QComboBox()
+        self.mode.addItem("Reading (text / ebook)", "reading")
+        self.mode.addItem("Listening (audiobook)", "listening")
+        if existing:
+            self.mode.setCurrentIndex(self.mode.findData(existing["mode"]))
+        self.note = QTextEdit()
+        self.note.setPlaceholderText("Optional session notes…")
+        self.note.setMaximumHeight(105)
+        if existing:
+            self.note.setPlainText(existing["note"])
+        form.addRow("Book", self.book)
+        form.addRow("Date", self.date)
+        form.addRow("Duration", self.minutes)
+        form.addRow("Activity", self.mode)
+        form.addRow("Note", self.note)
+        layout.addLayout(form)
+        self.feedback = label("", "muted")
+        layout.addWidget(self.feedback)
+        actions = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        actions.accepted.connect(self.validate_accept)
+        actions.rejected.connect(self.reject)
+        layout.addWidget(actions)
+
+    def validate_accept(self):
+        if not self.book.currentData():
+            self.feedback.setText("Choose a book before saving reading time.")
+            return
+        self.accept()
+
+    def values(self):
+        return {
+            "read_date": self.date.date().toString("yyyy-MM-dd"),
+            "minutes": self.minutes.value(),
+            "mode": self.mode.currentData(),
+            "note": self.note.toPlainText().strip(),
+        }
+
+
+class AnnotationDialog(QDialog):
+    """A bookmark, quotation or note attached to a work, optionally at a chapter/page."""
+
+    def __init__(self, parent, library, *, existing=None, work_id=None):
+        super().__init__(parent)
+        self.setWindowTitle("Edit saved note" if existing else "Add bookmark or note")
+        self.resize(610, 430)
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        self.book = QComboBox()
+        self.book.setMaxVisibleItems(20)
+        for entry in library.list_works(sort="title"):
+            self.book.addItem(
+                f"{entry['title']}  —  {entry['author'] or 'Unknown author'}",
+                entry["id"]
+            )
+        target = existing["work_id"] if existing else work_id
+        if target:
+            choice = self.book.findData(target)
+            if choice >= 0:
+                self.book.setCurrentIndex(choice)
+        self.book.setEnabled(not existing)
+        self.kind = QComboBox()
+        for item, display in (
+            ("bookmark", "Bookmark"), ("quote", "Quote / passage"),
+            ("note", "Reading note")
+        ):
+            self.kind.addItem(display, item)
+        if existing:
+            self.kind.setCurrentIndex(self.kind.findData(existing["kind"]))
+        self.has_location = QCheckBox("Attach a chapter / page number")
+        self.location = QSpinBox()
+        self.location.setRange(0, 10000000)
+        self.location.setEnabled(False)
+        self.unit = QComboBox()
+        for key in UNITS:
+            self.unit.addItem(name(key), key)
+        self.unit.setEnabled(False)
+        self.has_location.toggled.connect(self.location.setEnabled)
+        self.has_location.toggled.connect(self.unit.setEnabled)
+        if existing and existing["location"] is not None:
+            self.has_location.setChecked(True)
+            self.location.setValue(existing["location"])
+            index = self.unit.findData(existing["location_unit"])
+            if index >= 0:
+                self.unit.setCurrentIndex(index)
+        elif target:
+            work = library.get_work(target)
+            if work:
+                self.unit.setCurrentIndex(
+                    max(0, self.unit.findData(work["progress_unit"]))
+                )
+        self.body = QTextEdit()
+        self.body.setPlaceholderText(
+            "Quote, personal reaction, bookmark label, or something to remember…"
+        )
+        if existing:
+            self.body.setPlainText(existing["body"])
+        self.body.setMinimumHeight(130)
+        form.addRow("Book", self.book)
+        form.addRow("Type", self.kind)
+        form.addRow(self.has_location)
+        form.addRow("Position", self.location)
+        form.addRow("Unit", self.unit)
+        form.addRow("Text", self.body)
+        layout.addLayout(form)
+        self.feedback = label("", "muted")
+        layout.addWidget(self.feedback)
+        actions = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        actions.accepted.connect(self.validate_accept)
+        actions.rejected.connect(self.reject)
+        layout.addWidget(actions)
+
+    def validate_accept(self):
+        if not self.book.currentData():
+            self.feedback.setText("Choose a book before saving.")
+            return
+        if self.kind.currentData() in ("quote", "note") and not self.body.toPlainText().strip():
+            self.feedback.setText("A quote or note needs some text.")
+            return
+        self.accept()
+
+    def values(self):
+        return {
+            "kind": self.kind.currentData(),
+            "location": self.location.value() if self.has_location.isChecked() else None,
+            "location_unit": self.unit.currentData() if self.has_location.isChecked() else "",
+            "body": self.body.toPlainText().strip(),
+        }
 
 
 class MainWindow(QMainWindow):
@@ -998,7 +1199,9 @@ class MainWindow(QMainWindow):
         for title, index in (("▤   Library", 0), ("◷   Reading history", 1),
                              ("▥   Dashboard", 2), ("▦   Series", 3),
                              ("♧   Authors", 4), ("▤   Insights", 5),
-                             ("◇   Library health", 6)):
+                             ("◇   Library health", 6),
+                             ("▦   Reading calendar", 7),
+                             ("✎   Notes && quotes", 8)):
             nav = button(title, lambda _, i=index: self.navigate(i))
             nav.setObjectName("nav")
             nav.setCheckable(True)
@@ -1021,6 +1224,8 @@ class MainWindow(QMainWindow):
         self.create_authors_page()
         self.create_insights_page()
         self.create_health_page()
+        self.create_calendar_page()
+        self.create_journal_page()
         geometry = self.settings.value("window_geometry")
         if geometry:
             self.restoreGeometry(geometry)
@@ -1051,6 +1256,9 @@ class MainWindow(QMainWindow):
             ("Library health", lambda: self.navigate(6), "Ctrl+Shift+L"),
             ("Save current library view", self.save_current_view, "Ctrl+Shift+V"),
             ("Log progress on selected work", self.log_progress, "Ctrl+L"),
+            ("Reading calendar", lambda: self.navigate(7), "Ctrl+Shift+C"),
+            ("Notes and quotes", lambda: self.navigate(8), "Ctrl+Shift+N"),
+            ("Log reading or listening time", self.log_reading_session, "Ctrl+Shift+T"),
         ):
             action = QAction(title, self)
             action.triggered.connect(callback)
@@ -1078,6 +1286,10 @@ class MainWindow(QMainWindow):
             self.refresh_insights_page()
         elif index == 6:
             self.refresh_health_page()
+        elif index == 7:
+            self.refresh_calendar_page()
+        elif index == 8:
+            self.refresh_journal_page()
 
     def focus_library_search(self):
         self.navigate(0)
@@ -1450,12 +1662,15 @@ class MainWindow(QMainWindow):
             with open(path, "w", newline="", encoding="utf-8-sig") as stream:
                 writer = csv.writer(stream)
                 writer.writerow(
-                    ["Year", "Month", "Chapters", "Pages", "Active days", "Events", "Completions"]
+                    ["Year", "Month", "Chapters", "Pages", "Active days", "Events",
+                     "Completions", "Reading minutes", "Listening minutes", "Sessions"]
                 )
                 for item in self.library.monthly_activity(self.insights_year.value()):
                     writer.writerow([
                         self.insights_year.value(), item["month"], item["chapters"],
                         item["pages"], item["reading_days"], item["events"], item["completed"],
+                        item["reading_minutes"], item["listening_minutes"],
+                        item["sessions"],
                     ])
             self.statusBar().showMessage("Reading insights exported.", 7000)
         except OSError as exc:
@@ -1478,7 +1693,9 @@ class MainWindow(QMainWindow):
             f"{sum(m['chapters'] for m in data):,} chapters   ·   "
             f"{sum(m['pages'] for m in data):,} pages   ·   "
             f"{sum(m['reading_days'] for m in data):,} active days   ·   "
-            f"{sum(m['completed'] for m in data):,} dated completions"
+            f"{sum(m['completed'] for m in data):,} dated completions\n"
+            f"{sum(m['reading_minutes'] for m in data) / 60:.1f} h reading   ·   "
+            f"{sum(m['listening_minutes'] for m in data) / 60:.1f} h listening"
         )
         self.insight_authors.clear()
         for author in self.library.author_summary()[:12]:
@@ -1668,6 +1885,561 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             fail(self, exc)
 
+    def create_calendar_page(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        heading = QHBoxLayout()
+        heading.addWidget(label("Reading calendar", "headline"), stretch=1)
+        heading.addWidget(button(
+            "+ Log reading / listening", self.log_reading_session, primary=True
+        ))
+        heading.addWidget(button("Export time log CSV", self.export_time_log))
+        layout.addLayout(heading)
+        layout.addWidget(label(
+            "A day is active if you recorded a reading milestone or logged actual "
+            "reading/listening time. Days with missing history stay unmarked.", "muted"
+        ))
+        self.calendar_streak = label("", "subheading")
+        layout.addWidget(self.calendar_streak)
+        columns = QHBoxLayout()
+        self.calendar = QCalendarWidget()
+        self.calendar.setGridVisible(False)
+        self.calendar.setVerticalHeaderFormat(
+            QCalendarWidget.VerticalHeaderFormat.NoVerticalHeader
+        )
+        self.calendar.setMinimumWidth(335)
+        self.calendar.setStyleSheet(
+            "QCalendarWidget { background: #192231; }"
+            "QCalendarWidget QWidget#qt_calendar_navigationbar { background: #233146; }"
+            "QCalendarWidget QTableView { background-color: #202c3c;"
+            " alternate-background-color: #202c3c; color: #e7eef9;"
+            " selection-background-color: #3274c2; }"
+            "QCalendarWidget QHeaderView::section { background: #233146;"
+            " color: #e7eef9; border: none; }"
+        )
+        header = QTextCharFormat()
+        header.setForeground(QColor("#c5d5ea"))
+        header.setBackground(QColor("#233146"))
+        for weekday in (
+            Qt.DayOfWeek.Monday, Qt.DayOfWeek.Tuesday,
+            Qt.DayOfWeek.Wednesday, Qt.DayOfWeek.Thursday,
+            Qt.DayOfWeek.Friday, Qt.DayOfWeek.Saturday,
+            Qt.DayOfWeek.Sunday,
+        ):
+            self.calendar.setWeekdayTextFormat(weekday, header)
+        self.calendar.selectionChanged.connect(self.refresh_calendar_day)
+        self.calendar.currentPageChanged.connect(self.refresh_calendar_page)
+        columns.addWidget(self.calendar, stretch=1)
+        right = QVBoxLayout()
+        self.calendar_month_summary = label("", "subheading")
+        right.addWidget(self.calendar_month_summary)
+        self.calendar_day_summary = label("", "muted")
+        right.addWidget(self.calendar_day_summary)
+        self.calendar_table = QTableWidget(0, 4)
+        self.calendar_table.setHorizontalHeaderLabels(
+            ["Activity", "Book", "Amount", "Note"]
+        )
+        self.calendar_table.setSelectionBehavior(
+            QTableWidget.SelectionBehavior.SelectRows
+        )
+        self.calendar_table.setSelectionMode(
+            QTableWidget.SelectionMode.SingleSelection
+        )
+        self.calendar_table.setEditTriggers(
+            QTableWidget.EditTrigger.NoEditTriggers
+        )
+        self.calendar_table.verticalHeader().setVisible(False)
+        self.calendar_table.horizontalHeader().setSectionResizeMode(
+            1, QHeaderView.ResizeMode.Stretch
+        )
+        self.calendar_table.horizontalHeader().setSectionResizeMode(
+            3, QHeaderView.ResizeMode.Stretch
+        )
+        self.calendar_table.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.calendar_table.horizontalHeader().setSectionResizeMode(
+            2, QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.calendar_table.itemDoubleClicked.connect(self.open_calendar_book)
+        right.addWidget(self.calendar_table, stretch=1)
+        controls = QHBoxLayout()
+        controls.addWidget(button("Edit time", self.edit_selected_session))
+        controls.addWidget(button(
+            "Delete time", self.delete_selected_session, danger=True
+        ))
+        controls.addWidget(button("Open book", self.open_calendar_book))
+        right.addLayout(controls)
+        columns.addLayout(right, stretch=2)
+        layout.addLayout(columns, stretch=1)
+        layout.addWidget(label(
+            "Highlighted dates show activity. Clicking a date displays recorded "
+            "progress and time sessions; editing a milestone remains available "
+            "under Reading history.", "muted"
+        ))
+        self.pages.addWidget(page)
+        self._calendar_marked = []
+
+    def refresh_calendar_page(self, *_args):
+        year, month = self.calendar.yearShown(), self.calendar.monthShown()
+        daily = self.library.daily_activity(year=year, month=month)
+        for date in self._calendar_marked:
+            self.calendar.setDateTextFormat(date, QTextCharFormat())
+        self._calendar_marked.clear()
+        for iso, item in daily.items():
+            date = QDate.fromString(iso, "yyyy-MM-dd")
+            if not date.isValid():
+                continue
+            minutes = item["reading_minutes"] + item["listening_minutes"]
+            background = ("#356894" if minutes >= 60 else
+                          "#294f72" if minutes or item["milestones"] >= 2
+                          else "#2c465f")
+            fmt = QTextCharFormat()
+            fmt.setBackground(QColor(background))
+            fmt.setForeground(QColor("#ffffff"))
+            self.calendar.setDateTextFormat(date, fmt)
+            self._calendar_marked.append(date)
+        total_minutes = sum(
+            entry["reading_minutes"] + entry["listening_minutes"]
+            for entry in daily.values()
+        )
+        self.calendar_month_summary.setText(
+            f"{len(daily)} active days  ·  {total_minutes / 60:.1f} hours logged"
+        )
+        self.calendar_streak.setText(
+            f"Current reading streak: {self.library.reading_streak()} days "
+            "(based on logged activity)"
+        )
+        self.refresh_calendar_day()
+
+    def refresh_calendar_day(self, *_args):
+        day = self.calendar.selectedDate().toString("yyyy-MM-dd")
+        daily = self.library.daily_activity(
+            year=self.calendar.selectedDate().year(),
+            month=self.calendar.selectedDate().month()
+        ).get(day, {})
+        sessions = self.library.list_sessions(read_date=day, limit=5000)
+        milestones = self.library.milestones_on(day)
+        minutes = daily.get("reading_minutes", 0)
+        audio = daily.get("listening_minutes", 0)
+        self.calendar_day_summary.setText(
+            f"{day}: {len(sessions)} timed sessions  ·  "
+            f"{minutes} min reading  ·  {audio} min listening  ·  "
+            f"{len(milestones)} progress milestones"
+        )
+        self.calendar_table.setRowCount(0)
+        for session in sessions:
+            row = self.calendar_table.rowCount()
+            self.calendar_table.insertRow(row)
+            values = (
+                "Listening" if session["mode"] == "listening" else "Reading",
+                session["title"], f"{session['minutes']} min", session["note"],
+            )
+            for col, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if col == 0:
+                    item.setData(
+                        Qt.ItemDataRole.UserRole,
+                        ("session", session["id"], session["work_id"]),
+                    )
+                self.calendar_table.setItem(row, col, item)
+            self.calendar_table.setRowHeight(row, 37)
+        for event in milestones:
+            row = self.calendar_table.rowCount()
+            self.calendar_table.insertRow(row)
+            amount = event["new_progress"] - event["old_progress"]
+            values = (
+                "Milestone", event["title"],
+                f"{event['new_progress']} {event['progress_unit']} ({amount:+d})",
+                event["note"],
+            )
+            for col, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if col == 0:
+                    item.setData(
+                        Qt.ItemDataRole.UserRole,
+                        ("milestone", event["id"], event["work_id"]),
+                    )
+                self.calendar_table.setItem(row, col, item)
+            self.calendar_table.setRowHeight(row, 37)
+
+    def selected_calendar_record(self):
+        row = self.calendar_table.currentRow()
+        if row < 0:
+            return None
+        item = self.calendar_table.item(row, 0)
+        return item.data(Qt.ItemDataRole.UserRole) if item else None
+
+    def log_reading_session(self):
+        if not self.library.list_works():
+            QMessageBox.information(
+                self, "Empty library", "Add a book before logging reading time."
+            )
+            return
+        day = (
+            self.calendar.selectedDate().toString("yyyy-MM-dd")
+            if self.pages.currentIndex() == 7 else None
+        )
+        dialog = ReadingSessionDialog(
+            self, self.library, work_id=self.selected_id, day=day
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        try:
+            ident = self.library.add_session(
+                dialog.book.currentData(), **dialog.values()
+            )
+            self.refresh_all(dialog.book.currentData())
+            self.statusBar().showMessage(
+                f"Reading session saved ({ident[:8]}).", 7000
+            )
+        except Exception as exc:
+            fail(self, exc)
+
+    def edit_selected_session(self):
+        record = self.selected_calendar_record()
+        if not record or record[0] != "session":
+            QMessageBox.information(
+                self, "Choose session", "Select a logged Reading or Listening entry."
+            )
+            return
+        current = self.library.get_session(record[1])
+        if current is None:
+            return
+        dialog = ReadingSessionDialog(self, self.library, existing=current)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        try:
+            self.library.update_session(record[1], **dialog.values())
+            self.refresh_all()
+        except Exception as exc:
+            fail(self, exc)
+
+    def delete_selected_session(self):
+        record = self.selected_calendar_record()
+        if not record or record[0] != "session":
+            QMessageBox.information(
+                self, "Choose session", "Select a reading or listening session."
+            )
+            return
+        if QMessageBox.question(
+            self, "Delete time log?",
+            "Remove this timed session? Book progress remains unchanged."
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        self.library.delete_session(record[1])
+        self.refresh_all()
+
+    def open_calendar_book(self, _item=None):
+        record = self.selected_calendar_record()
+        if not record:
+            return
+        self.clear_library_filters()
+        self.navigate(0)
+        self.refresh_library(select_id=record[2])
+
+    def export_time_log(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export reading/listening sessions",
+            "BookTracker-time-log.csv", "CSV files (*.csv)"
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w", newline="", encoding="utf-8-sig") as stream:
+                writer = csv.writer(stream)
+                writer.writerow(
+                    ["Date", "Book", "Author", "Activity", "Minutes", "Note"]
+                )
+                for item in self.library.list_sessions(limit=50000):
+                    # Spreadsheet applications must not interpret untrusted
+                    # book titles/notes as executable formula expressions.
+                    def safe(value):
+                        text = str(value or "")
+                        return (
+                            "'" + text if text.lstrip().startswith(
+                                ("=", "+", "-", "@")
+                            ) else text
+                        )
+                    writer.writerow([
+                        item["read_date"], safe(item["title"]),
+                        safe(item["author"]), item["mode"],
+                        item["minutes"], safe(item["note"]),
+                    ])
+            self.statusBar().showMessage("Exported logged reading time.", 7000)
+        except OSError as exc:
+            fail(self, exc)
+
+    def create_journal_page(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        heading = QHBoxLayout()
+        heading.addWidget(label("Notes & quotes", "headline"), stretch=1)
+        heading.addWidget(button(
+            "+ Add bookmark / quote / note", self.add_annotation, primary=True
+        ))
+        heading.addWidget(button("Export Markdown", self.export_annotations_md))
+        layout.addLayout(heading)
+        layout.addWidget(label(
+            "Keep passages, reactions and reading positions attached to each book. "
+            "Notes remain private in your local library and portable backups.", "muted"
+        ))
+        filters = QHBoxLayout()
+        self.journal_search = QLineEdit()
+        self.journal_search.setPlaceholderText(
+            "Search passages, titles or authors…"
+        )
+        self.journal_search.textChanged.connect(self.refresh_journal_page)
+        filters.addWidget(self.journal_search, stretch=2)
+        self.journal_type = QComboBox()
+        self.journal_type.addItem("All types", None)
+        for kind in ("bookmark", "quote", "note"):
+            self.journal_type.addItem(name(kind), kind)
+        self.journal_type.currentIndexChanged.connect(self.refresh_journal_page)
+        filters.addWidget(self.journal_type)
+        self.journal_work = QComboBox()
+        self.journal_work.addItem("All books", None)
+        self.journal_work.currentIndexChanged.connect(self.refresh_journal_page)
+        filters.addWidget(self.journal_work, stretch=2)
+        layout.addLayout(filters)
+        self.journal_table = QTableWidget(0, 5)
+        self.journal_table.setHorizontalHeaderLabels(
+            ["Type", "Book", "Position", "Excerpt / note", "Updated"]
+        )
+        self.journal_table.setSelectionBehavior(
+            QTableWidget.SelectionBehavior.SelectRows
+        )
+        self.journal_table.setSelectionMode(
+            QTableWidget.SelectionMode.SingleSelection
+        )
+        self.journal_table.setEditTriggers(
+            QTableWidget.EditTrigger.NoEditTriggers
+        )
+        self.journal_table.verticalHeader().setVisible(False)
+        for col in (1, 3):
+            self.journal_table.horizontalHeader().setSectionResizeMode(
+                col, QHeaderView.ResizeMode.Stretch
+            )
+        for col in (0, 2, 4):
+            self.journal_table.horizontalHeader().setSectionResizeMode(
+                col, QHeaderView.ResizeMode.ResizeToContents
+            )
+        self.journal_table.itemSelectionChanged.connect(self.show_annotation_detail)
+        self.journal_table.itemDoubleClicked.connect(
+            lambda _item: self.edit_annotation()
+        )
+        layout.addWidget(self.journal_table, stretch=4)
+        controls = QHBoxLayout()
+        controls.addWidget(button("Edit", self.edit_annotation))
+        controls.addWidget(button("Copy text", self.copy_annotation))
+        controls.addWidget(button("Open book", self.open_annotation_book))
+        controls.addWidget(button(
+            "Delete", self.delete_selected_annotation, danger=True
+        ))
+        self.journal_count = label("", "muted")
+        controls.addWidget(self.journal_count, stretch=1)
+        layout.addLayout(controls)
+        layout.addWidget(label("Selected note / quotation", "subheading"))
+        self.annotation_detail = QTextEdit()
+        self.annotation_detail.setReadOnly(True)
+        self.annotation_detail.setMaximumHeight(125)
+        layout.addWidget(self.annotation_detail, stretch=1)
+        self.pages.addWidget(page)
+
+    def refresh_journal_work_filter(self):
+        current = self.journal_work.currentData()
+        self.journal_work.blockSignals(True)
+        self.journal_work.clear()
+        self.journal_work.addItem("All books", None)
+        for work in self.library.list_works(sort="title"):
+            self.journal_work.addItem(
+                f"{work['title']} — {work['author']}", work["id"]
+            )
+        choice = self.journal_work.findData(current)
+        self.journal_work.setCurrentIndex(max(0, choice))
+        self.journal_work.blockSignals(False)
+
+    def refresh_journal_page(self, *_args):
+        self.refresh_journal_work_filter()
+        entries = self.library.list_annotations(
+            work_id=self.journal_work.currentData(),
+            kind=self.journal_type.currentData(),
+            search=self.journal_search.text(),
+            limit=5000,
+        )
+        selected = self.selected_annotation_id()
+        self.journal_table.blockSignals(True)
+        self.journal_table.setRowCount(len(entries))
+        selected_row = -1
+        for row, item in enumerate(entries):
+            if item["id"] == selected:
+                selected_row = row
+            position = (
+                f"{'Page' if item['location_unit'] == 'pages' else 'Chapter'} "
+                f"{item['location']}"
+                if item["location"] is not None
+                and item["location_unit"] != "percent"
+                else f"{item['location']}%"
+                if item["location"] is not None else "—"
+            )
+            values = (
+                name(item["kind"]), item["title"], position,
+                item["body"].replace("\n", " ")[:150],
+                local_timestamp(item["updated_at"]),
+            )
+            for col, value in enumerate(values):
+                cell = QTableWidgetItem(value)
+                if col == 0:
+                    cell.setData(Qt.ItemDataRole.UserRole, item["id"])
+                self.journal_table.setItem(row, col, cell)
+            self.journal_table.setRowHeight(row, 39)
+        self.journal_table.blockSignals(False)
+        if selected_row >= 0:
+            self.journal_table.selectRow(selected_row)
+        self.journal_count.setText(
+            f"{len(entries)} notes shown"
+            + (" (first 5,000)" if len(entries) == 5000 else "")
+        )
+        self.show_annotation_detail()
+
+    def selected_annotation_id(self):
+        if not hasattr(self, "journal_table"):
+            return None
+        rows = self.journal_table.selectionModel().selectedRows()
+        if not rows:
+            return None
+        item = self.journal_table.item(rows[0].row(), 0)
+        return item.data(Qt.ItemDataRole.UserRole) if item else None
+
+    def show_annotation_detail(self):
+        ident = self.selected_annotation_id()
+        item = self.library.get_annotation(ident) if ident else None
+        self.annotation_detail.setPlainText(item["body"] if item else "")
+
+    def add_annotation(self):
+        if not self.library.list_works():
+            QMessageBox.information(
+                self, "Empty library", "Add a book before saving notes or bookmarks."
+            )
+            return
+        dialog = AnnotationDialog(self, self.library, work_id=self.selected_id)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        try:
+            self.library.add_annotation(dialog.book.currentData(), **dialog.values())
+            self.refresh_all(dialog.book.currentData())
+            self.statusBar().showMessage("Saved note to your library.", 6000)
+        except Exception as exc:
+            fail(self, exc)
+
+    def edit_annotation(self):
+        ident = self.selected_annotation_id()
+        if not ident:
+            QMessageBox.information(
+                self, "Choose note", "Select a saved bookmark, quote or note first."
+            )
+            return
+        item = self.library.get_annotation(ident)
+        if not item:
+            return
+        dialog = AnnotationDialog(self, self.library, existing=item)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        try:
+            self.library.update_annotation(ident, **dialog.values())
+            self.refresh_all()
+        except Exception as exc:
+            fail(self, exc)
+
+    def copy_annotation(self):
+        ident = self.selected_annotation_id()
+        item = self.library.get_annotation(ident) if ident else None
+        if item:
+            QApplication.clipboard().setText(item["body"])
+            self.statusBar().showMessage("Copied note to clipboard.", 5000)
+
+    def delete_selected_annotation(self):
+        ident = self.selected_annotation_id()
+        if not ident:
+            QMessageBox.information(self, "Choose note", "Select a saved note first.")
+            return
+        if QMessageBox.question(
+            self, "Delete saved note?",
+            "Delete this bookmark, quote or note? The book remains untouched."
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        self.library.delete_annotation(ident)
+        self.refresh_all()
+
+    def open_annotation_book(self):
+        ident = self.selected_annotation_id()
+        item = self.library.get_annotation(ident) if ident else None
+        if not item:
+            return
+        self.clear_library_filters()
+        self.navigate(0)
+        self.refresh_library(select_id=item["work_id"])
+
+    def show_work_annotations(self):
+        work = self.selected_work()
+        if not work:
+            return
+        self.journal_search.clear()
+        self.journal_type.setCurrentIndex(0)
+        self.navigate(8)
+        position = self.journal_work.findData(work["id"])
+        if position >= 0:
+            self.journal_work.setCurrentIndex(position)
+        self.refresh_journal_page()
+
+    def export_annotations_md(self):
+        entries = self.library.list_annotations(
+            work_id=self.journal_work.currentData(),
+            kind=self.journal_type.currentData(),
+            search=self.journal_search.text(),
+            limit=50000,
+        )
+        if not entries:
+            QMessageBox.information(self, "No saved notes", "No notes match these filters.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export reading notes",
+            "BookTracker-reading-notes.md", "Markdown (*.md)"
+        )
+        if not path:
+            return
+        try:
+            entries.sort(
+                key=lambda item: (
+                    item["title"].casefold(), item["author"].casefold(),
+                    item["created_at"], item["id"]
+                )
+            )
+            with open(path, "w", encoding="utf-8") as output:
+                output.write("# BookTracker Reading Notes\n\n")
+                last_book = None
+                for item in entries:
+                    if item["work_id"] != last_book:
+                        output.write(
+                            f"\n## {item['title']} — {item['author']}\n\n"
+                        )
+                        last_book = item["work_id"]
+                    where = (
+                        f" · {item['location']}%"
+                        if item["location_unit"] == "percent"
+                        else f" · {'Page' if item['location_unit'] == 'pages' else 'Chapter'} "
+                             f"{item['location']}"
+                    ) if item["location"] is not None else ""
+                    output.write(
+                        f"### {name(item['kind'])}{where}\n\n"
+                        f"{item['body'] or '(bookmark)'}\n\n"
+                    )
+            self.statusBar().showMessage(
+                f"Exported {len(entries)} saved notes.", 7000
+            )
+        except OSError as exc:
+            fail(self, exc)
+
     def create_series_page(self):
         page = QWidget()
         layout = QVBoxLayout(page)
@@ -1847,7 +2619,7 @@ class MainWindow(QMainWindow):
         for event in self.library.recent_activity(15):
             difference = event["new_progress"] - event["old_progress"]
             item = QListWidgetItem(
-                f"{event['recorded_at'][:10]}  ·  {event['title']}  "
+                f"{local_timestamp(event['recorded_at'])[:10]}  ·  {event['title']}  "
                 f"({difference:+d} {event['progress_unit']})"
             )
             item.setData(Qt.ItemDataRole.UserRole, event["work_id"])
@@ -1870,6 +2642,10 @@ class MainWindow(QMainWindow):
         self.refresh_library(select_id=select_id)
         self.refresh_history()
         self.refresh_stats()
+        if self.pages.currentIndex() == 7:
+            self.refresh_calendar_page()
+        if self.pages.currentIndex() == 8:
+            self.refresh_journal_page()
 
     def refresh_library(self, *_args, select_id=None):
         active_view = self.saved_view_combo.currentData()
@@ -2061,6 +2837,18 @@ class MainWindow(QMainWindow):
             self.details.addWidget(label(summary + ("…" if len(book["description"]) > 300 else ""), "muted"))
         self.details.addSpacing(10)
         self.details.addWidget(button("Log progress", self.log_progress, primary=True))
+        self.details.addWidget(button(
+            "Log reading / listening time", self.log_reading_session
+        ))
+        self.details.addWidget(button(
+            "Add bookmark / quote / note", self.add_annotation
+        ))
+        saved = len(self.library.list_annotations(work_id=work_id))
+        if saved:
+            self.details.addWidget(label(f"Saved bookmarks & notes: {saved}", "muted"))
+        self.details.addWidget(button(
+            "View this book's notes", self.show_work_annotations
+        ))
         self.details.addWidget(button("View this book's history", self.show_work_history))
         self.details.addWidget(button("Edit details", self.edit_work))
         if book["kind"] == "book":
@@ -2624,7 +3412,7 @@ class MainWindow(QMainWindow):
         for row, event in enumerate(events):
             delta = event["new_progress"] - event["old_progress"]
             values = (
-                event["recorded_at"][:16].replace("T", " "),
+                local_timestamp(event["recorded_at"]),
                 event["title"],
                 (f"{event['old_progress']} → {event['new_progress']} "
                  f"{event['progress_unit']} ({delta:+d})"),
@@ -2759,7 +3547,13 @@ class MainWindow(QMainWindow):
             widget.setText(f"{stats['by_status']['reading']:,}" if key == "reading"
                            else f"{stats[key]:,}")
         breakdown = "   ·   ".join(f"{name(kind)}: {count}" for kind, count in stats["by_kind"].items())
-        self.stat_breakdown.setText("Library breakdown\n" + breakdown)
+        totals = self.library.session_totals()
+        hours = totals["reading_minutes"] / 60
+        listening = totals["listening_minutes"] / 60
+        self.stat_breakdown.setText(
+            "Library breakdown\n" + breakdown
+            + f"\nLogged time: {hours:.1f} h reading · {listening:.1f} h listening"
+        )
         self.refresh_goal_dashboard()
 
     def export_library(self):
