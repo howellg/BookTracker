@@ -437,8 +437,9 @@ class EpubReader(QDialog):
         self.viewer.setHtml(content["html"])
         self.apply_theme()
         self.counter.setText(
-            f"Spine section {index+1} / {len(self.book)} · {content['title']}"
+            f"Spine section {index+1} / {len(self.book)}"
         )
+        self.counter.setToolTip(content["title"])
         self.message.setText(
             "Reading position saves automatically. EPUB spine sections "
             "may not equal actual chapters or printed pages."
