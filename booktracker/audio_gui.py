@@ -398,6 +398,7 @@ class AudioLibraryPage(QWidget):
         actions=QGridLayout()
         for index,(text,func) in enumerate((
             ("Play in BookTracker",self.play_in_app),
+            ("Queue next",self.queue_selected_next),
             ("Open audio file",self.open_file),
             ("Start listening timer",self.start_listening_timer),
             ("Log listening time",self.log_listening_session),
@@ -406,7 +407,7 @@ class AudioLibraryPage(QWidget):
             ("Local file links",self.manage_files),
             ("Open library book",self.open_book),
         )):
-            actions.addWidget(_button(text,func),index//4,index%4)
+            actions.addWidget(_button(text,func),index//3,index%3)
         layout.addLayout(actions)
         layout.addWidget(_label(
             "Possible part gaps are missing numbers between 1 and the largest "
@@ -639,14 +640,20 @@ class AudioLibraryPage(QWidget):
 
     def play_in_app(self):
         """Open a modeless player so the listening timer stays usable."""
+        item=self.current_file()
+        if not item:
+            self.scan_message.setText("Select an M4B file to play.")
+            return
+        self.launch_audio_file(item)
+
+    def launch_audio_file(self,item):
         if self._player_dialog is not None:
             self._player_dialog.show()
             self._player_dialog.raise_()
             self._player_dialog.activateWindow()
-            return
-        item=self.current_file()
-        if not item:
-            self.scan_message.setText("Select an M4B file to play.")
+            self.scan_message.setText(
+                "Audio player already open. Use Queue next or close it to switch books."
+            )
             return
         if not item["available"]:
             QMessageBox.information(
@@ -657,18 +664,33 @@ class AudioLibraryPage(QWidget):
         try:
             from .audio_player import AudioPlayerDialog
 
-            dialog=AudioPlayerDialog(self,self._files,item)
+            available=self.library.list_audio_files(work_id=item["work_id"])
+            dialog=AudioPlayerDialog(self,available,item)
             self._player_dialog=dialog
             dialog.finished.connect(self.player_closed)
             dialog.show()
+            if self.main is not None and hasattr(self.main,"attach_audio_player"):
+                self.main.attach_audio_player(dialog)
         except (RuntimeError,ValueError,OSError) as exc:
             QMessageBox.warning(
                 self,"Built-in player unavailable",
                 f"{exc}\n\nYou can still open the audio file in your external player."
             )
 
+    def queue_selected_next(self):
+        selected=self.current_file()
+        if selected is None or self._player_dialog is None:
+            self.scan_message.setText("Select an audiobook and open the player first.")
+            return
+        if self._player_dialog.queue_selected_next(selected):
+            self.scan_message.setText("Selected file is next in the play queue.")
+        else:
+            self.scan_message.setText("Queue accepts other parts from the same edition.")
+
     def player_closed(self,*_args):
         self._player_dialog=None
+        if self.main is not None and hasattr(self.main,"detach_audio_player"):
+            self.main.detach_audio_player()
         self.refresh_files()
 
     def start_listening_timer(self):

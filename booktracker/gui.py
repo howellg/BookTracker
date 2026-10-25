@@ -54,6 +54,7 @@ from PySide6.QtWidgets import (
     QTableWidgetItem,
     QTabWidget,
     QTextEdit,
+    QToolBar,
     QVBoxLayout,
     QWidget,
 )
@@ -2368,6 +2369,7 @@ class MainWindow(QMainWindow):
         self.create_habits_page()
         self.audio_page=AudioLibraryPage(self,self.library)
         self.pages.addWidget(self.audio_page)
+        self.create_audio_toolbar()
         self.sync_page=SyncPage(self,self.library)
         self.pages.addWidget(self.sync_page)
         geometry = self.settings.value("window_geometry")
@@ -2386,6 +2388,100 @@ class MainWindow(QMainWindow):
         # Strictly opt-in. Never scrape as an unannounced default behavior.
         if self.settings.value("serial_auto_check", False, type=bool):
             QTimer.singleShot(1800, self.maybe_check_on_launch)
+
+    def create_audio_toolbar(self):
+        """Compact transport on every BookTracker page while an audiobook is open."""
+        self.audio_toolbar=QToolBar("Audiobook playback",self)
+        self.audio_toolbar.setMovable(False)
+        self.audio_toolbar.setObjectName("audioMiniPlayer")
+        self.audio_mini_label=QLabel("No audiobook playing")
+        self.audio_mini_label.setMaximumWidth(330)
+        self.audio_toolbar.addWidget(self.audio_mini_label)
+        for title,callback in (
+            ("◀ Part",lambda:self.audio_transport("previous")),
+            ("−30s",lambda:self.audio_transport("back")),
+            ("Play / Pause",lambda:self.audio_transport("play")),
+            ("+30s",lambda:self.audio_transport("forward")),
+            ("Part ▶",lambda:self.audio_transport("next")),
+            ("Show player",self.show_audio_player),
+            ("Close audio",self.close_audio_player),
+        ):
+            action=self.audio_toolbar.addAction(title)
+            action.triggered.connect(callback)
+        self.addToolBar(Qt.ToolBarArea.BottomToolBarArea,self.audio_toolbar)
+        self.audio_toolbar.hide()
+
+    def audio_transport(self, command):
+        player=self.audio_page._player_dialog
+        if player is None:
+            return
+        if command=="previous":
+            player.change_part(-1)
+        elif command=="next":
+            player.change_part(1)
+        elif command=="back":
+            player.jump(-30000)
+        elif command=="forward":
+            player.jump(30000)
+        elif command=="play":
+            player.toggle_play()
+
+    def show_audio_player(self):
+        player=self.audio_page._player_dialog
+        if player is not None:
+            player.show()
+            player.raise_()
+            player.activateWindow()
+
+    def close_audio_player(self):
+        player=self.audio_page._player_dialog
+        if player is not None:
+            player.close()
+
+    def attach_audio_player(self, dialog):
+        self.audio_toolbar.show()
+        dialog.updated.connect(self.refresh_audio_toolbar)
+        self.refresh_audio_toolbar()
+
+    def detach_audio_player(self):
+        self.audio_toolbar.hide()
+        self.audio_mini_label.setText("No audiobook playing")
+
+    def refresh_audio_toolbar(self):
+        player=self.audio_page._player_dialog
+        if player is not None:
+            from .audio_gui import fmt_duration
+
+            self.audio_mini_label.setText(
+                f"{player.current['work_title']} · "
+                f"{fmt_duration(player.player.position())} / "
+                f"{fmt_duration(player.player.duration())}"
+            )
+            self.audio_mini_label.setToolTip(player.current["filename"])
+
+    def play_audio_for_work(self, work_id):
+        """EPUB reader bridge: choose a local linked M4B, never infer progress."""
+        available=[item for item in self.library.list_audio_files(work_id=work_id)
+                   if item["available"]]
+        if not available:
+            QMessageBox.information(
+                self,"No local audio","No available M4B is linked to this work."
+            )
+            return
+        if len(available)==1:
+            selected=available[0]
+        else:
+            labels=[
+                f"{item['filename']} — {item['narrator'] or 'Unknown narrator'}"
+                for item in available
+            ]
+            label,accepted=QInputDialog.getItem(
+                self,"Choose linked audiobook","Play which M4B?",labels,0,False
+            )
+            if not accepted:
+                return
+            selected=available[labels.index(label)]
+        self.audio_page.launch_audio_file(selected)
 
     def make_menu(self):
         menu = self.menuBar().addMenu("&File")

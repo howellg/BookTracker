@@ -5,15 +5,19 @@ is NOT a verified listening session and never becomes a progress milestone.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 
-from PySide6.QtCore import QSettings, Qt, QTimer, QUrl
+from PySide6.QtCore import QSettings, Qt, QTimer, QUrl, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDialog,
     QHBoxLayout,
     QLabel,
+    QListWidget,
+    QListWidgetItem,
     QPushButton,
     QSlider,
     QVBoxLayout,
@@ -88,6 +92,10 @@ def playlist_for_file(files, selected):
     """Only sequence compatible parts within one work/narrator and edition type."""
     if not selected or not selected.get("available"):
         raise ValueError("Select a locally available audiobook first.")
+    # A full edition or unnumbered standalone file is a single recording,
+    # not one part in a sequence of other editions/standalone exports.
+    if not selected.get("part_number"):
+        return [selected]
     parts = [
         item for item in files
         if item.get("available") and item["work_id"] == selected["work_id"]
@@ -110,11 +118,24 @@ def time_label(position, duration):
 class AudioPlayerDialog(QDialog):
     """Local media playback. Never infer time spent from playback state."""
 
+    updated = Signal()
+
     def __init__(self, parent, files, selected, *, settings=None, player=None, audio_output=None):
         super().__init__(parent)
         self.settings = settings if settings is not None else QSettings("BookTracker", "BookTracker")
         self.resume = AudioResumeStore(self.settings)
-        self.files = playlist_for_file(files, selected)
+        self._all_files = playlist_for_file(files, selected)
+        self.files = list(self._all_files)
+        group = (selected["work_id"], selected["narrator"],
+                 bool(selected["is_complete"]), bool(selected["part_number"]))
+        self._queue_key = ("player_queue/" + hashlib.sha256(
+            json.dumps(group, ensure_ascii=False).encode("utf-8")
+        ).hexdigest())
+        self._restore_queue_order()
+        if not any(item["id"] == selected["id"] for item in self.files):
+            # Launching a previously removed part explicitly requeues it.
+            self.files.insert(0, selected)
+            self._save_queue()
         self._index = next(i for i, item in enumerate(self.files) if item["id"] == selected["id"])
         self._pending_resume = 0
         self._loading = False
@@ -122,6 +143,8 @@ class AudioPlayerDialog(QDialog):
         self._finished_file = False
         self._loaded_chapters = []
         self._advance_scheduled = False
+        self._mpv_engine = None
+        self._supports_pitch_safe_speed = True
         self.setWindowTitle("BookTracker — Audiobook player")
         self.resize(680, 330)
         self.setMinimumWidth(480)
@@ -188,16 +211,44 @@ class AudioPlayerDialog(QDialog):
         options.addWidget(self.chapters, stretch=1)
         options.addWidget(self._button("Load markers", self.load_chapters))
         root.addLayout(options)
+        root.addWidget(QLabel("Play queue (double-click to play a part)"))
+        self.queue_list = QListWidget()
+        self.queue_list.setMaximumHeight(120)
+        self.queue_list.itemDoubleClicked.connect(self.play_queue_item)
+        root.addWidget(self.queue_list)
+        queue_buttons = QHBoxLayout()
+        for text, callback in (
+            ("Move up", lambda: self.move_queue(-1)),
+            ("Move down", lambda: self.move_queue(1)),
+            ("Remove", self.remove_from_queue),
+            ("Restore sequence", self.restore_queue),
+        ):
+            queue_buttons.addWidget(self._button(text, callback))
+        root.addLayout(queue_buttons)
         root.addWidget(self._button("Close player", self.close))
-        if player is None or audio_output is None:
-            try:
+        if player is None and audio_output is None:
+            from .mpv_player import MpvOutput, MpvPlayer, pitch_safe_backend
+
+            if pitch_safe_backend():
+                self.player = MpvPlayer(self)
+                self._mpv_engine = self.player
+                self.output = MpvOutput(self.player)
+                self.status.setText("Pitch-preserving audio engine: mpv")
+            else:
+                # Qt 6.8 QMediaPlayer changes pitch when rate changes. Never
+                # silently use that behavior when no pitch-safe engine exists.
                 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
-            except ImportError as exc:
-                raise RuntimeError("QtMultimedia is unavailable on this system.") from exc
-            self.player = player if player is not None else QMediaPlayer(self)
-            self.output = audio_output if audio_output is not None else QAudioOutput(self)
+
+                self.player = QMediaPlayer(self)
+                self.output = QAudioOutput(self)
+                self._supports_pitch_safe_speed = False
         else:
             self.player, self.output = player, audio_output
+        if not self._supports_pitch_safe_speed:
+            self.speed.setCurrentIndex(self.speed.findData(1.0))
+            self.speed.setEnabled(False)
+            self.speed.setToolTip("Install mpv for pitch-preserving variable speed.")
+            self.settings.setValue("player_speed", 1.0)
         self.player.setAudioOutput(self.output)
         self.output.setVolume(self.volume.value() / 100)
         self.volume.valueChanged.connect(self.change_volume)
@@ -211,12 +262,159 @@ class AudioPlayerDialog(QDialog):
         self._save_timer.timeout.connect(self.save_position)
         self._save_timer.start()
         self.load_part()
+        self.refresh_queue()
 
     @staticmethod
     def _button(title, callback):
         widget = QPushButton(title)
         widget.clicked.connect(callback)
         return widget
+
+    def _restore_queue_order(self):
+        raw = str(self.settings.value(self._queue_key, ""))
+        try:
+            saved = json.loads(raw)
+        except (ValueError, TypeError):
+            return
+        if not isinstance(saved, dict):
+            return
+        identifiers = saved.get("order")
+        known = saved.get("known")
+        if (not isinstance(identifiers, list) or len(identifiers) > 500
+                or not isinstance(known, list) or len(known) > 500):
+            return
+        records = {item["id"]: item for item in self._all_files}
+        arranged = []
+        seen = set()
+        for identifier in identifiers:
+            if not isinstance(identifier, str):
+                continue
+            if identifier in records and identifier not in seen:
+                arranged.append(records[identifier])
+                seen.add(identifier)
+        known_ids = {key for key in known if isinstance(key,str)}
+        # Only append genuinely new files; intentionally removed IDs stay out.
+        self.files = arranged + [item for item in self._all_files
+                                 if item["id"] not in seen and item["id"] not in known_ids]
+        if not self.files:
+            self.files = list(self._all_files)
+
+    def _save_queue(self):
+        self.settings.setValue(self._queue_key, json.dumps({
+            "order": [item["id"] for item in self.files],
+            "known": [item["id"] for item in self._all_files],
+        }))
+
+    def refresh_queue(self):
+        if not hasattr(self, "queue_list"):
+            return
+        prior = self.queue_list.currentRow()
+        self.queue_list.clear()
+        for idx, item in enumerate(self.files):
+            title = item["filename"]
+            text = f"{idx + 1}. {title}"
+            if idx == self._index:
+                text = "▶ " + text
+            widget = QListWidgetItem(text)
+            widget.setData(Qt.ItemDataRole.UserRole, item["id"])
+            self.queue_list.addItem(widget)
+        if 0 <= prior < self.queue_list.count():
+            self.queue_list.setCurrentRow(prior)
+        else:
+            self.queue_list.setCurrentRow(self._index)
+
+    def play_queue_item(self, item):
+        identifier = item.data(Qt.ItemDataRole.UserRole)
+        target = next((i for i, row in enumerate(self.files)
+                       if row["id"] == identifier), None)
+        if target is not None and target != self._index:
+            self.change_part_to(target)
+
+    def change_part_to(self, target):
+        if not 0 <= target < len(self.files) or target == self._index:
+            return
+        from PySide6.QtMultimedia import QMediaPlayer
+
+        was_playing=(
+            self.player.playbackState()==QMediaPlayer.PlaybackState.PlayingState
+        )
+        self.save_position()
+        self._index = target
+        self.load_part()
+        if was_playing:
+            self.player.play()
+
+    def move_queue(self, delta):
+        row = self.queue_list.currentRow()
+        target = row + delta
+        if not 0 <= row < len(self.files) or not 0 <= target < len(self.files):
+            return
+        active_id = self.current["id"]
+        self.files[row], self.files[target] = self.files[target], self.files[row]
+        self._index = next(i for i, item in enumerate(self.files)
+                           if item["id"] == active_id)
+        self._save_queue()
+        self.refresh_queue()
+        self.queue_list.setCurrentRow(target)
+        self.previous.setEnabled(self._index > 0)
+        self.next.setEnabled(self._index < len(self.files) - 1)
+        self.updated.emit()
+
+    def remove_from_queue(self):
+        row = self.queue_list.currentRow()
+        if row < 0 or row >= len(self.files):
+            return
+        if row == self._index:
+            self.status.setText("Cannot remove the currently playing file from its queue.")
+            return
+        self.files.pop(row)
+        if row < self._index:
+            self._index -= 1
+        self._save_queue()
+        self.refresh_queue()
+        self.previous.setEnabled(self._index > 0)
+        self.next.setEnabled(self._index < len(self.files) - 1)
+        self.updated.emit()
+
+    def restore_queue(self):
+        selected_id = self.current["id"]
+        self.files = list(self._all_files)
+        self._index = next(i for i, item in enumerate(self.files)
+                           if item["id"] == selected_id)
+        self._save_queue()
+        self.refresh_queue()
+        self.previous.setEnabled(self._index > 0)
+        self.next.setEnabled(self._index < len(self.files) - 1)
+        self.updated.emit()
+
+    def queue_selected_next(self, selected):
+        """Insert a file from this one narrator and edition, never mix collections."""
+        if not self.current.get("part_number") or not selected.get("part_number"):
+            return False
+        if not selected.get("available"):
+            return False
+        first = self.current
+        if (selected["work_id"] != first["work_id"]
+                or selected["narrator"] != first["narrator"]
+                or bool(selected["is_complete"]) != bool(first["is_complete"])
+                or bool(selected["part_number"]) != bool(first["part_number"])):
+            return False
+        identifier = selected["id"]
+        if identifier == self.current["id"]:
+            return False
+        index = next((i for i, row in enumerate(self.files)
+                      if row["id"] == identifier), None)
+        if index is not None:
+            self.files.pop(index)
+            if index < self._index:
+                self._index -= 1
+        if len(self.files) >= 500:
+            return False
+        self.files.insert(self._index + 1, selected)
+        self._save_queue()
+        self.refresh_queue()
+        self.status.setText("Added to play next (this device only).")
+        return True
 
     @property
     def current(self):
@@ -247,14 +445,11 @@ class AudioPlayerDialog(QDialog):
         self.player.setSource(QUrl.fromLocalFile(item["path"]))
         self.change_speed()
         self._loading = False
+        self.refresh_queue()
+        self.updated.emit()
 
     def change_part(self, offset):
-        target = self._index + offset
-        if not 0 <= target < len(self.files):
-            return
-        self.save_position()
-        self._index = target
-        self.load_part()
+        self.change_part_to(self._index + offset)
 
     def toggle_play(self):
         from PySide6.QtMultimedia import QMediaPlayer
@@ -273,6 +468,7 @@ class AudioPlayerDialog(QDialog):
         self.play_button.setText(
             "Pause" if state == QMediaPlayer.PlaybackState.PlayingState else "Play"
         )
+        self.updated.emit()
 
     def update_duration(self, duration):
         if self._closed or self._loading:
@@ -290,6 +486,7 @@ class AudioPlayerDialog(QDialog):
         if not self.seek.isSliderDown():
             self.seek.setValue(max(0, int(position)))
         self.clock.setText(time_label(position, self.player.duration()))
+        self.updated.emit()
 
     def restart_part(self):
         self._finished_file = False
@@ -312,7 +509,7 @@ class AudioPlayerDialog(QDialog):
         self.save_position()
 
     def change_speed(self, *_args):
-        value = float(self.speed.currentData())
+        value = float(self.speed.currentData()) if self._supports_pitch_safe_speed else 1.0
         self.player.setPlaybackRate(value)
         self.settings.setValue("player_speed", value)
 
@@ -401,4 +598,6 @@ class AudioPlayerDialog(QDialog):
         self._closed = True
         self.player.stop()
         self.player.setSource(QUrl())
+        if self._mpv_engine is not None:
+            self._mpv_engine.shutdown()
         super().closeEvent(event)

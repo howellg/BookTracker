@@ -191,6 +191,13 @@ class EpubReader(QDialog):
         mark_actions=QHBoxLayout()
         mark_actions.addWidget(_action_button("Rename",self.rename_bookmark))
         mark_actions.addWidget(_action_button("Remove",self.remove_bookmark))
+        self.listen_button=_action_button("♫ Listen",self.listen_to_work)
+        self.listen_button.setToolTip("Play the linked audiobook for this work")
+        self.listen_button.setEnabled(
+            parent is not None and hasattr(parent,"play_audio_for_work")
+            and any(item["available"] for item in library.list_audio_files(work_id=self.work["id"]))
+        )
+        mark_actions.addWidget(self.listen_button)
         saved_layout.addLayout(mark_actions)
         saved_layout.addWidget(QLabel("Notes and quotes for this work"))
         self.note_filter=QLineEdit()
@@ -638,6 +645,11 @@ class EpubReader(QDialog):
             return
         self.library.remove_epub_bookmark(row["id"])
         self.refresh_bookmarks()
+
+    def listen_to_work(self):
+        owner=self.parent()
+        if owner is not None and hasattr(owner,"play_audio_for_work"):
+            owner.play_audio_for_work(self.work["id"])
 
     def save_note(self):
         selected=self.viewer.textCursor().selectedText().replace("\u2029","\n").strip()
