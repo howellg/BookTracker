@@ -51,6 +51,56 @@ Built with Python, PySide6, and SQLite. No account, cloud subscription, or alway
 - All data is saved locally in an SQLite database; portable JSON/XML import uses stable UUIDs for merge.
 - Use **Device sync** to exchange portable snapshots via a dedicated shared folder with per-field conflict review and recovery backups.
 
+## New in v0.21.0 — Audiobook chapter browser, queue editor and long-book timeline
+
+### Chapter navigation without losing your place
+
+In the built-in player, choose the **Chapters** tab and press **Load markers**.
+BookTracker checks the M4B's embedded chapter markers on a worker thread so
+the playback window stays responsive while large audio files are scanned.
+A searchable list of up to 5,000 validated markers shows titles and timestamps.
+Double-click a chapter to jump, or use **Previous chapter**,
+**Current chapter**, and **Next chapter** to navigate. The current chapter
+is marked during playback. Chapter markers always refer to the currently
+loaded M4B part, **not** to EPUB chapters or reading milestones.
+
+### Drag-and-drop queue management
+
+The **Play queue** tab has a filter for parts and filenames. Drag items
+to reorder them, or select an entry and choose **▲ / ▼**, **Play next**,
+or **To end**. **Remove** keeps the part off the current queue;
+**Undo** restores the last removed entry, and **Restore** rebuilds the original
+available-part order. Dragging is disabled while filtering to prevent
+hidden-item confusion. Queue order continues to persist locally between
+sessions and is scoped to one book, narrator, and edition.
+
+### Whole-playlist playback timeline
+
+For long multi-part audiobooks, the player shows **total media duration,
+elapsed media time, time remaining, and active part number**, calculated
+across the currently queued M4Bs. The new **Go to playlist time** field
+accepts a cumulative `HH:MM:SS` timestamp (for example, `85:30:00`)
+and jumps to the appropriate recording and position, even when that
+recording is not the current one.
+
+Book-wide seeking is **disabled if any queued part lacks a valid duration**.
+Imported media durations are used for other parts, and the current part's
+actual player duration overrides its catalog value. This is a *media position*,
+not a claim about hours actually listened to or reading progress.
+
+The pitch-preserving mpv speed control, sleep timer, EPUB/audio bookmarks,
+device-local resumes, and explicit/manual listening logs are unchanged.
+No SQLite migration, sync format change, or edits to AudiobookAI Studio.
+
+To update:
+
+```bash
+cd ~/BookTracker
+git pull --ff-only
+uv sync
+uv run python -m booktracker
+```
+
 ## New in v0.20.0 — Listening comfort, audio shortcuts and EPUB links
 
 ### Convenient long-form audiobook listening
