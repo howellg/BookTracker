@@ -68,12 +68,12 @@ def export_portable(library: Library, path: str | Path):
         staging.unlink(missing_ok=True)
 
 
-def import_portable(library: Library, path: str | Path, *, strategy="merge") -> int:
+def import_portable(library: Library, path: str | Path, *, strategy="merge", postmerge=None, sync_mode=False) -> int:
     """Restore a portable backup, validating every embedded cover before use."""
     try:
         with zipfile.ZipFile(path) as z:
             entries = z.namelist()
-            if len(entries) > MAX_COVER_COUNT + 1:
+            if len(entries) > MAX_COVER_COUNT + 2:
                 raise ValueError("Portable backup contains too many entries.")
             if "library.json" not in entries:
                 raise ValueError("Portable backup has no library.json.")
@@ -117,4 +117,4 @@ def import_portable(library: Library, path: str | Path, *, strategy="merge") -> 
 
     # SQLite merges and replacements stay atomic. On invalid library metadata
     # only unreferenced, validated image files may be left behind.
-    return library.import_data(data, strategy=strategy)
+    return library.import_data(data, strategy=strategy, postmerge=postmerge, sync_mode=sync_mode)

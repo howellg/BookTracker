@@ -48,6 +48,92 @@ Built with Python, PySide6, and SQLite. No account, cloud subscription, or alway
 - Review library statistics, recent progress history, reading goals, time spent and series progress.
 - Manage crosspost URLs, editions, followed stories, observed releases, and safe manual/opt-in chapter checks without altering work-level reading history.
 - All data is saved locally in an SQLite database; portable JSON/XML import uses stable UUIDs for merge.
+- Use **Device sync** to exchange portable snapshots via a dedicated shared folder with per-field conflict review and recovery backups.
+
+## New in v0.14.0
+
+**Device sync (shared-folder edition)** lets multiple computers exchange
+BookTracker records without sharing live SQLite databases. Synchronization
+is intentionally opt-in, review-driven, and local-first.
+
+### Setup with Syncthing, a network drive, or a removable disk
+
+1. Update all computers to v0.14.0 and make a portable .btbackup first.
+2. Create a **dedicated shared folder**, such as ~/Sync/BookTracker.
+   Synchronize that folder with Syncthing; **never** synchronize the
+   BookTracker live library.sqlite3, -wal or -shm files.
+3. On computer A open **Device sync** (near the top of the sidebar, or
+   Ctrl+Alt+S). Give this computer a name, choose the dedicated shared
+   folder, and select **Publish my changes**.
+4. On computer B, choose its local copy of the same shared folder and
+   **Publish my changes**. Wait for your folder-syncing tool to transfer
+   both snapshots.
+5. Click **Find peers** on each machine, then **Review selected peer**.
+   The app displays new records, unambiguous field edits and differences.
+   Competing field edits default to **Keep local**. Check **Use peer** to
+   accept an incoming field value. Confirm **Apply reviewed changes**.
+6. Publish again after merging so the other computer can receive your
+   latest edits. Repeat on other computers as needed.
+
+**Publish + find peers** combines the two discovery actions, but never
+imports a remote revision without review.
+
+### What synchronizes
+
+- New books, authors, series, tags, historical progress events, rereads,
+  reading and listening sessions, notes/quotes, shelves, reading goals,
+  saved views, source links, editions and serialized release observations.
+- Audiobook file metadata and file-link *hints*, not the audio contents.
+  Local EPUB covers travel inside portable archives with integrity checks.
+- Edits to supported existing book fields, sessions, annotations, goals
+  and reading events use three-way comparisons against the last successfully
+  imported peer snapshot. Unambiguous changes apply automatically, and
+  conflicts are presented for explicit resolution. Imported milestone
+  events are reconciled chronologically without duplicate event IDs.
+- A local SQLite backup is made **before every approved peer import**.
+  Review operations reject an archive changed during review or a local
+  library changed after the preview began.
+
+### Safety boundaries and known limitations
+
+- **Deletions never propagate automatically.** If a book is deleted on
+  one computer, it stays deleted there and a previously seen copy from
+  another computer cannot silently recreate it. Other computers do not
+  delete it automatically: remove it separately where desired.
+- Changes to existing editions, sources, reading-run properties and file
+  associations may require a manual edit on another device. The review
+  identifies these differences instead of silently overwriting local data.
+- This is **manual snapshot synchronization**, not a continuously running
+  cloud daemon. BookTracker makes no direct network connections for sync.
+  Syncthing (or your other folder transport) handles file distribution.
+- Sync snapshots contain titles, personal notes, reading history and
+  other library information **in plain text**. They are **not encrypted**
+  by BookTracker. Use a trusted, access-controlled shared folder.
+- No full M4B, EPUB, PDF or other source media is transferred, and
+  machine-specific absolute file paths never leave a device.
+- A separate per-computer UUID identifies each device; only the newest
+  three locally published revisions are retained. Files are written
+  through atomic rename and damaged/partial transfers are ignored.
+  When using Syncthing you can ignore .bt-sync-* hidden temporary export
+  directories to avoid transferring intermediate snapshots.
+- If you cloned an entire BookTracker SQLite database between computers
+  (rather than importing a .btbackup), use **Device sync → New device ID**
+  on the clone to avoid duplicated computer identities. This resets
+  revision tracking only; books and reading history remain unchanged.
+- Normal portable JSON/XML/.btbackup exports omit sync identity and peer
+  baselines, so restoring a portable backup creates a fresh sync identity.
+
+### Database and compatibility
+
+- SQLite **schema v10** adds two sync-only tables: sync_device and
+  sync_peers. Existing works, reading history and local audio metadata
+  remain intact.
+- Before migration, BookTracker stores a WAL-consistent snapshot under
+  backups/BookTracker-before-v014-*.sqlite3.
+- JSON, XML and portable .btbackup now export schema v10 and still import
+  older v1–v9 backups.
+- Upgrade: close BookTracker, export a .btbackup, run git pull and uv sync,
+  then launch with uv run python -m booktracker.
 
 ## New in v0.13.0
 
@@ -475,8 +561,8 @@ For existing Goodreads history, use **File → Import Goodreads CSV**. It import
 | Format | Works & history | Audio metadata, follows, queue, journal | Local EPUB covers |
 |---|---|---|---|
 | **.btbackup** portable bundle | Yes | Yes (including time, notes and saved views) | **Yes** |
-| JSON (schema v9) | Yes | Yes (including time, notes and saved views) | No |
-| XML (schema v9) | Yes | Yes (including time, notes and saved views) | No |
+| JSON (schema v10) | Yes | Yes (including time, notes and saved views) | No |
+| XML (schema v10) | Yes | Yes (including time, notes and saved views) | No |
 | CSV catalog | Works/metadata only | No | No |
 | Goodreads CSV (import) | Imported work fields | No | No |
 
@@ -510,6 +596,8 @@ Project layout:
 
 - booktracker/database.py — reading runs, queue, listening sessions, source follows/releases, audio metadata, habits, local files, calendar statistics, and versioned merges
 - booktracker/audiobooks.py — read-only AudiobookAI Studio ledger, bounded M4B scanning and FFprobe metadata parsing
+- booktracker/sync.py — portable shared-folder snapshots, peer baselines and conservative three-way reconciliation
+- booktracker/sync_gui.py — peer discovery and explicit field-conflict review
 - booktracker/audio_gui.py — audiobook catalogue, matching preview, M4B discovery worker and chapter viewer
 - booktracker/backups.py — daily SQLite snapshots and retention
 - booktracker/integrations.py — Open Library/story metadata, Goodreads CSV, JSON/XML/CSV

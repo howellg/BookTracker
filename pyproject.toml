@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "booktracker"
-version = "0.13.0"
+version = "0.14.0"
 description = "Local-first reading history tracker for books, fanfiction and serialized web novels"
 readme = "README.md"
 requires-python = ">=3.10"

@@ -74,6 +74,7 @@ from .integrations import (
     source_from_url,
 )
 from .metadata import missing_book_metadata
+from .sync_gui import SyncPage
 
 LABELS = {
     "book": "Book", "fanfiction": "Fanfiction", "web_novel": "Web novel", "other": "Other",
@@ -2307,7 +2308,7 @@ class MainWindow(QMainWindow):
         nav_layout.setSpacing(6)
         self.nav_buttons = []
         for title, index in (("▤   Library", 0), ("◷   Reading history", 1),
-                             ("▥   Dashboard", 2), ("▦   Series", 3),
+                             ("▥   Dashboard", 2), ("⇄   Device sync", 13), ("▦   Series", 3),
                              ("♧   Authors", 4), ("▤   Insights", 5),
                              ("◇   Library health", 6),
                              ("▦   Reading calendar", 7),
@@ -2347,6 +2348,8 @@ class MainWindow(QMainWindow):
         self.create_habits_page()
         self.audio_page=AudioLibraryPage(self,self.library)
         self.pages.addWidget(self.audio_page)
+        self.sync_page=SyncPage(self,self.library)
+        self.pages.addWidget(self.sync_page)
         geometry = self.settings.value("window_geometry")
         if geometry:
             self.restoreGeometry(geometry)
@@ -2390,6 +2393,7 @@ class MainWindow(QMainWindow):
             ("Reading queue", lambda: self.navigate(10), "Ctrl+Shift+Q"),
             ("Reading habits", lambda: self.navigate(11), "Ctrl+Alt+H"),
             ("Audiobooks", lambda: self.navigate(12), "Ctrl+Alt+B"),
+            ("Device sync", lambda: self.navigate(13), "Ctrl+Alt+S"),
             ("Import AudiobookAI completed parts",
              lambda: self.audio_page.import_studio(), ""),
             ("Scan audiobook folder",
@@ -2437,6 +2441,8 @@ class MainWindow(QMainWindow):
             self.refresh_habits_page()
         elif index == 12:
             self.audio_page.refresh()
+        elif index == 13:
+            pass  # Discovery only when requested by the user.
 
     def focus_library_search(self):
         self.navigate(0)
