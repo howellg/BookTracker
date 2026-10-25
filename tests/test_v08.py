@@ -261,7 +261,7 @@ def test_gui_calendar_and_annotations_screen(app, lib):
     lib.record_progress_on(key, 100, date="2025-04-01")
     window = MainWindow(lib)
     try:
-        assert len(window.nav_buttons) == 10
+        assert len(window.nav_buttons) == 11
         window.navigate(7)
         window.calendar.setSelectedDate(QDate(2025, 4, 1))
         assert window.calendar_table.rowCount() == 2
@@ -477,7 +477,7 @@ def test_upgrade_from_v4_database_preserves_books_and_saved_views(tmp_path):
 
     reopened = Library(path)
     try:
-        assert reopened.db.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert reopened.db.execute("PRAGMA user_version").fetchone()[0] == 7
         assert reopened.get_work(key)["notes"] == "Do not lose this."
         assert reopened.list_views()[0]["id"] == view
         reopened.add_session(
