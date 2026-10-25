@@ -51,6 +51,57 @@ Built with Python, PySide6, and SQLite. No account, cloud subscription, or alway
 - All data is saved locally in an SQLite database; portable JSON/XML import uses stable UUIDs for merge.
 - Use **Device sync** to exchange portable snapshots via a dedicated shared folder with per-field conflict review and recovery backups.
 
+## New in v0.18.0 — Local audiobook player and listening workflows
+
+Open **Audiobooks**, select a locally available M4B, and click
+**Play in BookTracker** to play it in a separate BookTracker window.
+You can continue using the library and its listening timer while sound plays.
+The existing **Open audio file** option still sends the file to your
+usual external player.
+
+### Built-in M4B player
+
+- Play/pause, seek bar, skip back/forward 30 seconds, and adjust volume and
+  playback speed (0.75×–2.5×).
+- Navigate between numbered M4B parts without mixing narrators, books,
+  complete editions or unrelated standalone files. Missing parts are not
+  silently treated as available.
+- Enable **Automatically play next part** if desired; disabled by default.
+  Turn it off to stop at the end of each part.
+- Click **Load markers** to inspect embedded chapter timestamps on demand
+  and seek directly to a chosen marker. Audio markers need not correspond to
+  the work's actual chapters or to source EPUB sections.
+- Close and reopen the built-in player to resume at the last saved file
+  location. The Audiobooks file list includes **Resume (this device)**.
+  **Restart this part** clears its local resume record.
+- Playback positions, volume, speed and auto-next preferences are stored in
+  per-device Qt settings; they do not enter your library database, sync
+  snapshots or portable backups. A replaced or changed file does not reuse
+  its old location.
+
+### Separate, deliberately logged listening sessions
+
+- **Start listening timer** opens the existing foreground stopwatch,
+  preselecting the audiobook and Listening activity. Press Start, then
+  explicitly save a full-minute session.
+- **Log listening time** opens the existing dated-session form, preselecting
+  the current work and Listening. Enter the actual minutes and optional
+  notes; the saved session appears in Reading calendar, history and Insights.
+- Starting, pausing or seeking media does **not** automatically create reading
+  or listening records, mark a work started/completed, or estimate progress.
+  BookTracker cannot verify that sound actually played or was heard.
+
+The built-in player uses QtMultimedia and the system's available audio/codec
+backend; some codecs or unusual M4Bs may not decode on every computer.
+If playback fails, use **Open audio file** with your external player instead.
+AudiobookAI Studio remains a separate application: no TTS generation, queue
+editing, transcoding, or source-file mutation takes place.
+
+No database migration and no portable backup-format changes are required for
+v0.18.0. To update, close BookTracker, run `git pull --ff-only && uv sync`
+from your BookTracker directory, then launch with
+`uv run python -m booktracker`.
+
 ## New in v0.17.0 — Reading comfort and annotations
 
 The integrated EPUB reader now offers a more comfortable layout and direct
