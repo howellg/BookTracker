@@ -396,7 +396,7 @@ def test_gui_dashboard_series_filters_and_goal_saving(tmp_path):
     })
     window = MainWindow(db)
     try:
-        assert len(window.nav_buttons) == 4
+        assert len(window.nav_buttons) == 5
         assert window.series_filter.count() == 2
         assert window.tag_filter.count() == 2
         window.navigate(3)
