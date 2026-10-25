@@ -8,6 +8,8 @@ Built with Python, PySide6, and SQLite. No account, cloud subscription, or alway
 
 - Manage regular books, fanfiction, web novels and custom works in one library.
 - Record **reading progress** in chapters, pages, or percent, with dated milestones and optional notes.
+- Independently log **time spent reading or listening to audiobooks**, using explicit dates and durations. Time records do not invent chapter/page progress.
+- Save **bookmarks, quotations, and reading notes** associated with books and optional chapter/page positions.
 - Distinguish **caught up with an ongoing story** from **completed the work**.
 - Track **rereads** as independent reading runs without losing previous history.
 - Search titles, authors, fandoms, series, ISBNs, descriptions, personal notes and tags. Filter by type, status, shelves, exact author/series/tag, favorites and metadata completeness.
@@ -28,12 +30,46 @@ Built with Python, PySide6, and SQLite. No account, cloud subscription, or alway
 - **Import local EPUB metadata** offline, individually or in bulk, including embedded covers, authors, series, ISBNs, language, description, and tags where available. Recognize supported fanfiction source links embedded in EPUB metadata.
 - Search and filter your reading-event history by book, author, note and year. Edit milestones and backdate progress without corrupting the most recent reading position. Export the filtered history as CSV.
 - Save and restore **named library views** with complex filters and sorting rules. These travel in JSON/XML/.btbackup exports.
-- Explore **Insights** by month, including dated chapter/page progress, active reading days and completions, and export a monthly CSV.
+- Explore **Insights** by month, including dated chapter/page progress, active reading days, reading/listening time and completions, and export a monthly CSV.
 - Use **Library health** to inspect potential duplicates, missing metadata, unknown dates and serial backlogs without automatic deletions.
 - Manage global tags: rename/merge tag names or remove a tag across the library, keeping the books intact.
 - Quick-update serialized chapter counts, increment progress by one or five chapters, and mark a story caught up to its known published chapter count.
-- Review library statistics, recent progress history, reading goals and series progress.
+- Explore the **Reading calendar**, marked dates, streaks, individual activities and time sessions. Export time logs as CSV.
+- Search the **Notes & quotes** journal, copy selections to the clipboard and export selected annotations to Markdown.
+- Review library statistics, recent progress history, reading goals, time spent and series progress.
 - All data is saved locally in an SQLite database; portable JSON/XML import uses stable UUIDs for merge.
+
+## New in v0.8.0
+
+BookTracker v0.8 adds an optional **personal reading journal** without disturbing the existing books, history, shelves or progress model.
+
+### Reading calendar
+
+- **Reading calendar page:** A month-view calendar highlights dates with real recorded progress milestones or manual reading/listening sessions. Select any day to inspect its activity and jump to the relevant book.
+- **Reading streak:** Displays the count of consecutive days with logged activity, including today or yesterday when today has not yet been logged. Missed or unknown days are not inferred to be active.
+- **Timed reading sessions:** Choose a book, date, time in minutes and **Reading** or **Listening** (audiobooks). Add notes, then edit or remove the session if needed. Sessions are optional and do **not** update chapter/page progress automatically.
+- **Manual backdating:** Record a historical session from any date in the supported range. A session on a historical date stays on that date.
+- **Export a time log CSV:** Download a structured list of your logged sessions with date, book, author, activity, duration and note. Text fields are protected against spreadsheet formula interpretation.
+- **Insights integration:** Monthly statistics now include time spent reading and listening, along with active days that come from either timed sessions or progress milestones. Reading time is never guessed from page/chapter counts.
+- **Local timezone accuracy:** Offset-aware automatic timestamps are displayed and grouped by the computer's local date (including activity recorded near midnight). Explicit YYYY-MM-DD historical dates remain untouched.
+
+### Notes, quotes and bookmarks
+
+- **Notes & quotes page:** Save personal notes, passages and bookmarks for books, fanfiction or web novels.
+- **Precise locations:** Optionally attach chapter, page or percent positions to an annotation.
+- **Find and filter:** Search note text, title or author; filter by annotation type or book.
+- **Edit and organize:** Correct notes, quotes and positions later, copy text to the clipboard, jump to the associated work, or delete a mistaken annotation. Removing an annotation never deletes its book.
+- **Book-level shortcuts:** The selected book's detail panel links directly to timed reading logs and its personal notes.
+- **Markdown export:** Export annotations for the currently filtered selection as a readable Markdown document grouped by book.
+
+### Backups and compatibility
+
+- **Portable schema v5:** .btbackup, JSON and XML exports now preserve timed sessions, bookmarks, quotations and personal notes in addition to all prior fields and shelves. .btbackup continues to carry locally imported EPUB covers.
+- **Previous backups are still supported:** BookTracker can import version 1–4 JSON/XML/portable backups. Versions before v5 simply have no time sessions or annotations.
+- **Idempotent merge:** Imported sessions and annotations retain their UUIDs. Reimporting the same backup won't duplicate them, and a normal merge will not overwrite edits on your local copy.
+- **Non-destructive SQLite migration:** Existing databases are upgraded automatically by adding reading_sessions and annotations tables and indexes. The existing works and progress tables are left intact.
+
+Before upgrading, export a .btbackup file and keep it somewhere safe. Close BookTracker and run git pull, uv sync, then uv run python -m booktracker.
 
 ## New in v0.7.0
 
@@ -158,23 +194,25 @@ The database is stored in your OS's user-data directory (platformdirs), not insi
 10. Set annual reading goals and double-click current reads on the **Dashboard**. Browse series from **Series** or writers from **Authors**.
 11. For ongoing stories, update their chapter totals and use the +1, +5 or Catch up to published buttons in the book details.
 12. To reuse library searches and filters, click **Save current filters**. Explore **Insights** and **Library health** for more management tools.
+13. Use **Reading calendar → Log reading / listening** to record real reading time. Marked days contribute to the streak counter.
+14. Use **Notes & quotes** or the selected book's **Add bookmark / quote / note** action to store passages or reading reactions.
 11. To record something you read last year, choose **Log progress**, check **Set a specific reading date**, then select the historical date. To correct an older log, use **Reading history → Edit selected**.
 
 For existing Goodreads history, use **File → Import Goodreads CSV**. It imports Goodreads shelves and ratings; it does not create a detailed historical progress log that Goodreads never exported.
 
 ## Backup and portability
 
-| Format | Works & history | Shelves & goals | Local EPUB covers |
+| Format | Works & history | Shelves, goals & personal journal | Local EPUB covers |
 |---|---|---|---|
-| **.btbackup** portable bundle | Yes | Yes, plus saved views | **Yes** |
-| JSON (schema v4) | Yes | Yes, plus saved views | No |
-| XML (schema v4) | Yes | Yes, plus saved views | No |
+| **.btbackup** portable bundle | Yes | Yes (including time, notes and saved views) | **Yes** |
+| JSON (schema v5) | Yes | Yes (including time, notes and saved views) | No |
+| XML (schema v5) | Yes | Yes (including time, notes and saved views) | No |
 | CSV catalog | Works/metadata only | No | No |
 | Goodreads CSV (import) | Imported work fields | No | No |
 
 **Prefer .btbackup for moving to another computer.** It is a ZIP bundle containing versioned JSON and your locally imported EPUB cover images. All referenced embedded images are verified with SHA-256 checksums on import; invalid images are rejected. Files inside the archive are never extracted to arbitrary paths.
 
-JSON/XML remain useful for structured-data interchange and preserve reading runs, progress history, shelves and yearly goals, but do **not** carry local EPUB images. The default import mode merges reading data and preserves newer local personal fields; Replace fully overwrites your library and automatically creates a pre-import database snapshot first.
+JSON/XML remain useful for structured-data interchange and preserve reading runs, progress history, shelves, yearly goals and the personal journal, but do **not** carry local EPUB images. The default import mode merges reading data and preserves newer local personal fields; Replace fully overwrites your library and automatically creates a pre-import database snapshot first.
 
 Automatic SQLite snapshots are kept beside your database in the backups folder (14 daily snapshots retained). **The SQLite snapshot itself does not include the separate imported_covers directory**. For a portable, complete transfer of locally imported covers, use a .btbackup file.
 
@@ -200,7 +238,7 @@ To run a minimal GUI smoke test without a display on CI, set QT_QPA_PLATFORM=off
 
 Project layout:
 
-- booktracker/database.py — reading runs, shelves, bulk editing, corrections and versioned merges
+- booktracker/database.py — reading runs, timed sessions, annotations, calendar/streak statistics, shelves, and versioned merges
 - booktracker/backups.py — daily SQLite snapshots and retention
 - booktracker/integrations.py — Open Library/story metadata, Goodreads CSV, JSON/XML/CSV
 - booktracker/epub_import.py — offline EPUB metadata and embedded cover parsing
@@ -213,7 +251,7 @@ Project layout:
 
 ## Roadmap
 
-Automatic site-specific word/chapter adapters, additional visualization and reading calendar tools, easier bulk URL importing, multi-source/edition grouping, a browser helper for fanfiction, AudiobookAI integration, optional multi-device synchronization, and installable desktop binaries.
+Automatic site-specific word/chapter adapters, optional timed-session stopwatch and additional visualizations, easier bulk URL importing, multi-source/edition grouping, a browser helper for fanfiction, AudiobookAI integration, optional multi-device synchronization, and installable desktop binaries.
 
 ## License
 

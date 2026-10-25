@@ -145,8 +145,32 @@ class Library:
             filters_json TEXT NOT NULL,
             created_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS reading_sessions (
+            id TEXT PRIMARY KEY,
+            work_id TEXT NOT NULL REFERENCES works(id) ON DELETE CASCADE,
+            read_date TEXT NOT NULL,
+            minutes INTEGER NOT NULL CHECK(minutes BETWEEN 1 AND 1440),
+            mode TEXT NOT NULL CHECK(mode IN ('reading', 'listening')),
+            note TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_sessions_date ON reading_sessions(read_date);
+        CREATE INDEX IF NOT EXISTS idx_sessions_work ON reading_sessions(work_id,read_date);
+        CREATE TABLE IF NOT EXISTS annotations (
+            id TEXT PRIMARY KEY,
+            work_id TEXT NOT NULL REFERENCES works(id) ON DELETE CASCADE,
+            kind TEXT NOT NULL CHECK(kind IN ('bookmark','quote','note')),
+            location INTEGER,
+            location_unit TEXT NOT NULL DEFAULT '',
+            body TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            CHECK(location IS NULL OR location BETWEEN 0 AND 10000000)
+        );
+        CREATE INDEX IF NOT EXISTS idx_annotations_work ON annotations(work_id,created_at);
         """)
-        self.db.execute("PRAGMA user_version=4")
+        self.db.execute("PRAGMA user_version=5")
         self.db.commit()
 
     @staticmethod
@@ -544,7 +568,7 @@ class Library:
             )
 
     def history_filtered(self, *, search="", year=None, work_id=None, limit=2000):
-        """Search notes, titles and author with optional date-year filter."""
+        """Search milestones by book, author, note and machine-local activity year."""
         sql = """SELECT e.*, w.title,w.author,w.progress_unit FROM progress_events e
             JOIN works w ON w.id=e.work_id WHERE 1=1"""
         args = []
@@ -552,7 +576,10 @@ class Library:
             sql += " AND e.work_id=?"
             args.append(work_id)
         if search.strip():
-            escaped = search.strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            escaped = (
+                search.strip().replace("\\", "\\\\")
+                .replace("%", "\\%").replace("_", "\\_")
+            )
             sql += (" AND (w.title LIKE ? ESCAPE '\\' OR w.author LIKE ? ESCAPE '\\'"
                     " OR e.note LIKE ? ESCAPE '\\')")
             args.extend(["%" + escaped + "%"] * 3)
@@ -560,18 +587,28 @@ class Library:
             year = int(year)
             if not 1900 <= year <= 2200:
                 raise ValueError("History year is outside the supported range.")
-            sql += " AND SUBSTR(e.recorded_at,1,4)=?"
-            args.append(str(year))
-        sql += " ORDER BY e.recorded_at DESC,e.rowid DESC LIMIT ?"
-        args.append(max(1, min(10000, int(limit))))
-        return [dict(r) for r in self.db.execute(sql, args)]
+        sql += " ORDER BY e.recorded_at DESC,e.rowid DESC"
+        count = max(1, min(10000, int(limit)))
+        if year is None:
+            sql += " LIMIT ?"
+            args.append(count)
+        entries = []
+        for row in self.db.execute(sql, args):
+            if year is not None:
+                day = self.activity_day(row["recorded_at"])
+                if not day or int(day[:4]) != year:
+                    continue
+            entries.append(dict(row))
+            if len(entries) >= count:
+                break
+        return entries
 
     def history_years(self):
-        return [int(row["year"]) for row in self.db.execute(
-            """SELECT DISTINCT SUBSTR(recorded_at,1,4) AS year
-            FROM progress_events WHERE LENGTH(recorded_at)>=4
-            ORDER BY year DESC"""
-        ) if row["year"].isdigit()]
+        return sorted({
+            int(day[:4]) for row in self.db.execute(
+                "SELECT recorded_at FROM progress_events"
+            ) if (day := self.activity_day(row["recorded_at"]))
+        }, reverse=True)
 
     def history(self, work_id=None, limit=500):
         if work_id:
@@ -936,31 +973,28 @@ class Library:
         }
 
     def goal_progress(self, year: int):
-        """Count recorded activity only; unknown historical dates are excluded."""
+        """Only dated activity, interpreted on the machine-local calendar day."""
         year = int(year)
+        if not 1900 <= year <= 2200:
+            raise ValueError("Choose a valid reading-goal year.")
         label = str(year)
-        books = self.db.execute(
-            """SELECT COUNT(*) FROM works w
-            WHERE (w.finished_at != '' AND SUBSTR(w.finished_at,1,4)=?)
-            OR EXISTS (
-                SELECT 1 FROM reading_runs r
-                WHERE r.work_id=w.id AND r.finished_at != ''
-                AND SUBSTR(r.finished_at,1,4)=?
-            )""", (label, label),
-        ).fetchone()[0]
-        totals = self.db.execute(
-            """SELECT w.progress_unit AS unit,
-                SUM(CASE WHEN e.new_progress > e.old_progress
-                    THEN e.new_progress - e.old_progress ELSE 0 END) AS amount
-            FROM progress_events e JOIN works w ON w.id=e.work_id
-            WHERE SUBSTR(e.recorded_at,1,4)=?
-            GROUP BY w.progress_unit""", (label,)
-        )
-        amounts = {r["unit"]: r["amount"] or 0 for r in totals}
+        work_ids = set()
+        for row in self.db.execute("SELECT id,finished_at FROM works"):
+            if self.activity_day(row["finished_at"]) and (
+                self.activity_day(row["finished_at"])[:4] == label
+            ):
+                work_ids.add(row["id"])
+        for row in self.db.execute(
+            "SELECT work_id,finished_at FROM reading_runs WHERE finished_at!=''"
+        ):
+            finished = self.activity_day(row["finished_at"])
+            if finished and finished[:4] == label:
+                work_ids.add(row["work_id"])
+        daily = self.daily_activity(year=year)
         return {
-            "year": year, "books": books,
-            "chapters": amounts.get("chapters", 0),
-            "pages": amounts.get("pages", 0),
+            "year": year, "books": len(work_ids),
+            "chapters": sum(day["chapters"] for day in daily.values()),
+            "pages": sum(day["pages"] for day in daily.values()),
         }
 
     def recent_activity(self, limit=10):
@@ -1167,61 +1201,346 @@ class Library:
             raise ValueError("Choose a valid statistics year.")
         months = [
             {"month": n, "chapters": 0, "pages": 0, "reading_days": 0,
-             "events": 0, "completed": 0}
+             "events": 0, "completed": 0, "reading_minutes": 0,
+             "listening_minutes": 0, "sessions": 0}
             for n in range(1, 13)
         ]
-        readings = [set() for _ in range(12)]
-        events = self.db.execute(
-            """SELECT e.recorded_at,e.old_progress,e.new_progress,w.progress_unit
-               FROM progress_events e JOIN works w ON w.id=e.work_id
-               WHERE SUBSTR(e.recorded_at,1,4)=? ORDER BY e.recorded_at""",
-            (str(year),)
-        )
-        for event in events:
-            date = event["recorded_at"][:10]
-            if len(date) != 10:
-                continue
-            try:
-                index = datetime.fromisoformat(date).month - 1
-            except ValueError:
-                continue
-            bucket = months[index]
-            amount = max(0, event["new_progress"] - event["old_progress"])
-            if event["progress_unit"] in ("pages", "chapters"):
-                bucket[event["progress_unit"]] += amount
-            bucket["events"] += 1
-            readings[index].add(date)
-        for index, dates in enumerate(readings):
-            months[index]["reading_days"] = len(dates)
+        for iso_day, activity in self.daily_activity(year=year).items():
+            month = int(iso_day[5:7]) - 1
+            row = months[month]
+            row["reading_days"] += 1
+            row["chapters"] += activity["chapters"]
+            row["pages"] += activity["pages"]
+            row["events"] += activity["milestones"]
+            row["sessions"] += activity["sessions"]
+            row["reading_minutes"] += activity["reading_minutes"]
+            row["listening_minutes"] += activity["listening_minutes"]
         # A distinct work counts once per month for each known completion date.
         for work in self.list_works():
-            dates = {run["finished_at"][:10] for run in self.runs(work["id"])
-                     if run["finished_at"]}
+            dates = {self.activity_day(run["finished_at"])
+                     for run in self.runs(work["id"]) if run["finished_at"]}
             if work["status"] == "completed" and work["finished_at"]:
-                dates.add(work["finished_at"][:10])
+                dates.add(self.activity_day(work["finished_at"]))
             for finished in dates:
-                if finished[:4] != str(year):
-                    continue
-                try:
-                    month = datetime.fromisoformat(finished).month - 1
-                    months[month]["completed"] += 1
-                except ValueError:
-                    continue
+                if finished and finished[:4] == str(year):
+                    months[int(finished[5:7]) - 1]["completed"] += 1
         return months
 
+    # Private reading/listening sessions are independent of chapter/page milestones.
+    # Duration never estimates progress, and milestones never estimate reading time.
+    @staticmethod
+    def _day(value):
+        from datetime import date as local_date
+
+        if isinstance(value, datetime):
+            value = value.date()
+        if isinstance(value, local_date):
+            value = value.isoformat()
+        value = str(value or "").strip()
+        try:
+            parsed = local_date.fromisoformat(value)
+        except ValueError as exc:
+            raise ValueError("Use a valid date formatted YYYY-MM-DD.") from exc
+        if not 1900 <= parsed.year <= 2200:
+            raise ValueError("Date must be between 1900 and 2200.")
+        return parsed.isoformat()
+
+    @staticmethod
+    def _session_values(read_date, minutes, mode, note):
+        day = Library._day(read_date)
+        try:
+            number = int(minutes)
+            if str(minutes).strip() != str(number):
+                raise ValueError()
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Reading duration must be a whole number of minutes.") from exc
+        if not 1 <= number <= 1440:
+            raise ValueError("Session duration must be between 1 and 1440 minutes.")
+        if mode not in ("reading", "listening"):
+            raise ValueError("Choose Reading or Listening.")
+        comment = str(note or "").strip()
+        if len(comment) > 10000:
+            raise ValueError("Session notes must be under 10,000 characters.")
+        return day, number, mode, comment
+
+    def add_session(self, work_id, *, read_date, minutes, mode="reading", note=""):
+        if not self.get_work(work_id):
+            raise ValueError("Choose a book that exists in the library.")
+        day, minutes, mode, note = self._session_values(read_date, minutes, mode, note)
+        session_id = new_id()
+        stamp = now()
+        with self.transaction():
+            self.db.execute(
+                """INSERT INTO reading_sessions
+                (id,work_id,read_date,minutes,mode,note,created_at,updated_at)
+                VALUES (?,?,?,?,?,?,?,?)""",
+                (session_id, work_id, day, minutes, mode, note, stamp, stamp),
+            )
+        return session_id
+
+    def get_session(self, session_id):
+        row = self.db.execute(
+            """SELECT s.*,w.title,w.author FROM reading_sessions s
+            JOIN works w ON w.id=s.work_id WHERE s.id=?""", (session_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def list_sessions(self, *, work_id=None, read_date=None, mode=None, limit=1000):
+        sql = """SELECT s.*,w.title,w.author FROM reading_sessions s
+                 JOIN works w ON w.id=s.work_id WHERE 1=1"""
+        args = []
+        if work_id is not None:
+            sql += " AND s.work_id=?"
+            args.append(work_id)
+        if read_date is not None:
+            sql += " AND s.read_date=?"
+            args.append(self._day(read_date))
+        if mode is not None:
+            if mode not in ("reading", "listening"):
+                raise ValueError("Unknown reading session mode.")
+            sql += " AND s.mode=?"
+            args.append(mode)
+        sql += " ORDER BY s.read_date DESC,s.created_at DESC,s.id DESC LIMIT ?"
+        args.append(max(1, min(50000, int(limit))))
+        return [dict(row) for row in self.db.execute(sql, args)]
+
+    def update_session(self, session_id, *, read_date, minutes, mode="reading", note=""):
+        values = self._session_values(read_date, minutes, mode, note)
+        with self.transaction():
+            cursor = self.db.execute(
+                """UPDATE reading_sessions SET read_date=?,minutes=?,mode=?,
+                note=?,updated_at=? WHERE id=?""",
+                (*values, now(), session_id),
+            )
+            if cursor.rowcount == 0:
+                raise ValueError("Reading session does not exist.")
+
+    def delete_session(self, session_id):
+        with self.transaction():
+            self.db.execute("DELETE FROM reading_sessions WHERE id=?", (session_id,))
+
+    @staticmethod
+    def _annotation_values(kind, body, location, location_unit):
+        if kind not in ("bookmark", "quote", "note"):
+            raise ValueError("Annotation must be a bookmark, quote or note.")
+        body = str(body or "").strip()
+        if kind in ("quote", "note") and not body:
+            raise ValueError("Quotes and notes need text.")
+        if len(body) > 20000:
+            raise ValueError("Annotations must be under 20,000 characters.")
+        if location in ("", None):
+            location = None
+        else:
+            try:
+                number = int(location)
+                if str(number) != str(location).strip():
+                    raise ValueError()
+                location = number
+            except (TypeError, ValueError) as exc:
+                raise ValueError("Location must be a whole-number chapter or page.") from exc
+            if not 0 <= location <= 10000000:
+                raise ValueError("Location is outside the supported range.")
+        if location_unit not in ("", *UNITS):
+            raise ValueError("Unknown bookmark location unit.")
+        if location is None:
+            location_unit = ""
+        elif not location_unit:
+            location_unit = "chapters"
+        return kind, location, location_unit, body
+
+    def add_annotation(self, work_id, *, kind, body="", location=None,
+                       location_unit=""):
+        if not self.get_work(work_id):
+            raise ValueError("Annotation must refer to an existing book.")
+        values = self._annotation_values(kind, body, location, location_unit)
+        ident = new_id()
+        stamp = now()
+        with self.transaction():
+            self.db.execute(
+                """INSERT INTO annotations
+                (id,work_id,kind,location,location_unit,body,created_at,updated_at)
+                VALUES (?,?,?,?,?,?,?,?)""",
+                (ident, work_id, *values, stamp, stamp),
+            )
+        return ident
+
+    def get_annotation(self, annotation_id):
+        row = self.db.execute(
+            """SELECT a.*,w.title,w.author FROM annotations a
+            JOIN works w ON w.id=a.work_id WHERE a.id=?""", (annotation_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def list_annotations(self, *, work_id=None, kind=None, search="", limit=5000):
+        sql = """SELECT a.*,w.title,w.author FROM annotations a
+                 JOIN works w ON w.id=a.work_id WHERE 1=1"""
+        args = []
+        if work_id is not None:
+            sql += " AND a.work_id=?"
+            args.append(work_id)
+        if kind is not None:
+            if kind not in ("bookmark", "quote", "note"):
+                raise ValueError("Invalid annotation type.")
+            sql += " AND a.kind=?"
+            args.append(kind)
+        if search.strip():
+            escaped = (
+                search.strip().replace("\\", "\\\\")
+                .replace("%", "\\%").replace("_", "\\_")
+            )
+            sql += (" AND (a.body LIKE ? ESCAPE '\\' OR w.title LIKE ? ESCAPE '\\'"
+                    " OR w.author LIKE ? ESCAPE '\\')")
+            args.extend([f"%{escaped}%"] * 3)
+        sql += " ORDER BY a.updated_at DESC,a.id DESC LIMIT ?"
+        args.append(max(1, min(50000, int(limit))))
+        return [dict(row) for row in self.db.execute(sql, args)]
+
+    def update_annotation(self, annotation_id, *, kind, body="", location=None,
+                          location_unit=""):
+        fields = self._annotation_values(kind, body, location, location_unit)
+        with self.transaction():
+            cursor = self.db.execute(
+                """UPDATE annotations SET kind=?,location=?,location_unit=?,
+                body=?,updated_at=? WHERE id=?""",
+                (*fields, now(), annotation_id),
+            )
+            if cursor.rowcount == 0:
+                raise ValueError("Annotation does not exist.")
+
+    def delete_annotation(self, annotation_id):
+        with self.transaction():
+            self.db.execute("DELETE FROM annotations WHERE id=?", (annotation_id,))
+
+    @staticmethod
+    def activity_day(timestamp):
+        """Convert offset-aware event timestamps to machine-local calendar dates.
+
+        Naive timestamps and YYYY-MM-DD historical dates retain the entered day.
+        """
+        try:
+            parsed = datetime.fromisoformat(str(timestamp).strip().replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is not None:
+            parsed = parsed.astimezone()
+        if not 1900 <= parsed.year <= 2200:
+            return None
+        return parsed.date().isoformat()
+
+    def milestones_on(self, read_date):
+        from datetime import timedelta
+
+        day = self._day(read_date)
+        parsed = date_class.fromisoformat(day)
+        nearby = [
+            (parsed + timedelta(days=i)).isoformat()
+            for i in (-1, 0, 1)
+        ]
+        return [
+            dict(row) for row in self.db.execute(
+                """SELECT e.*,w.title,w.author,w.progress_unit
+                   FROM progress_events e JOIN works w ON w.id=e.work_id
+                   WHERE SUBSTR(e.recorded_at,1,10) IN (?,?,?)
+                   ORDER BY e.recorded_at DESC,e.rowid DESC""",
+                nearby,
+            )
+            if self.activity_day(row["recorded_at"]) == day
+        ]
+
+    def daily_activity(self, *, year=None, month=None):
+        """Activity derived solely from dated events and explicitly logged sessions.
+
+        Entries are keyed by ISO local calendar date. A progress milestone counts
+        as one activity event, a session counts once, and reading days use their
+        union. Session minutes are never inferred from milestones.
+        """
+        if year is not None and not 1900 <= int(year) <= 2200:
+            raise ValueError("Year outside supported range.")
+        if month is not None and (year is None or not 1 <= int(month) <= 12):
+            raise ValueError("Month requires a year and must be 1–12.")
+        prefix = (
+            f"{int(year):04d}-{int(month):02d}" if month is not None
+            else f"{int(year):04d}" if year is not None else None
+        )
+        result = {}
+
+        def day_bucket(day):
+            return result.setdefault(day, {
+                "date": day, "milestones": 0, "sessions": 0,
+                "reading_minutes": 0, "listening_minutes": 0,
+                "chapters": 0, "pages": 0,
+            })
+        statement = """SELECT e.recorded_at,e.old_progress,e.new_progress,
+            w.progress_unit AS unit FROM progress_events e
+            JOIN works w ON w.id=e.work_id"""
+        for row in self.db.execute(statement):
+            day = self.activity_day(row["recorded_at"])
+            if not day or (prefix and not day.startswith(prefix)):
+                continue
+            item = day_bucket(day)
+            item["milestones"] += 1
+            if row["unit"] in ("chapters", "pages"):
+                item[row["unit"]] += max(
+                    0, row["new_progress"] - row["old_progress"]
+                )
+        sessions = """SELECT read_date,mode,SUM(minutes) AS duration,
+                  COUNT(*) AS total FROM reading_sessions WHERE 1=1"""
+        args = []
+        if prefix:
+            sessions += " AND SUBSTR(read_date,1,?)=?"
+            args.extend((len(prefix), prefix))
+        sessions += " GROUP BY read_date,mode"
+        for row in self.db.execute(sessions, args):
+            item = day_bucket(row["read_date"])
+            item["sessions"] += row["total"]
+            item["reading_minutes" if row["mode"] == "reading"
+                 else "listening_minutes"] += row["duration"]
+        return dict(sorted(result.items()))
+
+    def reading_streak(self, *, today=None):
+        from datetime import date as local_date
+        from datetime import timedelta
+
+        today = local_date.fromisoformat(self._day(today or local_date.today()))
+        active_days = set(self.daily_activity())
+        current = today if today.isoformat() in active_days else today - timedelta(days=1)
+        streak = 0
+        while current.isoformat() in active_days:
+            streak += 1
+            current -= timedelta(days=1)
+        return streak
+
+    def session_totals(self, *, year=None):
+        sql = """SELECT mode,COALESCE(SUM(minutes),0) AS minutes,COUNT(*) AS sessions
+                FROM reading_sessions WHERE 1=1"""
+        args = []
+        if year is not None:
+            if not 1900 <= int(year) <= 2200:
+                raise ValueError("Year outside supported range.")
+            sql += " AND SUBSTR(read_date,1,4)=?"
+            args.append(str(int(year)))
+        sql += " GROUP BY mode"
+        result = {"reading_minutes": 0, "listening_minutes": 0, "sessions": 0}
+        for item in self.db.execute(sql, args):
+            result[item["mode"] + "_minutes"] = item["minutes"]
+            result["sessions"] += item["sessions"]
+        return result
+
     def export_data(self):
-        return {"format": "booktracker", "schema_version": 4, "exported_at": now(),
+        return {"format": "booktracker", "schema_version": 5, "exported_at": now(),
                 "works": [dict(row) for row in self.db.execute("SELECT * FROM works")],
                 "reading_runs": [dict(row) for row in self.db.execute("SELECT * FROM reading_runs")],
                 "progress_events": [dict(row) for row in self.db.execute("SELECT * FROM progress_events")],
                 "shelves": [dict(row) for row in self.db.execute("SELECT * FROM shelves")],
                 "work_shelves": [dict(row) for row in self.db.execute("SELECT * FROM work_shelves")],
                 "reading_goals": [dict(row) for row in self.db.execute("SELECT * FROM reading_goals")],
-                "saved_views": [dict(row) for row in self.db.execute("SELECT * FROM saved_views")]}
+                "saved_views": [dict(row) for row in self.db.execute("SELECT * FROM saved_views")],
+                "reading_sessions": [dict(row) for row in self.db.execute("SELECT * FROM reading_sessions")],
+                "annotations": [dict(row) for row in self.db.execute("SELECT * FROM annotations")]}
 
     def import_data(self, data, *, strategy="merge"):
         """Transactional import; duplicate event IDs are skipped when merging."""
-        if data.get("format") != "booktracker" or data.get("schema_version") not in (1, 2, 3, 4):
+        if data.get("format") != "booktracker" or data.get("schema_version") not in (1, 2, 3, 4, 5):
             raise ValueError("Unsupported BookTracker backup format or schema version.")
         if data["schema_version"] >= 2 and (
             not isinstance(data.get("shelves"), list)
@@ -1232,6 +1551,11 @@ class Library:
             raise ValueError("Backup is missing reading goals.")
         if data["schema_version"] >= 4 and not isinstance(data.get("saved_views"), list):
             raise ValueError("Backup is missing saved library views.")
+        if data["schema_version"] >= 5 and (
+            not isinstance(data.get("reading_sessions"), list)
+            or not isinstance(data.get("annotations"), list)
+        ):
+            raise ValueError("Backup is missing sessions or annotations.")
         for key in ("works", "reading_runs", "progress_events"):
             if not isinstance(data.get(key), list):
                 raise ValueError(f"Backup is missing {key}.")
@@ -1357,5 +1681,41 @@ class Library:
                     "INSERT OR IGNORE INTO saved_views VALUES(?,?,?,?)",
                     (view_id, name, json.dumps(filters, ensure_ascii=False),
                      item.get("created_at") or now()),
+                )
+            for session in data.get("reading_sessions", []):
+                if not isinstance(session, dict) or not session.get("id"):
+                    raise ValueError("Malformed reading session.")
+                work_id = mapping.get(session.get("work_id"))
+                if not work_id:
+                    raise ValueError("Orphaned reading session.")
+                day, minutes, mode, comment = self._session_values(
+                    session.get("read_date"), session.get("minutes"),
+                    session.get("mode"), session.get("note", ""),
+                )
+                self.db.execute(
+                    """INSERT OR IGNORE INTO reading_sessions
+                    (id,work_id,read_date,minutes,mode,note,created_at,updated_at)
+                    VALUES (?,?,?,?,?,?,?,?)""",
+                    (session["id"], work_id, day, minutes, mode, comment,
+                     session.get("created_at") or now(),
+                     session.get("updated_at") or now()),
+                )
+            for item in data.get("annotations", []):
+                if not isinstance(item, dict) or not item.get("id"):
+                    raise ValueError("Malformed book annotation.")
+                work_id = mapping.get(item.get("work_id"))
+                if not work_id:
+                    raise ValueError("Orphaned book annotation.")
+                fields = self._annotation_values(
+                    item.get("kind"), item.get("body", ""),
+                    item.get("location"), item.get("location_unit", ""),
+                )
+                self.db.execute(
+                    """INSERT OR IGNORE INTO annotations
+                    (id,work_id,kind,location,location_unit,body,created_at,updated_at)
+                    VALUES (?,?,?,?,?,?,?,?)""",
+                    (item["id"], work_id, *fields,
+                     item.get("created_at") or now(),
+                     item.get("updated_at") or now()),
                 )
         return count
