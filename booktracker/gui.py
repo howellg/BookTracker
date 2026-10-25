@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import sys
 import webbrowser
+from datetime import datetime
+from pathlib import Path
 
-from PySide6.QtCore import QSize, Qt, QThread, QUrl, Signal
+from PySide6.QtCore import QSettings, QSize, Qt, QThread, QUrl, Signal
 from PySide6.QtGui import QAction, QColor, QFont, QIcon, QPainter, QPalette, QPixmap
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
 from PySide6.QtWidgets import (
@@ -28,6 +30,7 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QScrollArea,
     QSpinBox,
@@ -45,6 +48,7 @@ from .backups import automatic_backup
 from .book_search import _normalize, cached_book_search
 from .covers import CoverCache, cover_url_for
 from .database import KINDS, PUBLICATION, STATUSES, UNITS, Library
+from .epub_import import read_epub_metadata
 from .integrations import (
     export_file,
     fetch_saved_page_metadata,
@@ -93,6 +97,9 @@ QPushButton:disabled { color: #8290a4; background: #222b37; }
 QPushButton#primary { background: #3274c2; border: 1px solid #3274c2; color: #ffffff; }
 QPushButton#primary:hover { background: #468adb; }
 QPushButton#danger { background: #613540; border: 1px solid #85505a; }
+QProgressBar { background: #202c3c; color: #e7eef9; text-align: center;
+  border: 1px solid #34445a; border-radius: 6px; min-height: 18px; }
+QProgressBar::chunk { background: #3274c2; border-radius: 5px; }
 QPushButton#nav { border: none; text-align: left; background: transparent; padding: 12px; }
 QPushButton#nav:checked { background: #294665; color: #baddff; }
 QTableWidget { gridline-color: transparent; background: #192231; padding: 0px; border: none; }
@@ -217,7 +224,10 @@ class WorkEditor(QDialog):
         self.kind = self.combo(KINDS, self.work.get("kind", "book"))
         self.status = self.combo(STATUSES, self.work.get("status", "plan_to_read"))
         self.publication = self.combo(PUBLICATION, self.work.get("publication_status", "unknown"))
-        self.unit = self.combo(UNITS, self.work.get("progress_unit", "chapters"))
+        self.unit = self.combo(UNITS, self.work.get(
+            "progress_unit", "pages" if not work else "chapters"
+        ))
+        self.kind.currentIndexChanged.connect(self.work_type_changed)
         self.total = QSpinBox()
         self.total.setRange(0, 10_000_000)
         self.total.setValue(self.work.get("total_units", 0))
@@ -254,6 +264,8 @@ class WorkEditor(QDialog):
         lookups.addWidget(self.saved_button)
         lookups.addWidget(self.search_button)
         form.addRow("Auto-fill", lookups)
+        self.epub_button = button("Read metadata from EPUB…", self.import_epub)
+        form.addRow("Offline file", self.epub_button)
         for heading, control in (
             ("Title", self.title),
             ("Author", self.author),
@@ -745,13 +757,16 @@ class WorkEditor(QDialog):
 
     def fill_metadata(self, info):
         for attr, key in ((self.title, "title"), (self.author, "author"),
-                          (self.fandom, "fandom"), (self.source_site, "source_site"),
+                          (self.fandom, "fandom"), (self.series, "series"),
+                          (self.source_site, "source_site"),
                           (self.source_url, "source_url"), (self.isbn, "isbn"),
                           (self.published, "published_at"), (self.language, "language")):
             if info.get(key):
                 attr.setText(str(info[key]))
-        self.source_id = info.get("source_id", "")
-        self.cover_url = info.get("cover_url", "")
+        if info.get("source_id"):
+            self.source_id = info["source_id"]
+        if info.get("cover_url"):
+            self.cover_url = info["cover_url"]
         if info.get("description"):
             self.description.setPlainText(info["description"])
         if info.get("tags"):
@@ -803,6 +818,33 @@ class WorkEditor(QDialog):
             self.feedback.setText(str(exc))
             return
         self.run_lookup(fetch_url_metadata, url, self.fill_metadata)
+
+    def work_type_changed(self, _index):
+        if self.work:
+            return
+        requested = "pages" if self.kind.currentData() == "book" else "chapters"
+        selected = self.unit.findData(requested)
+        if selected >= 0:
+            self.unit.setCurrentIndex(selected)
+
+    def import_epub(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Choose an EPUB", "", "EPUB ebooks (*.epub)"
+        )
+        if not path:
+            return
+        try:
+            parent = self.parent()
+            folder = (parent.library.path.parent / "imported_covers"
+                      if parent and hasattr(parent, "library") else None)
+            info = read_epub_metadata(path, cover_dir=folder)
+            self.fill_metadata(info)
+            self.tabs.setCurrentIndex(2)
+            self.feedback.setText(
+                "EPUB metadata loaded locally. Review the fields, then save."
+            )
+        except (OSError, ValueError) as exc:
+            self.feedback.setText(f"EPUB import failed: {exc}")
 
     def import_saved_page(self):
         url = self.source_url.text().strip()
@@ -874,11 +916,14 @@ class MainWindow(QMainWindow):
         self.library = library
         self.selected_id = None
         self.covers = CoverCache(self)
+        self.covers.local_covers = library.path.parent / "imported_covers"
         self.covers.cover_ready.connect(self.cover_available)
         self.current_cover_label = None
         self.current_cover_url = ""
         self.gallery_books = []
         self.metadata_worker = None
+        self.epub_worker = None
+        self.settings = QSettings("BookTracker", "BookTracker")
         self.setWindowTitle("BookTracker — Your reading, remembered")
         self.resize(1360, 840)
         self.setMinimumSize(900, 620)
@@ -899,13 +944,14 @@ class MainWindow(QMainWindow):
         sidebar.addSpacing(24)
         self.nav_buttons = []
         for title, index in (("▤   Library", 0), ("◷   Reading history", 1),
-                             ("▥   Statistics", 2)):
+                             ("▥   Dashboard", 2), ("▦   Series", 3)):
             nav = button(title, lambda _, i=index: self.navigate(i))
             nav.setObjectName("nav")
             nav.setCheckable(True)
             sidebar.addWidget(nav)
             self.nav_buttons.append(nav)
         sidebar.addStretch()
+        sidebar.addWidget(button("Import EPUB files", self.import_epub_files))
         sidebar.addWidget(button("Import library", self.import_library))
         sidebar.addWidget(button("Export library", self.export_library))
         sidebar.addWidget(button("Back up database", self.manual_backup))
@@ -917,6 +963,12 @@ class MainWindow(QMainWindow):
         self.create_library_page()
         self.create_history_page()
         self.create_stats_page()
+        self.create_series_page()
+        geometry = self.settings.value("window_geometry")
+        if geometry:
+            self.restoreGeometry(geometry)
+        if self.settings.value("library_view", "list") == "gallery":
+            self.view_selector.setCurrentIndex(1)
         self.navigate(0)
         self.refresh_all()
         self.statusBar().showMessage(f"Local database: {self.library.path}")
@@ -928,12 +980,18 @@ class MainWindow(QMainWindow):
 
     def make_menu(self):
         menu = self.menuBar().addMenu("&File")
-        for title, callback in (("Add work", self.add_work),
-                                ("Import Goodreads CSV", self.import_goodreads_csv),
-                                ("Import BookTracker file", self.import_library),
-                                ("Export BookTracker file", self.export_library)):
+        for title, callback, shortcut in (
+            ("Add work", self.add_work, "Ctrl+N"),
+            ("Import EPUB files", self.import_epub_files, "Ctrl+Shift+E"),
+            ("Import Goodreads CSV", self.import_goodreads_csv, ""),
+            ("Import BookTracker file", self.import_library, ""),
+            ("Export BookTracker file", self.export_library, "Ctrl+Shift+S"),
+            ("Back up database", self.manual_backup, "Ctrl+B"),
+        ):
             action = QAction(title, self)
             action.triggered.connect(callback)
+            if shortcut:
+                action.setShortcut(shortcut)
             menu.addAction(action)
         menu.addSeparator()
         quit_action = QAction("Quit", self)
@@ -948,6 +1006,8 @@ class MainWindow(QMainWindow):
             self.refresh_history()
         elif index == 2:
             self.refresh_stats()
+        elif index == 3:
+            self.refresh_series_page()
 
     def create_library_page(self):
         page = QWidget()
@@ -983,15 +1043,27 @@ class MainWindow(QMainWindow):
         self.shelf_filter = QComboBox()
         self.shelf_filter.addItem("All shelves", None)
         self.shelf_filter.currentIndexChanged.connect(self.refresh_library)
+        self.series_filter = QComboBox()
+        self.series_filter.addItem("All series", None)
+        self.series_filter.currentIndexChanged.connect(self.refresh_library)
+        self.tag_filter = QComboBox()
+        self.tag_filter.addItem("All tags", None)
+        self.tag_filter.currentIndexChanged.connect(self.refresh_library)
         self.only_fav = QCheckBox("★ Favorites")
         self.only_fav.toggled.connect(self.refresh_library)
         filters.addWidget(self.search, stretch=3)
         filters.addWidget(self.filter_status, stretch=1)
         filters.addWidget(self.filter_kind, stretch=1)
         filters.addWidget(self.sort, stretch=1)
-        filters.addWidget(self.shelf_filter)
         filters.addWidget(self.only_fav)
         layout.addLayout(filters)
+        secondary_filters = QHBoxLayout()
+        secondary_filters.addWidget(label("Collections:", "muted"))
+        secondary_filters.addWidget(self.shelf_filter, stretch=1)
+        secondary_filters.addWidget(self.series_filter, stretch=1)
+        secondary_filters.addWidget(self.tag_filter, stretch=1)
+        secondary_filters.addWidget(button("Clear filters", self.clear_library_filters))
+        layout.addLayout(secondary_filters)
         commands = QHBoxLayout()
         self.view_selector = QComboBox()
         self.view_selector.addItem("Detailed list", "list")
@@ -1002,6 +1074,7 @@ class MainWindow(QMainWindow):
         commands.addWidget(button("Bulk edit", self.bulk_edit_selected))
         commands.addWidget(button("Add to shelf", self.add_selected_to_shelf))
         commands.addWidget(button("New shelf", self.create_shelf))
+        commands.addWidget(button("Manage shelves", self.manage_shelves))
         commands.addStretch()
         layout.addLayout(commands)
         layout.addSpacing(10)
@@ -1086,11 +1159,28 @@ class MainWindow(QMainWindow):
 
     def create_stats_page(self):
         page = QWidget()
-        layout = QVBoxLayout(page)
-        layout.addWidget(label("Reading statistics", "headline"))
-        layout.addWidget(label("A snapshot of your reading history.", "muted"))
+        outer = QVBoxLayout(page)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setStyleSheet("QScrollArea { background: #10151f; border: none; }")
+        content = QWidget()
+        content.setObjectName("dashboardContent")
+        content.setStyleSheet("QWidget#dashboardContent { background: #10151f; }")
+        for surface in (scroll.viewport(), content):
+            palette = surface.palette()
+            palette.setColor(QPalette.ColorRole.Window, QColor("#10151f"))
+            surface.setPalette(palette)
+            surface.setAutoFillBackground(True)
+        layout = QVBoxLayout(content)
+        layout.setSpacing(15)
+        layout.addWidget(label("Reading dashboard", "headline"))
+        layout.addWidget(label(
+            "Recorded milestones, your current reads and goals — without guessing historical dates.",
+            "muted"
+        ))
         grid = QGridLayout()
-        grid.setSpacing(14)
+        grid.setSpacing(10)
         self.stat_labels = {}
         for i, (key, title) in enumerate((
             ("works", "Works in library"), ("completed_works", "Completed works"),
@@ -1099,21 +1189,185 @@ class MainWindow(QMainWindow):
             frame = QFrame()
             frame.setObjectName("statCard")
             inner = QVBoxLayout(frame)
-            inner.setContentsMargins(22, 22, 22, 22)
+            inner.setContentsMargins(18, 12, 18, 12)
             inner.addWidget(label(title, "muted"))
             value = label("0", "value")
             inner.addWidget(value)
             self.stat_labels[key] = value
             grid.addWidget(frame, i // 3, i % 3)
         layout.addLayout(grid)
-        layout.addSpacing(30)
-        self.stat_breakdown = label("", "subheading")
+        self.stat_breakdown = label("", "muted")
         layout.addWidget(self.stat_breakdown)
+
+        head = QHBoxLayout()
+        head.addWidget(label("Reading goals", "subheading"))
+        head.addWidget(label("Year:", "muted"))
+        self.goal_year = QSpinBox()
+        self.goal_year.setRange(1900, 2200)
+        self.goal_year.setValue(datetime.now().year)
+        head.addWidget(self.goal_year)
+        head.addStretch()
+        layout.addLayout(head)
+
+        goals_form = QGridLayout()
+        self.goal_inputs = {}
+        self.goal_progress_bars = {}
+        for row, (key, title, upper) in enumerate((
+            ("books", "Completed books (known finish dates)", 100000),
+            ("chapters", "Chapters recorded", 10000000),
+            ("pages", "Pages recorded", 100000000),
+        )):
+            goals_form.addWidget(label(title), row, 0)
+            spin = QSpinBox()
+            spin.setRange(0, upper)
+            spin.setSpecialValueText("No goal")
+            self.goal_inputs[key] = spin
+            goals_form.addWidget(spin, row, 1)
+            bar = QProgressBar()
+            bar.setFormat("%v / %m")
+            bar.setMaximum(1)
+            bar.setValue(0)
+            self.goal_progress_bars[key] = bar
+            goals_form.addWidget(bar, row, 2)
+        goals_form.setColumnStretch(2, 2)
+        layout.addLayout(goals_form)
+        actions = QHBoxLayout()
+        actions.addWidget(button("Save goals", self.save_reading_goals, primary=True))
+        actions.addWidget(label(
+            "No goal disables that target. Unknown historical finish dates are excluded.",
+            "muted"
+        ), stretch=1)
+        layout.addLayout(actions)
+
+        layout.addWidget(label("Continue reading", "subheading"))
+        self.current_reads = QListWidget()
+        self.current_reads.setMaximumHeight(155)
+        self.current_reads.itemDoubleClicked.connect(self.open_current_read)
+        layout.addWidget(self.current_reads)
+        layout.addWidget(label("Recent recorded activity", "subheading"))
+        self.recent_list = QListWidget()
+        self.recent_list.setMaximumHeight(190)
+        self.recent_list.itemDoubleClicked.connect(self.open_current_read)
+        layout.addWidget(self.recent_list)
         layout.addStretch()
+        scroll.setWidget(content)
+        outer.addWidget(scroll)
         self.pages.addWidget(page)
+        self.goal_year.valueChanged.connect(self.load_reading_goals)
+        self.load_reading_goals()
+
+    def create_series_page(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.addWidget(label("Explore series", "headline"))
+        layout.addWidget(label(
+            "Browse known series; double-click one to see its books in your library.", "muted"
+        ))
+        self.series_table = QTableWidget(0, 4)
+        self.series_table.setHorizontalHeaderLabels(
+            ["Series", "Books", "Completed", "Active"]
+        )
+        self.series_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.series_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.series_table.verticalHeader().setVisible(False)
+        self.series_table.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.Stretch
+        )
+        for column in (1, 2, 3):
+            self.series_table.horizontalHeader().setSectionResizeMode(
+                column, QHeaderView.ResizeMode.ResizeToContents
+            )
+        self.series_table.itemDoubleClicked.connect(self.open_series_from_table)
+        layout.addWidget(self.series_table)
+        self.pages.addWidget(page)
+
+    def refresh_series_page(self):
+        series = self.library.series_summary()
+        self.series_table.setRowCount(len(series))
+        for row, item in enumerate(series):
+            values = (item["series"], str(item["total"]),
+                      str(item["completed"]), str(item["active"]))
+            for col, value in enumerate(values):
+                self.series_table.setItem(row, col, QTableWidgetItem(value))
+            self.series_table.setRowHeight(row, 39)
+
+    def open_series_from_table(self, item):
+        series_item = self.series_table.item(item.row(), 0)
+        if not series_item:
+            return
+        series = series_item.text()
+        self.clear_library_filters()
+        self.refresh_catalog_filters()
+        found = self.series_filter.findData(series)
+        if found >= 0:
+            self.series_filter.setCurrentIndex(found)
+        self.navigate(0)
+        self.refresh_library()
+
+    def load_reading_goals(self, *_args):
+        goal = self.library.get_goal(self.goal_year.value())
+        for key, control in self.goal_inputs.items():
+            control.setValue(goal[key + "_target"])
+        self.refresh_goal_dashboard()
+
+    def save_reading_goals(self):
+        self.library.save_goal(
+            self.goal_year.value(),
+            books=self.goal_inputs["books"].value(),
+            chapters=self.goal_inputs["chapters"].value(),
+            pages=self.goal_inputs["pages"].value()
+        )
+        self.refresh_goal_dashboard()
+        self.statusBar().showMessage("Reading goals saved locally.", 6000)
+
+    def refresh_goal_dashboard(self):
+        year = self.goal_year.value()
+        goals = self.library.get_goal(year)
+        actual = self.library.goal_progress(year)
+        for key, bar in self.goal_progress_bars.items():
+            value = actual[key]
+            target = goals[key + "_target"]
+            bar.setRange(0, max(value, target, 1))
+            bar.setValue(value)
+            bar.setFormat(
+                f"{value:,} / {target:,}" if target else f"{value:,} recorded (no goal)"
+            )
+        current = self.library.list_works(sort="updated")
+        reading = [w for w in current if w["status"] in ("reading", "caught_up")]
+        self.current_reads.clear()
+        for book in reading[:30]:
+            progress = book["progress"]
+            total = book["total_units"]
+            ratio = f"{progress:,}/{total:,}" if total else str(progress)
+            text = f"{book['title']} — {name(book['status'])} · {ratio} {book['progress_unit']}"
+            tile = QListWidgetItem(text)
+            tile.setData(Qt.ItemDataRole.UserRole, book["id"])
+            self.current_reads.addItem(tile)
+        if not reading:
+            self.current_reads.addItem("No current reads. Mark a book as Reading to see it here.")
+        self.recent_list.clear()
+        for event in self.library.recent_activity(15):
+            difference = event["new_progress"] - event["old_progress"]
+            item = QListWidgetItem(
+                f"{event['recorded_at'][:10]}  ·  {event['title']}  "
+                f"({difference:+d} {event['progress_unit']})"
+            )
+            item.setData(Qt.ItemDataRole.UserRole, event["work_id"])
+            self.recent_list.addItem(item)
+        if not self.recent_list.count():
+            self.recent_list.addItem("Reading milestones will appear here.")
+
+    def open_current_read(self, item):
+        work_id = item.data(Qt.ItemDataRole.UserRole)
+        if not work_id:
+            return
+        self.clear_library_filters()
+        self.navigate(0)
+        self.refresh_library(select_id=work_id)
 
     def refresh_all(self, select_id=None):
         self.refresh_shelves()
+        self.refresh_catalog_filters()
         self.refresh_library(select_id=select_id)
         self.refresh_history()
         self.refresh_stats()
@@ -1122,7 +1376,8 @@ class MainWindow(QMainWindow):
         books = self.library.list_works(
             self.search.text(), self.filter_status.currentData(),
             self.filter_kind.currentData(), self.only_fav.isChecked(),
-            self.sort.currentData(), self.shelf_filter.currentData())
+            self.sort.currentData(), self.shelf_filter.currentData(),
+            self.series_filter.currentData(), self.tag_filter.currentData())
         current = select_id or self.selected_id
         self.table.blockSignals(True)
         self.table.setRowCount(len(books))
@@ -1131,8 +1386,8 @@ class MainWindow(QMainWindow):
             if book["id"] == current:
                 chosen = row
             total = book["total_units"] or (100 if book["progress_unit"] == "percent" else 0)
-            progress = ("Finished · history unknown" if book["status"] == "completed"
-                        and not self.library.runs(book["id"]) else
+            progress = ("Read · unlogged"
+                        if book["status"] == "completed" and book["progress"] == 0 else
                         (f"{book['progress']} / {total}" if total else str(book["progress"])))
             if book["status"] == "caught_up":
                 progress += " ✓"
@@ -1240,9 +1495,11 @@ class MainWindow(QMainWindow):
                 self.details.addWidget(label(text))
         runs = self.library.runs(work_id)
         progress = runs[0]["current_progress"] if runs else 0
-        self.details.addWidget(label(
-            f"Progress: {progress} {book['progress_unit']}" +
-            (f" / {book['total_units']}" if book["total_units"] else ""), "subheading"))
+        progress_text = ("Completed · progress not recorded"
+                         if book["status"] == "completed" and progress == 0 else
+                         (f"Progress: {progress} {book['progress_unit']}" +
+                          (f" / {book['total_units']}" if book["total_units"] else "")))
+        self.details.addWidget(label(progress_text, "subheading"))
         if book["notes"]:
             self.details.addWidget(label("Notes: " + book["notes"]))
         if book["description"]:
@@ -1337,6 +1594,29 @@ class MainWindow(QMainWindow):
         else:
             self.table.selectAll()
 
+    def refresh_catalog_filters(self):
+        for combo, entries, title, key in (
+            (self.series_filter, self.library.series_summary(), "All series", "series"),
+            (self.tag_filter, self.library.tag_summary(), "All tags", "tag"),
+        ):
+            current = combo.currentData()
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItem(title, None)
+            for entry in entries:
+                combo.addItem(f"{entry[key]} ({entry['total']})", entry[key])
+            found = combo.findData(current)
+            combo.setCurrentIndex(max(0, found))
+            combo.blockSignals(False)
+
+    def clear_library_filters(self):
+        self.search.clear()
+        for combo in (self.filter_status, self.filter_kind, self.shelf_filter,
+                      self.series_filter, self.tag_filter):
+            combo.setCurrentIndex(0)
+        self.only_fav.setChecked(False)
+        self.refresh_library()
+
     def refresh_shelves(self):
         current = self.shelf_filter.currentData()
         self.shelf_filter.blockSignals(True)
@@ -1354,6 +1634,50 @@ class MainWindow(QMainWindow):
             return
         try:
             self.library.create_shelf(name)
+            self.refresh_all()
+        except Exception as exc:
+            fail(self, exc)
+
+    def manage_shelves(self):
+        shelves = self.library.list_shelves()
+        if not shelves:
+            QMessageBox.information(self, "No shelves", "Create a shelf to organize your books.")
+            return
+        names = [shelf["name"] for shelf in shelves]
+        choice, ok = QInputDialog.getItem(
+            self, "Manage shelves", "Choose a shelf:", names, 0, False
+        )
+        if not ok:
+            return
+        selected = next(row for row in shelves if row["name"] == choice)
+        action, ok = QInputDialog.getItem(
+            self, f"Manage {choice}", "Action:",
+            ["Rename shelf", "Delete shelf (keep books)", "Remove selected books from shelf"],
+            0, False,
+        )
+        if not ok:
+            return
+        try:
+            if action == "Rename shelf":
+                new_name, accepted = QInputDialog.getText(
+                    self, "Rename shelf", "New name:", text=choice
+                )
+                if accepted:
+                    self.library.rename_shelf(selected["id"], new_name)
+            elif action == "Delete shelf (keep books)":
+                if QMessageBox.question(
+                    self, "Delete shelf?",
+                    f"Delete shelf {choice!r}? Books and reading history will remain."
+                ) == QMessageBox.StandardButton.Yes:
+                    self.library.delete_shelf(selected["id"])
+            else:
+                ids = self.selected_ids()
+                if not ids:
+                    QMessageBox.information(
+                        self, "Choose books", "Select the books to remove first."
+                    )
+                    return
+                self.library.set_shelf_membership(ids, selected["id"], include=False)
             self.refresh_all()
         except Exception as exc:
             fail(self, exc)
@@ -1583,23 +1907,30 @@ class MainWindow(QMainWindow):
                            else f"{stats[key]:,}")
         breakdown = "   ·   ".join(f"{name(kind)}: {count}" for kind, count in stats["by_kind"].items())
         self.stat_breakdown.setText("Library breakdown\n" + breakdown)
+        self.refresh_goal_dashboard()
 
     def export_library(self):
         path, _ = QFileDialog.getSaveFileName(
-            self, "Export BookTracker library", "BookTracker-backup.json",
-            "JSON backup (*.json);;XML backup (*.xml);;CSV catalog (*.csv)")
+            self, "Export BookTracker library", "BookTracker-full.btbackup",
+            "Portable full backup (*.btbackup);;JSON backup (*.json);;"
+            "XML backup (*.xml);;CSV catalog (*.csv)")
         if not path:
             return
         try:
             export_file(self.library, path)
-            message = "Export complete.\n\nJSON and XML preserve reading history; CSV is a flat catalog only."
+            message = (
+                "Export complete.\n\nPortable .btbackup files include your reading history, "
+                "shelves, goals and imported EPUB covers. JSON/XML include reading data "
+                "but not local images; CSV is a flat catalog."
+            )
             QMessageBox.information(self, "Exported", message)
         except Exception as exc:
             fail(self, exc)
 
     def import_library(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Import library", "", "BookTracker files (*.json *.xml *.csv)")
+            self, "Import library", "",
+            "BookTracker files (*.btbackup *.json *.xml *.csv)")
         if not path:
             return
         answer = QMessageBox.question(
@@ -1619,11 +1950,99 @@ class MainWindow(QMainWindow):
             if confirm != QMessageBox.StandardButton.Yes:
                 return
         try:
+            if strategy == "replace":
+                backup_folder = self.library.path.parent / "backups"
+                timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+                self.library.backup_to(
+                    backup_folder / f"BookTracker-before-import-{timestamp}.sqlite3"
+                )
             count = import_file(self.library, path, strategy=strategy)
             self.refresh_all()
             QMessageBox.information(self, "Imported", f"Imported {count} new works.")
         except Exception as exc:
             fail(self, exc)
+
+    @staticmethod
+    def _scan_epub_files(paths, cover_dir):
+        works = []
+        errors = []
+        for filename in paths:
+            try:
+                works.append(read_epub_metadata(filename, cover_dir=cover_dir))
+            except (OSError, ValueError, KeyError) as exc:
+                errors.append(f"{Path(filename).name}: {exc}")
+        return {"works": works, "errors": errors}
+
+    def import_epub_files(self):
+        if self.epub_worker and self.epub_worker.isRunning():
+            self.statusBar().showMessage("An EPUB import is already in progress.", 6000)
+            return
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Select EPUB files to add", "", "EPUB ebooks (*.epub)"
+        )
+        if not paths:
+            return
+        if len(paths) > 250:
+            QMessageBox.warning(self, "Import limit", "Select up to 250 EPUBs at once.")
+            return
+        reply = QMessageBox.question(
+            self, "Import reading status",
+            "Mark these books as completed?\n\n"
+            "Yes = Completed (historical finish date unknown).\n"
+            "No = Plan to read.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No |
+            QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.No,
+        )
+        if reply == QMessageBox.StandardButton.Cancel:
+            return
+        status = "completed" if reply == QMessageBox.StandardButton.Yes else "plan_to_read"
+        worker = LookupThread(
+            self._scan_epub_files, paths, self.library.path.parent / "imported_covers"
+        )
+        self.epub_worker = worker
+        worker.found.connect(lambda data: self.finish_epub_import(data, status))
+        worker.failed.connect(
+            lambda err: QMessageBox.warning(self, "EPUB import", err)
+        )
+        self.statusBar().showMessage(f"Reading metadata from {len(paths)} EPUB files…")
+        worker.start()
+
+    def finish_epub_import(self, data, status):
+        works = data["works"]
+        errors = data["errors"]
+        if works:
+            preview = "\n".join("• " + w["title"] for w in works[:12])
+            if len(works) > 12:
+                preview += f"\n… and {len(works) - 12} more"
+            proceed = QMessageBox.question(
+                self, "Import these books?",
+                f"Ready to add {len(works)} books ({name(status)}):\n\n"
+                f"{preview}\n\nExisting entries will be enriched when metadata is missing.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if proceed == QMessageBox.StandardButton.Yes:
+                try:
+                    report = self.library.bulk_add_works(
+                        works, status=status, enrich_duplicates=True
+                    )
+                    self.refresh_all()
+                    QMessageBox.information(
+                        self, "EPUB import complete",
+                        f"Added: {report['added']}\n"
+                        f"Existing books enriched: {report['enriched']}\n"
+                        f"Skipped duplicates: {report['skipped']}"
+                        + (f"\nUnreadable EPUBs: {len(errors)}" if errors else "")
+                    )
+                except Exception as exc:
+                    fail(self, exc)
+        if errors:
+            details = "\n".join(errors[:15])
+            if len(errors) > 15:
+                details += f"\n… and {len(errors)-15} more"
+            QMessageBox.warning(self, "EPUBs that could not be read", details)
+        self.statusBar().showMessage("EPUB import finished.", 6000)
 
     def import_goodreads_csv(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -1639,8 +2058,11 @@ class MainWindow(QMainWindow):
             fail(self, exc)
 
     def closeEvent(self, event):
-        if self.metadata_worker and self.metadata_worker.isRunning():
-            self.metadata_worker.wait()
+        for worker in (self.metadata_worker, self.epub_worker):
+            if worker and worker.isRunning():
+                worker.wait()
+        self.settings.setValue("window_geometry", self.saveGeometry())
+        self.settings.setValue("library_view", self.view_selector.currentData())
         self.library.close()
         super().closeEvent(event)
 
