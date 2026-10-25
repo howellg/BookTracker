@@ -50,6 +50,7 @@ class Library:
         self.db.execute("PRAGMA foreign_keys=ON")
         self.db.execute("PRAGMA busy_timeout=5000")
         self.db.execute("PRAGMA journal_mode=WAL")
+        self._snapshot_before_catalog_migration()
         self._initialize()
 
     def close(self):
@@ -63,6 +64,22 @@ class Library:
         except Exception:
             self.db.rollback()
             raise
+
+    def _snapshot_before_catalog_migration(self):
+        """Create a recoverable WAL-aware copy *before* version 6 alters tables."""
+        version = self.db.execute("PRAGMA user_version").fetchone()[0]
+        exists = self.db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='works'"
+        ).fetchone()
+        if not exists or version >= 6:
+            return
+        folder = self.path.parent / "backups"
+        folder.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        target = folder / f"BookTracker-before-v09-{stamp}.sqlite3"
+        # sqlite3.backup copies committed WAL content safely.
+        with sqlite3.connect(target) as destination:
+            self.db.backup(destination)
 
     def _initialize(self):
         self.db.executescript("""
@@ -169,9 +186,106 @@ class Library:
             CHECK(location IS NULL OR location BETWEEN 0 AND 10000000)
         );
         CREATE INDEX IF NOT EXISTS idx_annotations_work ON annotations(work_id,created_at);
+        CREATE TABLE IF NOT EXISTS work_sources (
+            id TEXT PRIMARY KEY,
+            work_id TEXT NOT NULL REFERENCES works(id) ON DELETE CASCADE,
+            url TEXT NOT NULL UNIQUE,
+            site TEXT NOT NULL DEFAULT '',
+            external_id TEXT NOT NULL DEFAULT '',
+            label TEXT NOT NULL DEFAULT '',
+            is_primary INTEGER NOT NULL DEFAULT 0 CHECK(is_primary IN (0,1)),
+            published_units INTEGER NOT NULL DEFAULT 0 CHECK(published_units>=0),
+            last_checked_at TEXT NOT NULL DEFAULT '',
+            last_error TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_work_sources_site
+            ON work_sources(site,external_id)
+            WHERE site!='' AND external_id!='';
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_work_sources_primary
+            ON work_sources(work_id) WHERE is_primary=1;
+        CREATE INDEX IF NOT EXISTS idx_work_sources_work ON work_sources(work_id);
+        CREATE TABLE IF NOT EXISTS work_editions (
+            id TEXT PRIMARY KEY,
+            work_id TEXT NOT NULL REFERENCES works(id) ON DELETE CASCADE,
+            title TEXT NOT NULL DEFAULT '',
+            format TEXT NOT NULL DEFAULT 'unknown',
+            isbn TEXT NOT NULL DEFAULT '',
+            publisher TEXT NOT NULL DEFAULT '',
+            published_at TEXT NOT NULL DEFAULT '',
+            pages INTEGER NOT NULL DEFAULT 0 CHECK(pages>=0),
+            language TEXT NOT NULL DEFAULT '',
+            notes TEXT NOT NULL DEFAULT '',
+            is_preferred INTEGER NOT NULL DEFAULT 0 CHECK(is_preferred IN (0,1)),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_work_editions_work ON work_editions(work_id);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_work_editions_preferred
+            ON work_editions(work_id) WHERE is_preferred=1;
+        CREATE INDEX IF NOT EXISTS idx_work_editions_isbn ON work_editions(isbn);
+        CREATE TABLE IF NOT EXISTS source_checks (
+            id TEXT PRIMARY KEY,
+            source_id TEXT NOT NULL REFERENCES work_sources(id) ON DELETE CASCADE,
+            checked_at TEXT NOT NULL,
+            outcome TEXT NOT NULL,
+            old_units INTEGER NOT NULL CHECK(old_units>=0),
+            observed_units INTEGER NOT NULL CHECK(observed_units>=0),
+            message TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_source_checks_source
+            ON source_checks(source_id,checked_at DESC);
         """)
-        self.db.execute("PRAGMA user_version=5")
+        self.db.execute("PRAGMA user_version=6")
+        self._backfill_catalog_relationships()
         self.db.commit()
+
+    def _backfill_catalog_relationships(self):
+        """Idempotently lift old source/ISBN fields into linked records.
+
+        Existing columns remain authoritative and never disappear, keeping
+        old code and third-party exports working. No network calls.
+        """
+        for work in self.db.execute(
+            """SELECT id,source_url,source_site,source_id,total_units,
+               isbn,language,published_at,progress_unit FROM works"""
+        ).fetchall():
+            if work["source_url"].startswith("https://"):
+                row = self.db.execute(
+                    "SELECT id,work_id FROM work_sources WHERE url=?",
+                    (work["source_url"],)
+                ).fetchone()
+                if row is None:
+                    source_id = new_id()
+                    try:
+                        self.db.execute(
+                            """INSERT INTO work_sources
+                            (id,work_id,url,site,external_id,label,is_primary,
+                             published_units,last_checked_at,last_error,created_at,updated_at)
+                            VALUES (?,?,?,?,?,?,1,?,'','',?,?)""",
+                            (source_id, work["id"], work["source_url"],
+                             work["source_site"], work["source_id"], "",
+                             work["total_units"] if work["progress_unit"] == "chapters" else 0,
+                             now(), now())
+                        )
+                    except sqlite3.IntegrityError:
+                        # Backups may contain duplicate legacy mirrors; leave
+                        # historical works intact instead of making startup fail.
+                        pass
+            if work["isbn"] and not self.db.execute(
+                "SELECT 1 FROM work_editions WHERE work_id=?", (work["id"],)
+            ).fetchone():
+                self.db.execute(
+                    """INSERT INTO work_editions
+                    (id,work_id,title,format,isbn,publisher,published_at,
+                    pages,language,notes,is_preferred,created_at,updated_at)
+                    VALUES (?,?,?,'unknown',?,'',?,?,?,'',1,?,?)""",
+                    (new_id(), work["id"], "", work["isbn"],
+                     work["published_at"],
+                     work["total_units"] if work["progress_unit"]=="pages" else 0,
+                     work["language"], now(), now()),
+                )
 
     @staticmethod
     def _clean(data):
@@ -225,6 +339,19 @@ class Library:
                 run_id = self._begin_run(work_id, fields.get("started_at") or fields["finished_at"])
                 self.db.execute("UPDATE reading_runs SET finished_at=?,is_active=0 WHERE id=?",
                                 (fields["finished_at"], run_id))
+            if fields.get("source_url"):
+                self._sync_primary_source_from_work(work_id)
+            if fields.get("isbn"):
+                self.db.execute(
+                    """INSERT INTO work_editions
+                    (id,work_id,title,format,isbn,publisher,published_at,pages,
+                     language,notes,is_preferred,created_at,updated_at)
+                    VALUES (?,?,?,'unknown',?,'',?,?,?,'',1,?,?)""",
+                    (new_id(),work_id,"",fields["isbn"],fields.get("published_at") or "",
+                     fields.get("total_units",0)
+                     if fields.get("progress_unit", "chapters")=="pages" else 0,
+                     fields.get("language") or "",now(),now()),
+                )
         return work_id
 
     def update_work(self, work_id: str, data: dict):
@@ -234,12 +361,19 @@ class Library:
         fields["updated_at"] = now()
         with self.transaction():
             assignment = ", ".join(f"{key}=?" for key in fields)
-            cursor = self.db.execute(
-                f"UPDATE works SET {assignment} WHERE id=?",
-                (*fields.values(), work_id),
-            )
-            if not cursor.rowcount:
-                raise KeyError(work_id)
+            try:
+                cursor = self.db.execute(
+                    f"UPDATE works SET {assignment} WHERE id=?",
+                    (*fields.values(), work_id),
+                )
+                if not cursor.rowcount:
+                    raise KeyError(work_id)
+                if any(key in fields for key in ("source_url", "source_site", "source_id")):
+                    self._sync_primary_source_from_work(work_id)
+            except sqlite3.IntegrityError as exc:
+                raise ValueError(
+                    "Source or ISBN is already linked to another work."
+                ) from exc
 
     def get_work(self, work_id: str) -> dict | None:
         row = self.db.execute("SELECT * FROM works WHERE id=?", (work_id,)).fetchone()
@@ -658,7 +792,92 @@ class Library:
                                   (data["source_url"],)).fetchone()
             if row:
                 return row["id"]
+        if data.get("isbn"):
+            row = self.db.execute(
+                "SELECT work_id FROM work_editions WHERE isbn=? LIMIT 1",
+                (data["isbn"],)
+            ).fetchone()
+            if row:
+                return row["work_id"]
+        if data.get("source_site") and data.get("source_id"):
+            row = self.db.execute(
+                """SELECT work_id FROM work_sources
+                WHERE site=? AND external_id=?""",
+                (data["source_site"], data["source_id"])
+            ).fetchone()
+            if row:
+                return row["work_id"]
+        if data.get("source_url"):
+            url = data["source_url"]
+            row = self.db.execute(
+                "SELECT work_id FROM work_sources WHERE url=?", (url,)
+            ).fetchone()
+            if not row and str(url).startswith("https://"):
+                try:
+                    canonical, site, external, _ = self._source_values(url)
+                except ValueError:
+                    canonical = site = external = ""
+                if external:
+                    row = self.db.execute(
+                        "SELECT work_id FROM work_sources WHERE site=? AND external_id=?",
+                        (site,external)
+                    ).fetchone()
+                if not row and canonical:
+                    row = self.db.execute(
+                        "SELECT work_id FROM work_sources WHERE url=?", (canonical,)
+                    ).fetchone()
+            if row:
+                return row["work_id"]
         return None
+
+    def _save_alternate_import_identifiers(self, work_id, fields):
+        """Keep crossposts/edition ISBNs even for matched titles during bulk import.
+
+        Called only inside the parent's transaction. Existing personal fields,
+        reading runs and the selected preferred source are never overwritten.
+        """
+        url = fields.get("source_url") or ""
+        if url.startswith("https://"):
+            try:
+                canonical, site, external, _ = self._source_values(url)
+            except ValueError:
+                canonical = ""
+            if canonical:
+                existing = self.db.execute(
+                    "SELECT id,work_id FROM work_sources WHERE url=?", (canonical,)
+                ).fetchone()
+                if not existing and site and external:
+                    existing = self.db.execute(
+                        """SELECT id,work_id FROM work_sources
+                        WHERE site=? AND external_id=?""", (site,external)
+                    ).fetchone()
+                if not existing:
+                    new_source = new_id()
+                    self.db.execute(
+                        """INSERT INTO work_sources
+                        (id,work_id,url,site,external_id,label,is_primary,
+                         published_units,last_checked_at,last_error,created_at,updated_at)
+                        VALUES (?,?,?,?,?,'',0,?,'','',?,?)""",
+                        (new_source,work_id,canonical,site,external,
+                         fields.get("total_units") or 0
+                         if fields.get("progress_unit")=="chapters" else 0,
+                         now(),now()),
+                    )
+        isbn = fields.get("isbn") or ""
+        if isbn and not self.db.execute(
+            "SELECT 1 FROM work_editions WHERE work_id=? AND isbn=?",
+            (work_id,isbn)
+        ).fetchone():
+            self.db.execute(
+                """INSERT INTO work_editions
+                (id,work_id,title,format,isbn,publisher,published_at,
+                 pages,language,notes,is_preferred,created_at,updated_at)
+                VALUES (?,?,?,'unknown',?,'',?,?,?,'',0,?,?)""",
+                (new_id(),work_id,"",isbn,fields.get("published_at") or "",
+                 fields.get("total_units") or 0
+                 if fields.get("progress_unit")=="pages" else 0,
+                 fields.get("language") or "",now(),now()),
+            )
 
     def bulk_add_works(
         self, books: list[dict], *, status: str = "completed",
@@ -694,6 +913,16 @@ class Library:
             }
             by_url = {row["source_url"]: row["id"] for row in existing if row["source_url"]}
             statuses = {row["id"]: row["status"] for row in existing}
+            for row in self.db.execute(
+                "SELECT work_id,isbn FROM work_editions WHERE isbn!=''"
+            ):
+                by_isbn.setdefault(row["isbn"],row["work_id"])
+            for row in self.db.execute(
+                "SELECT work_id,url,site,external_id FROM work_sources"
+            ):
+                by_url.setdefault(row["url"],row["work_id"])
+                if row["site"] and row["external_id"]:
+                    by_site.setdefault((row["site"],row["external_id"]),row["work_id"])
 
             for data in books:
                 if not isinstance(data, dict):
@@ -763,6 +992,13 @@ class Library:
                             enriched.append(existing_id)
                     else:
                         duplicates.append(fields["title"])
+                    self._save_alternate_import_identifiers(existing_id,fields)
+                    if isbn:
+                        by_isbn.setdefault(isbn,existing_id)
+                    if all(site_id):
+                        by_site.setdefault(site_id,existing_id)
+                    if url:
+                        by_url.setdefault(url,existing_id)
                     continue
 
                 timestamp = now()
@@ -783,6 +1019,7 @@ class Library:
                 if url:
                     by_url[url] = fields["id"]
                 # No invented reading run, start or finish date.
+            self._backfill_catalog_relationships()
 
         return {
             "added": len(added), "updated": len(updated),
@@ -1526,8 +1763,435 @@ class Library:
             result["sessions"] += item["sessions"]
         return result
 
+    @staticmethod
+    def _source_values(url, label=""):
+        from urllib.parse import urlsplit, urlunsplit
+
+        url = str(url or "").strip()
+        parsed = urlsplit(url)
+        try:
+            valid_port = parsed.port in (None, 443)
+        except ValueError:
+            valid_port = False
+        if (parsed.scheme.lower() != "https" or not parsed.hostname
+                or parsed.username or parsed.password or not valid_port):
+            raise ValueError("Source links must be valid HTTPS URLs without credentials.")
+        if len(url) > 1800:
+            raise ValueError("Source URL is too long.")
+        label = str(label or "").strip()
+        if len(label) > 100:
+            raise ValueError("Source label must be 100 characters or fewer.")
+        canonical = urlunsplit((
+            "https", parsed.hostname.lower(), parsed.path.rstrip("/") or "/",
+            parsed.query, ""
+        ))
+        site = parsed.hostname.lower()
+        external_id = ""
+        # Recognize real site IDs when possible. Unsupported HTTPS links may
+        # still be saved but will never be fetched automatically.
+        from .integrations import source_from_url
+        try:
+            recognized = source_from_url(canonical)
+        except ValueError:
+            recognized = None
+        if recognized:
+            site = recognized["source_site"]
+            external_id = recognized["source_id"]
+            canonical = recognized["source_url"]
+        elif site == "openlibrary.org":
+            match = re.fullmatch(r"/works/(OL\d+W)", parsed.path.rstrip("/"))
+            if match:
+                site = "Open Library"
+                external_id = "/works/" + match.group(1)
+                canonical = f"https://openlibrary.org{external_id}"
+        return canonical, site, external_id, label
+
+    def list_sources(self, work_id=None):
+        if work_id is not None:
+            if not self.get_work(work_id):
+                raise KeyError(work_id)
+            rows = self.db.execute(
+                """SELECT s.*,w.title,w.progress_unit,w.total_units AS work_total
+                   FROM work_sources s JOIN works w ON w.id=s.work_id
+                   WHERE s.work_id=? ORDER BY is_primary DESC,created_at,id""",
+                (work_id,),
+            )
+        else:
+            rows = self.db.execute(
+                """SELECT s.*,w.title,w.progress_unit,w.total_units AS work_total
+                   FROM work_sources s JOIN works w ON w.id=s.work_id
+                   ORDER BY s.updated_at DESC,s.created_at DESC"""
+            )
+        return [dict(row) for row in rows]
+
+    def get_source(self, source_id):
+        row = self.db.execute(
+            "SELECT * FROM work_sources WHERE id=?", (source_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def _primary_source(self, source_id):
+        row = self.get_source(source_id)
+        if not row:
+            raise ValueError("Source does not exist.")
+        self.db.execute(
+            "UPDATE work_sources SET is_primary=0 WHERE work_id=?",
+            (row["work_id"],)
+        )
+        self.db.execute(
+            "UPDATE work_sources SET is_primary=1,updated_at=? WHERE id=?",
+            (now(), source_id)
+        )
+        self.db.execute(
+            """UPDATE works SET source_site=?,source_id=?,source_url=?,updated_at=?
+               WHERE id=?""",
+            (row["site"], row["external_id"], row["url"], now(), row["work_id"])
+        )
+
+    def _sync_primary_source_from_work(self, work_id):
+        """Keep the legacy URL fields and linked primary row in sync atomically."""
+        work = self.get_work(work_id)
+        url = work["source_url"]
+        if not url:
+            self.db.execute(
+                "UPDATE work_sources SET is_primary=0 WHERE work_id=?",
+                (work_id,)
+            )
+            self.db.execute(
+                "UPDATE works SET source_site='',source_id='' WHERE id=?",
+                (work_id,)
+            )
+            return
+        if not url.startswith("https://"):
+            # Legacy custom/non-HTTPS metadata is left intact; never fetch it.
+            return
+        canonical, site, external_id, _ = self._source_values(url)
+        row = self.db.execute(
+            "SELECT id,work_id FROM work_sources WHERE url=?", (canonical,)
+        ).fetchone()
+        if not row and site and external_id:
+            row = self.db.execute(
+                """SELECT id,work_id FROM work_sources
+                   WHERE site=? AND external_id=?""", (site,external_id)
+            ).fetchone()
+        if row and row["work_id"] != work_id:
+            raise ValueError("Source link belongs to another work.")
+        if row:
+            source_id = row["id"]
+        else:
+            source_id = new_id()
+            self.db.execute(
+                """INSERT INTO work_sources
+                (id,work_id,url,site,external_id,label,is_primary,
+                published_units,last_checked_at,last_error,created_at,updated_at)
+                VALUES(?,?,?,?,?,'',0,0,'','',?,?)""",
+                (source_id,work_id,canonical,site,external_id,now(),now())
+            )
+        self._primary_source(source_id)
+
+    def add_source(self, work_id, url, *, label="", make_primary=False):
+        if not self.get_work(work_id):
+            raise KeyError(work_id)
+        url, site, external_id, label = self._source_values(url, label)
+        with self.transaction():
+            same_url = self.db.execute(
+                "SELECT id,work_id FROM work_sources WHERE url=?", (url,)
+            ).fetchone()
+            same_identity = self.db.execute(
+                """SELECT id,work_id FROM work_sources
+                   WHERE site=? AND external_id=?""",
+                (site, external_id)
+            ).fetchone() if site and external_id else None
+            existing = same_url or same_identity
+            if existing:
+                if existing["work_id"] != work_id:
+                    raise ValueError("That source is already linked to a different work.")
+                source_id = existing["id"]
+                if label:
+                    self.db.execute(
+                        "UPDATE work_sources SET label=?,updated_at=? WHERE id=?",
+                        (label, now(), source_id)
+                    )
+            else:
+                source_id = new_id()
+                self.db.execute(
+                    """INSERT INTO work_sources
+                    (id,work_id,url,site,external_id,label,is_primary,
+                     published_units,last_checked_at,last_error,created_at,updated_at)
+                    VALUES(?,?,?,?,?,?,0,0,'','',?,?)""",
+                    (source_id, work_id, url, site, external_id, label, now(), now())
+                )
+            primary = self.db.execute(
+                "SELECT 1 FROM work_sources WHERE work_id=? AND is_primary=1",
+                (work_id,)
+            ).fetchone()
+            if make_primary or not primary:
+                self._primary_source(source_id)
+        return source_id
+
+    def set_primary_source(self, source_id):
+        with self.transaction():
+            self._primary_source(source_id)
+
+    def remove_source(self, source_id):
+        with self.transaction():
+            row = self.get_source(source_id)
+            if not row:
+                raise ValueError("Source does not exist.")
+            self.db.execute("DELETE FROM work_sources WHERE id=?", (source_id,))
+            if row["is_primary"]:
+                replacement = self.db.execute(
+                    "SELECT id FROM work_sources WHERE work_id=? ORDER BY created_at,id LIMIT 1",
+                    (row["work_id"],)
+                ).fetchone()
+                if replacement:
+                    self._primary_source(replacement["id"])
+                else:
+                    self.db.execute(
+                        """UPDATE works SET source_site='',source_id='',source_url='',
+                           updated_at=? WHERE id=?""", (now(), row["work_id"])
+                    )
+
+    @staticmethod
+    def _edition_values(data):
+        if not isinstance(data, dict):
+            raise ValueError("Edition must be an object.")
+        fmt = str(data.get("format") or "unknown").strip()
+        if fmt not in ("unknown", "print", "ebook", "audiobook", "web", "other"):
+            raise ValueError("Unsupported edition format.")
+        fields = {
+            field: str(data.get(field) or "").strip()
+            for field in ("title", "isbn", "publisher", "published_at",
+                          "language", "notes")
+        }
+        for field, limit in (("title", 250), ("isbn", 35), ("publisher", 150),
+                             ("published_at", 40), ("language", 60), ("notes", 8000)):
+            if len(fields[field]) > limit:
+                raise ValueError(f"Edition {field} exceeds the size limit.")
+        raw_pages = data.get("pages") or 0
+        try:
+            pages = int(raw_pages)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Edition page count must be a number.") from exc
+        if not 0 <= pages <= 10_000_000:
+            raise ValueError("Edition page count is outside the supported range.")
+        fields.update(format=fmt, pages=pages)
+        return fields
+
+    def list_editions(self, work_id):
+        if not self.get_work(work_id):
+            raise KeyError(work_id)
+        return [dict(row) for row in self.db.execute(
+            """SELECT * FROM work_editions WHERE work_id=?
+               ORDER BY is_preferred DESC,created_at,id""", (work_id,)
+        )]
+
+    def get_edition(self, edition_id):
+        row = self.db.execute(
+            "SELECT * FROM work_editions WHERE id=?", (edition_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def add_edition(self, work_id, data, *, preferred=False):
+        if not self.get_work(work_id):
+            raise KeyError(work_id)
+        fields = self._edition_values(data)
+        edition_id = new_id()
+        with self.transaction():
+            if fields["isbn"] and self.db.execute(
+                "SELECT 1 FROM work_editions WHERE work_id=? AND isbn=?",
+                (work_id, fields["isbn"])
+            ).fetchone():
+                raise ValueError("This edition ISBN is already saved for the work.")
+            self.db.execute(
+                """INSERT INTO work_editions
+                (id,work_id,title,format,isbn,publisher,published_at,pages,
+                 language,notes,is_preferred,created_at,updated_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,0,?,?)""",
+                (edition_id, work_id, *(
+                    fields[key] for key in (
+                        "title", "format", "isbn", "publisher", "published_at",
+                        "pages", "language", "notes")
+                ), now(), now())
+            )
+            count = self.db.execute(
+                "SELECT COUNT(*) FROM work_editions WHERE work_id=?",
+                (work_id,)
+            ).fetchone()[0]
+            if preferred or count == 1:
+                self._prefer_edition(edition_id)
+        return edition_id
+
+    def update_edition(self, edition_id, data):
+        original = self.get_edition(edition_id)
+        if not original:
+            raise ValueError("Edition does not exist.")
+        fields = self._edition_values(data)
+        with self.transaction():
+            if fields["isbn"] and self.db.execute(
+                """SELECT 1 FROM work_editions
+                   WHERE work_id=? AND isbn=? AND id!=?""",
+                (original["work_id"], fields["isbn"], edition_id)
+            ).fetchone():
+                raise ValueError("Another edition already has this ISBN.")
+            self.db.execute(
+                """UPDATE work_editions SET title=?,format=?,isbn=?,publisher=?,
+                   published_at=?,pages=?,language=?,notes=?,updated_at=? WHERE id=?""",
+                (*(fields[key] for key in (
+                    "title", "format", "isbn", "publisher", "published_at",
+                    "pages", "language", "notes"
+                )), now(), edition_id)
+            )
+            if original["is_preferred"]:
+                self._prefer_edition(edition_id)
+
+    def _prefer_edition(self, edition_id):
+        edition = self.get_edition(edition_id)
+        if not edition:
+            raise ValueError("Edition does not exist.")
+        self.db.execute(
+            "UPDATE work_editions SET is_preferred=0 WHERE work_id=?",
+            (edition["work_id"],)
+        )
+        self.db.execute(
+            "UPDATE work_editions SET is_preferred=1,updated_at=? WHERE id=?",
+            (now(), edition_id)
+        )
+        # These legacy catalog fields expose the selected edition to the
+        # existing library layout, while preserving progress and history.
+        updates = {"isbn": edition["isbn"], "updated_at": now()}
+        if edition["language"]:
+            updates["language"] = edition["language"]
+        if edition["published_at"]:
+            updates["published_at"] = edition["published_at"]
+        if edition["pages"] and self.get_work(edition["work_id"])["progress_unit"] == "pages":
+            updates["total_units"] = edition["pages"]
+        query = ", ".join(f"{key}=?" for key in updates)
+        self.db.execute(
+            f"UPDATE works SET {query} WHERE id=?",
+            (*updates.values(), edition["work_id"])
+        )
+
+    def set_preferred_edition(self, edition_id):
+        with self.transaction():
+            self._prefer_edition(edition_id)
+
+    def remove_edition(self, edition_id):
+        with self.transaction():
+            edition = self.get_edition(edition_id)
+            if not edition:
+                raise ValueError("Edition does not exist.")
+            self.db.execute("DELETE FROM work_editions WHERE id=?", (edition_id,))
+            if edition["is_preferred"]:
+                replacement = self.db.execute(
+                    "SELECT id FROM work_editions WHERE work_id=? ORDER BY created_at,id LIMIT 1",
+                    (edition["work_id"],)
+                ).fetchone()
+                if replacement:
+                    self._prefer_edition(replacement["id"])
+                else:
+                    self.db.execute(
+                        "UPDATE works SET isbn='',updated_at=? WHERE id=?",
+                        (now(), edition["work_id"])
+                    )
+
+    def list_source_checks(self, source_id=None, limit=200):
+        sql = """SELECT c.*,s.url,s.site,w.title,w.id AS work_id
+                 FROM source_checks c JOIN work_sources s ON s.id=c.source_id
+                 JOIN works w ON w.id=s.work_id"""
+        args = []
+        if source_id:
+            sql += " WHERE c.source_id=?"
+            args.append(source_id)
+        sql += " ORDER BY c.checked_at DESC,c.rowid DESC LIMIT ?"
+        args.append(max(1,min(10000,int(limit))))
+        return [dict(row) for row in self.db.execute(sql,args)]
+
+    def record_source_check(self, source_id, *, observed_units=None, error=None,
+                            message=""):
+        """Save result of a user-requested check, never infer a missing work.
+
+        A successful higher chapter count updates the known published count.
+        The reading position, rating, dates, tags and personal status are never
+        changed by a source refresh.
+        """
+        source = self.get_source(source_id)
+        if not source:
+            raise ValueError("Source does not exist.")
+        if observed_units is not None:
+            observed_units = int(observed_units)
+            if not 0 <= observed_units <= 10_000_000:
+                raise ValueError("Reported chapter count is invalid.")
+        err = str(error or "").strip()[:500]
+        note = str(message or err)[:500]
+        previous = source["published_units"]
+        if err:
+            outcome = "error"
+            observed = previous
+        elif observed_units is None or observed_units == 0:
+            outcome = "unknown"
+            observed = previous
+        else:
+            observed = observed_units
+            outcome = "updated" if observed > previous else "unchanged"
+        timestamp = now()
+        with self.transaction():
+            if not err:
+                self.db.execute(
+                    """UPDATE work_sources SET published_units=?,
+                       last_checked_at=?,last_error='',updated_at=? WHERE id=?""",
+                    (max(previous, observed), timestamp, timestamp, source_id)
+                )
+                work = self.get_work(source["work_id"])
+                if (
+                    observed > 0 and work["kind"] in ("fanfiction","web_novel")
+                    and work["progress_unit"] == "chapters"
+                    and observed > work["total_units"]
+                ):
+                    self.db.execute(
+                        "UPDATE works SET total_units=?,updated_at=? WHERE id=?",
+                        (observed, timestamp, source["work_id"])
+                    )
+            else:
+                self.db.execute(
+                    """UPDATE work_sources SET last_checked_at=?,last_error=?,
+                       updated_at=? WHERE id=?""",
+                    (timestamp, err, timestamp, source_id)
+                )
+            self.db.execute(
+                """INSERT INTO source_checks VALUES(?,?,?,?,?,?,?)""",
+                (new_id(), source_id, timestamp, outcome, previous, observed, note)
+            )
+        return outcome
+
+    def source_update_summary(self):
+        """One row per story with known source chapters and logged progress."""
+        entries = []
+        for work in self.list_works(sort="updated"):
+            if work["kind"] not in ("fanfiction","web_novel"):
+                continue
+            sources = self.list_sources(work["id"])
+            if not sources:
+                continue
+            known = max([work["total_units"]] + [
+                source["published_units"] for source in sources
+            ])
+            entries.append({
+                "work_id": work["id"], "title": work["title"],
+                "author": work["author"], "progress": work["progress"],
+                "known_chapters": known,
+                "unread": max(0, known - work["progress"]),
+                "source_count": len(sources),
+                "last_checked_at": max((r["last_checked_at"] for r in sources), default=""),
+                "has_error": any(r["last_error"] for r in sources),
+                "status": work["status"],
+            })
+        return sorted(entries, key=lambda item: (
+            item["unread"] == 0, -item["unread"], item["title"].casefold()
+        ))
+
     def export_data(self):
-        return {"format": "booktracker", "schema_version": 5, "exported_at": now(),
+        return {"format": "booktracker", "schema_version": 6, "exported_at": now(),
                 "works": [dict(row) for row in self.db.execute("SELECT * FROM works")],
                 "reading_runs": [dict(row) for row in self.db.execute("SELECT * FROM reading_runs")],
                 "progress_events": [dict(row) for row in self.db.execute("SELECT * FROM progress_events")],
@@ -1536,11 +2200,14 @@ class Library:
                 "reading_goals": [dict(row) for row in self.db.execute("SELECT * FROM reading_goals")],
                 "saved_views": [dict(row) for row in self.db.execute("SELECT * FROM saved_views")],
                 "reading_sessions": [dict(row) for row in self.db.execute("SELECT * FROM reading_sessions")],
-                "annotations": [dict(row) for row in self.db.execute("SELECT * FROM annotations")]}
+                "annotations": [dict(row) for row in self.db.execute("SELECT * FROM annotations")],
+                "work_sources": [dict(row) for row in self.db.execute("SELECT * FROM work_sources")],
+                "work_editions": [dict(row) for row in self.db.execute("SELECT * FROM work_editions")],
+                "source_checks": [dict(row) for row in self.db.execute("SELECT * FROM source_checks")]}
 
     def import_data(self, data, *, strategy="merge"):
         """Transactional import; duplicate event IDs are skipped when merging."""
-        if data.get("format") != "booktracker" or data.get("schema_version") not in (1, 2, 3, 4, 5):
+        if data.get("format") != "booktracker" or data.get("schema_version") not in (1, 2, 3, 4, 5, 6):
             raise ValueError("Unsupported BookTracker backup format or schema version.")
         if data["schema_version"] >= 2 and (
             not isinstance(data.get("shelves"), list)
@@ -1556,6 +2223,11 @@ class Library:
             or not isinstance(data.get("annotations"), list)
         ):
             raise ValueError("Backup is missing sessions or annotations.")
+        if data["schema_version"] >= 6 and any(
+            not isinstance(data.get(key), list)
+            for key in ("work_sources", "work_editions", "source_checks")
+        ):
+            raise ValueError("Backup is missing linked sources, editions, or source checks.")
         for key in ("works", "reading_runs", "progress_events"):
             if not isinstance(data.get(key), list):
                 raise ValueError(f"Backup is missing {key}.")
@@ -1718,4 +2390,126 @@ class Library:
                      item.get("created_at") or now(),
                      item.get("updated_at") or now()),
                 )
+            source_mapping = {}
+            for source in data.get("work_sources", []):
+                if not isinstance(source, dict) or not source.get("id"):
+                    raise ValueError("Malformed source link in backup.")
+                work_id = mapping.get(source.get("work_id"))
+                if not work_id:
+                    raise ValueError("Orphaned source link.")
+                url = source.get("url")
+                try:
+                    _, _, _, _ = self._source_values(url, source.get("label", ""))
+                except ValueError as exc:
+                    raise ValueError("Invalid source link URL in backup.") from exc
+                site = str(source.get("site") or "")[:150]
+                external_id = str(source.get("external_id") or "")[:200]
+                original_id = str(source["id"])
+                same_id = self.db.execute(
+                    "SELECT id,work_id FROM work_sources WHERE id=?", (original_id,)
+                ).fetchone()
+                existing = same_id or self.db.execute(
+                    "SELECT id,work_id FROM work_sources WHERE url=?", (url,)
+                ).fetchone()
+                if not existing and site and external_id:
+                    existing = self.db.execute(
+                        """SELECT id,work_id FROM work_sources
+                        WHERE site=? AND external_id=?""", (site,external_id)
+                    ).fetchone()
+                if existing:
+                    if existing["work_id"] != work_id:
+                        raise ValueError("Source link in backup belongs to another work.")
+                    target = existing["id"]
+                    # Imported public chapter totals may be newer than the local
+                    # snapshot. Never decrease a known count during a merge.
+                    self.db.execute(
+                        """UPDATE work_sources SET
+                        published_units=MAX(published_units,?)
+                        WHERE id=?""",
+                        (max(0,int(source.get("published_units") or 0)),target)
+                    )
+                else:
+                    target = original_id
+                    self.db.execute(
+                        """INSERT INTO work_sources
+                        (id,work_id,url,site,external_id,label,is_primary,
+                         published_units,last_checked_at,last_error,created_at,updated_at)
+                        VALUES(?,?,?,?,?,?,0,?,?,?,?,?)""",
+                        (target,work_id,str(url),site,external_id,
+                         str(source.get("label") or "")[:100],
+                         max(0,int(source.get("published_units") or 0)),
+                         str(source.get("last_checked_at") or ""),
+                         str(source.get("last_error") or "")[:500],
+                         source.get("created_at") or now(),
+                         source.get("updated_at") or now()),
+                    )
+                source_mapping[original_id] = target
+                if source.get("is_primary") and not self.db.execute(
+                    "SELECT 1 FROM work_sources WHERE work_id=? AND is_primary=1",
+                    (work_id,)
+                ).fetchone():
+                    self.db.execute(
+                        "UPDATE work_sources SET is_primary=1 WHERE id=?", (target,)
+                    )
+            for edition in data.get("work_editions", []):
+                if not isinstance(edition,dict) or not edition.get("id"):
+                    raise ValueError("Malformed edition in backup.")
+                work_id = mapping.get(edition.get("work_id"))
+                if not work_id:
+                    raise ValueError("Orphaned edition in backup.")
+                fields = self._edition_values(edition)
+                same_id = self.db.execute(
+                    "SELECT id,work_id FROM work_editions WHERE id=?",
+                    (edition["id"],)
+                ).fetchone()
+                existing = same_id
+                if not existing and fields["isbn"]:
+                    existing = self.db.execute(
+                        "SELECT id,work_id FROM work_editions WHERE work_id=? AND isbn=?",
+                        (work_id, fields["isbn"])
+                    ).fetchone()
+                if existing:
+                    if existing["work_id"] != work_id:
+                        raise ValueError("Edition ID is linked to another work.")
+                    continue
+                preferred = int(bool(edition.get("is_preferred")))
+                if self.db.execute(
+                    "SELECT 1 FROM work_editions WHERE work_id=? AND is_preferred=1",
+                    (work_id,)
+                ).fetchone():
+                    preferred = 0
+                self.db.execute(
+                    """INSERT INTO work_editions
+                    (id,work_id,title,format,isbn,publisher,published_at,
+                     pages,language,notes,is_preferred,created_at,updated_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (edition["id"],work_id,*(
+                        fields[key] for key in (
+                            "title","format","isbn","publisher","published_at",
+                            "pages","language","notes"
+                        )
+                    ),preferred,edition.get("created_at") or now(),
+                    edition.get("updated_at") or now())
+                )
+            for check in data.get("source_checks", []):
+                if not isinstance(check,dict) or not check.get("id"):
+                    raise ValueError("Malformed source check in backup.")
+                source_id = source_mapping.get(check.get("source_id"))
+                if not source_id:
+                    raise ValueError("Orphaned source check in backup.")
+                old = int(check.get("old_units") or 0)
+                observed = int(check.get("observed_units") or 0)
+                if not 0 <= old <= 10_000_000 or not 0 <= observed <= 10_000_000:
+                    raise ValueError("Invalid source chapter count in backup.")
+                status = str(check.get("outcome") or "")
+                if status not in ("updated","unchanged","unknown","error"):
+                    raise ValueError("Invalid source check status.")
+                self.db.execute(
+                    """INSERT OR IGNORE INTO source_checks
+                    (id,source_id,checked_at,outcome,old_units,observed_units,message)
+                    VALUES (?,?,?,?,?,?,?)""",
+                    (check["id"], source_id,check.get("checked_at") or now(),
+                     status, old, observed, str(check.get("message") or "")[:500]),
+                )
+            self._backfill_catalog_relationships()
         return count

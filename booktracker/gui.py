@@ -1191,6 +1191,484 @@ class AnnotationDialog(QDialog):
         }
 
 
+class EditionEditor(QDialog):
+    """Edit an edition without touching the work's personal reading records."""
+
+    def __init__(self, parent=None, edition=None):
+        super().__init__(parent)
+        self.setWindowTitle("Edit edition" if edition else "Add edition")
+        self.resize(560, 475)
+        original = edition or {}
+        layout = QVBoxLayout(self)
+        layout.addWidget(label(
+            "Track a print, ebook, audiobook, web or other edition of this work.",
+            "muted"
+        ))
+        form = QFormLayout()
+        self.title = QLineEdit(original.get("title", ""))
+        self.title.setPlaceholderText("Optional edition title, e.g. 10th Anniversary")
+        self.fmt = QComboBox()
+        for key, text in (
+            ("unknown", "Unspecified"),
+            ("print", "Print"),
+            ("ebook", "Ebook"),
+            ("audiobook", "Audiobook"),
+            ("web", "Web edition"),
+            ("other", "Other"),
+        ):
+            self.fmt.addItem(text, key)
+        self.fmt.setCurrentIndex(max(0, self.fmt.findData(original.get("format","unknown"))))
+        self.isbn = QLineEdit(original.get("isbn", ""))
+        self.publisher = QLineEdit(original.get("publisher", ""))
+        self.published = QLineEdit(original.get("published_at", ""))
+        self.published.setPlaceholderText("YYYY or YYYY-MM-DD")
+        self.pages = QSpinBox()
+        self.pages.setRange(0, 10_000_000)
+        self.pages.setSpecialValueText("Unknown")
+        self.pages.setValue(original.get("pages") or 0)
+        self.language = QLineEdit(original.get("language", ""))
+        self.notes = QTextEdit(original.get("notes", ""))
+        self.notes.setMaximumHeight(130)
+        for caption, control in (
+            ("Edition title", self.title), ("Format", self.fmt),
+            ("ISBN", self.isbn), ("Publisher", self.publisher),
+            ("Published", self.published), ("Pages", self.pages),
+            ("Language", self.language), ("Edition notes", self.notes),
+        ):
+            form.addRow(caption, control)
+        layout.addLayout(form)
+        layout.addWidget(label(
+            "Choosing a preferred edition changes catalog ISBN/page metadata, "
+            "not your reading history.", "muted"
+        ))
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save |
+            QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def values(self):
+        return {
+            "title": self.title.text(), "format": self.fmt.currentData(),
+            "isbn": self.isbn.text(), "publisher": self.publisher.text(),
+            "published_at": self.published.text(),
+            "pages": self.pages.value(), "language": self.language.text(),
+            "notes": self.notes.toPlainText(),
+        }
+
+
+class CatalogManagerDialog(QDialog):
+    """One work may have many source mirrors and catalog/format editions."""
+
+    def __init__(self, parent, library, work_id):
+        super().__init__(parent)
+        self.library = library
+        self.work_id = work_id
+        self.worker = None
+        self.setWindowTitle("Sources & editions")
+        self.resize(1000, 650)
+        self.setMinimumSize(750, 520)
+        work = library.get_work(work_id)
+        layout = QVBoxLayout(self)
+        layout.addWidget(label(work["title"], "headline"))
+        layout.addWidget(label(
+            "All linked sources and editions belong to this one work. "
+            "Reading history stays attached to the original entry.", "muted"
+        ))
+        self.tabs = QTabWidget()
+        layout.addWidget(self.tabs, stretch=1)
+        source_page = QWidget()
+        source_layout = QVBoxLayout(source_page)
+        self.sources = QTableWidget(0, 5)
+        self.sources.setHorizontalHeaderLabels([
+            "Site", "Label / URL", "Known chapters", "Last checked", "Health"
+        ])
+        self.sources.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.sources.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.sources.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.sources.verticalHeader().setVisible(False)
+        for col in (1,):
+            self.sources.horizontalHeader().setSectionResizeMode(
+                col, QHeaderView.ResizeMode.Stretch
+            )
+        for col in (0,2,3,4):
+            self.sources.horizontalHeader().setSectionResizeMode(
+                col, QHeaderView.ResizeMode.ResizeToContents
+            )
+        source_layout.addWidget(self.sources)
+        row = QHBoxLayout()
+        for caption, callback in (
+            ("+ Add source", self.add_source),
+            ("Make primary", self.make_primary),
+            ("Open link", self.open_source_link),
+            ("Check chapters", self.check_source),
+            ("Import saved HTML", self.import_saved_html),
+        ):
+            row.addWidget(button(caption, callback))
+        source_layout.addLayout(row)
+        utilities = QHBoxLayout()
+        utilities.addWidget(button(
+            "Set chapter count manually", self.set_manual_chapters
+        ))
+        utilities.addWidget(button(
+            "View check history", self.show_check_history
+        ))
+        utilities.addWidget(button(
+            "Remove selected source", self.remove_source, danger=True
+        ))
+        source_layout.addLayout(utilities)
+        source_layout.addWidget(label(
+            "Automatic checks work only for supported public story sites. "
+            "Cloudflare blocks are normal; use a browser-saved HTML page instead. "
+            "No continuous monitoring or Cloudflare bypass is used.", "muted"
+        ))
+        self.tabs.addTab(source_page, "Story sources")
+
+        edition_page = QWidget()
+        edition_layout = QVBoxLayout(edition_page)
+        self.editions = QTableWidget(0, 5)
+        self.editions.setHorizontalHeaderLabels([
+            "Format", "Edition", "ISBN", "Publisher", "Pages"
+        ])
+        self.editions.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.editions.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.editions.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.editions.verticalHeader().setVisible(False)
+        self.editions.horizontalHeader().setSectionResizeMode(
+            1, QHeaderView.ResizeMode.Stretch
+        )
+        for col in (0,2,3,4):
+            self.editions.horizontalHeader().setSectionResizeMode(
+                col, QHeaderView.ResizeMode.ResizeToContents
+            )
+        self.editions.itemDoubleClicked.connect(lambda _: self.edit_edition())
+        edition_layout.addWidget(self.editions)
+        actions = QHBoxLayout()
+        for caption, callback in (
+            ("+ Add edition", self.add_edition),
+            ("Edit edition", self.edit_edition),
+            ("Make preferred", self.prefer_edition),
+            ("Remove edition", self.remove_edition),
+        ):
+            actions.addWidget(button(caption, callback))
+        edition_layout.addLayout(actions)
+        edition_layout.addWidget(label(
+            "Selecting a preferred edition changes the main catalog ISBN and, "
+            "for page-tracked works, the known page count. It never resets progress.", "muted"
+        ))
+        self.tabs.addTab(edition_page, "Print / ebook / audiobook editions")
+
+        self.feedback = label("", "muted")
+        layout.addWidget(self.feedback)
+        close = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        close.rejected.connect(self.reject)
+        layout.addWidget(close)
+        self.refresh()
+
+    def refresh(self):
+        previous_source = self.selected_source_id()
+        sources = self.library.list_sources(self.work_id)
+        self.sources.setRowCount(len(sources))
+        target = 0
+        for i, source in enumerate(sources):
+            if source["id"] == previous_source:
+                target = i
+            site = ("★ " if source["is_primary"] else "") + source["site"]
+            values = (
+                site,
+                source["label"] + (" — " if source["label"] else "") + source["url"],
+                f"{source['published_units']:,}" if source["published_units"] else "—",
+                local_timestamp(source["last_checked_at"]) if source["last_checked_at"] else "Never",
+                "Error" if source["last_error"] else "OK",
+            )
+            for col, value in enumerate(values):
+                cell = QTableWidgetItem(value)
+                if col == 0:
+                    cell.setData(Qt.ItemDataRole.UserRole, source["id"])
+                self.sources.setItem(i,col,cell)
+            self.sources.setRowHeight(i,41)
+        if sources:
+            self.sources.selectRow(target)
+        self.refresh_editions()
+
+    def refresh_editions(self):
+        selected = self.selected_edition_id()
+        editions = self.library.list_editions(self.work_id)
+        self.editions.setRowCount(len(editions))
+        target = 0
+        for i, edition in enumerate(editions):
+            if edition["id"] == selected:
+                target=i
+            values = (
+                ("★ " if edition["is_preferred"] else "") + name(edition["format"]),
+                edition["title"] or "Untitled edition",
+                edition["isbn"] or "—", edition["publisher"] or "—",
+                f"{edition['pages']:,}" if edition["pages"] else "—",
+            )
+            for col, value in enumerate(values):
+                cell = QTableWidgetItem(value)
+                if col==0:
+                    cell.setData(Qt.ItemDataRole.UserRole, edition["id"])
+                self.editions.setItem(i,col,cell)
+            self.editions.setRowHeight(i,41)
+        if editions:
+            self.editions.selectRow(target)
+
+    def selected_source_id(self):
+        row = self.sources.currentRow()
+        cell = self.sources.item(row,0) if row>=0 else None
+        return cell.data(Qt.ItemDataRole.UserRole) if cell else None
+
+    def selected_edition_id(self):
+        row = self.editions.currentRow()
+        cell = self.editions.item(row,0) if row>=0 else None
+        return cell.data(Qt.ItemDataRole.UserRole) if cell else None
+
+    def add_source(self):
+        url, okay = QInputDialog.getText(
+            self, "Add source or crosspost", "Story URL (HTTPS):"
+        )
+        if not okay:
+            return
+        try:
+            self.library.add_source(self.work_id,url)
+            self.refresh()
+            self.feedback.setText("Source linked to this work.")
+        except Exception as exc:
+            fail(self,exc)
+
+    def make_primary(self):
+        key = self.selected_source_id()
+        if not key:
+            return
+        try:
+            self.library.set_primary_source(key)
+            self.refresh()
+            self.feedback.setText("Preferred source updated; reading history unchanged.")
+        except Exception as exc:
+            fail(self,exc)
+
+    def remove_source(self):
+        key=self.selected_source_id()
+        if not key:
+            return
+        if QMessageBox.question(
+            self, "Remove source link?",
+            "Remove this source link and its check history? "
+            "The book and all reading records remain."
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self.library.remove_source(key)
+            self.refresh()
+        except Exception as exc:
+            fail(self,exc)
+
+    def open_source_link(self):
+        key=self.selected_source_id()
+        source=self.library.get_source(key) if key else None
+        if source:
+            webbrowser.open(source["url"])
+
+    def set_manual_chapters(self):
+        key = self.selected_source_id()
+        source = self.library.get_source(key) if key else None
+        if not source:
+            return
+        count, okay = QInputDialog.getInt(
+            self, "Record published chapters",
+            "Published chapters for this source (entered manually):",
+            value=source["published_units"], min=0, max=10_000_000,
+        )
+        if not okay:
+            return
+        try:
+            outcome = self.library.record_source_check(
+                key, observed_units=count,
+                message="Manually recorded by the user; not checked online."
+            )
+            self.refresh()
+            self.feedback.setText(
+                f"Manually recorded {count:,} chapters ({outcome}). "
+                "Reading progress remains unchanged."
+            )
+        except Exception as exc:
+            fail(self, exc)
+
+    def show_check_history(self):
+        key = self.selected_source_id()
+        if not key:
+            return
+        entries = self.library.list_source_checks(key,limit=300)
+        if not entries:
+            QMessageBox.information(
+                self, "Check history", "No checks or manual chapter updates have been recorded."
+            )
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Source check history")
+        dialog.resize(850,480)
+        layout = QVBoxLayout(dialog)
+        table = QTableWidget(len(entries), 4)
+        table.setHorizontalHeaderLabels([
+            "Date", "Outcome", "Old → reported", "Details"
+        ])
+        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        table.horizontalHeader().setSectionResizeMode(
+            3, QHeaderView.ResizeMode.Stretch
+        )
+        for i, row in enumerate(entries):
+            for col, value in enumerate((
+                local_timestamp(row["checked_at"]),
+                row["outcome"].title(),
+                f"{row['old_units']} → {row['observed_units']}",
+                row["message"],
+            )):
+                table.setItem(i,col,QTableWidgetItem(value))
+        layout.addWidget(table)
+        close = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        close.rejected.connect(dialog.reject)
+        layout.addWidget(close)
+        dialog.exec()
+
+    def check_source(self):
+        key = self.selected_source_id()
+        source = self.library.get_source(key) if key else None
+        if not source:
+            return
+        if self.worker and self.worker.isRunning():
+            self.feedback.setText("A story check is already running.")
+            return
+        try:
+            source_from_url(source["url"])
+        except ValueError:
+            self.feedback.setText(
+                "Automatic checks aren't available for this provider. "
+                "You can still open the link and update chapters manually."
+            )
+            return
+        self.feedback.setText("Checking the public story page…")
+        worker = LookupThread(fetch_url_metadata, source["url"])
+        self.worker = worker
+        worker.found.connect(lambda response, sid=key: self.check_success(sid,response))
+        worker.failed.connect(lambda message, sid=key: self.check_failed(sid,message))
+        worker.start()
+
+    def check_success(self, source_id, response):
+        count = response.get("total_units") or 0
+        try:
+            outcome = self.library.record_source_check(
+                source_id, observed_units=count, message="Story metadata retrieved."
+            )
+            self.feedback.setText(
+                f"Check: {outcome}. Reported chapters: {count or 'unknown'}. "
+                "Your reading position was not changed."
+            )
+            self.refresh()
+        except Exception as exc:
+            fail(self,exc)
+
+    def check_failed(self, source_id, message):
+        self.library.record_source_check(source_id,error=message)
+        self.refresh()
+        self.feedback.setText(
+            "Source could not be checked. No book metadata was deleted. "
+            "Try Import saved HTML after opening the page in your browser."
+        )
+
+    def import_saved_html(self):
+        key = self.selected_source_id()
+        source = self.library.get_source(key) if key else None
+        if not source:
+            return
+        try:
+            source_from_url(source["url"])
+        except ValueError:
+            self.feedback.setText(
+                "Saved-page parsing is supported only for recognized story sites."
+            )
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select browser-saved story HTML", "",
+            "HTML documents (*.html *.htm)"
+        )
+        if not path:
+            return
+        try:
+            data = fetch_saved_page_metadata(path,source["url"])
+            count = data.get("total_units") or 0
+            outcome = self.library.record_source_check(
+                key, observed_units=count,
+                message="Parsed locally from browser-saved HTML."
+            )
+            self.refresh()
+            self.feedback.setText(
+                f"Saved HTML imported: {outcome}; "
+                f"known chapter count {count or 'unknown'}."
+            )
+        except Exception as exc:
+            fail(self,exc)
+
+    def add_edition(self):
+        dialog = EditionEditor(self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        try:
+            self.library.add_edition(self.work_id,dialog.values())
+            self.refresh()
+        except Exception as exc:
+            fail(self,exc)
+
+    def edit_edition(self):
+        ident=self.selected_edition_id()
+        edition=self.library.get_edition(ident) if ident else None
+        if not edition:
+            return
+        dialog=EditionEditor(self,edition=edition)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        try:
+            self.library.update_edition(ident,dialog.values())
+            self.refresh()
+        except Exception as exc:
+            fail(self,exc)
+
+    def prefer_edition(self):
+        ident=self.selected_edition_id()
+        if not ident:
+            return
+        try:
+            self.library.set_preferred_edition(ident)
+            self.refresh()
+            self.feedback.setText("Preferred edition updated.")
+        except Exception as exc:
+            fail(self,exc)
+
+    def remove_edition(self):
+        ident=self.selected_edition_id()
+        if not ident:
+            return
+        if QMessageBox.question(
+            self, "Remove edition?",
+            "Remove this edition record? The book and reading history remain."
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self.library.remove_edition(ident)
+            self.refresh()
+        except Exception as exc:
+            fail(self,exc)
+
+    def done(self, code):
+        if self.worker and self.worker.isRunning():
+            self.feedback.setText("Finish the current check before closing this dialog.")
+            return
+        super().done(code)
+
+
 class MainWindow(QMainWindow):
     def __init__(self, library):
         super().__init__()
@@ -1229,7 +1707,8 @@ class MainWindow(QMainWindow):
                              ("♧   Authors", 4), ("▤   Insights", 5),
                              ("◇   Library health", 6),
                              ("▦   Reading calendar", 7),
-                             ("✎   Notes && quotes", 8)):
+                             ("✎   Notes && quotes", 8),
+                             ("◉   Update center", 9)):
             nav = button(title, lambda _, i=index: self.navigate(i))
             nav.setObjectName("nav")
             nav.setCheckable(True)
@@ -1254,6 +1733,7 @@ class MainWindow(QMainWindow):
         self.create_health_page()
         self.create_calendar_page()
         self.create_journal_page()
+        self.create_updates_page()
         geometry = self.settings.value("window_geometry")
         if geometry:
             self.restoreGeometry(geometry)
@@ -1287,6 +1767,8 @@ class MainWindow(QMainWindow):
             ("Reading calendar", lambda: self.navigate(7), "Ctrl+Shift+C"),
             ("Notes and quotes", lambda: self.navigate(8), "Ctrl+Shift+N"),
             ("Log reading or listening time", self.log_reading_session, "Ctrl+Shift+T"),
+            ("Sources and editions", self.manage_work_catalog, "Ctrl+Shift+M"),
+            ("Update center", lambda: self.navigate(9), "Ctrl+Shift+U"),
         ):
             action = QAction(title, self)
             action.triggered.connect(callback)
@@ -1318,6 +1800,8 @@ class MainWindow(QMainWindow):
             self.refresh_calendar_page()
         elif index == 8:
             self.refresh_journal_page()
+        elif index == 9:
+            self.refresh_updates_page()
 
     def focus_library_search(self):
         self.navigate(0)
@@ -2468,6 +2952,155 @@ class MainWindow(QMainWindow):
         except OSError as exc:
             fail(self, exc)
 
+    def create_updates_page(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        row = QHBoxLayout()
+        row.addWidget(label("Update center", "headline"), stretch=1)
+        row.addWidget(button(
+            "Manage selected sources", self.manage_update_source, primary=True
+        ))
+        row.addWidget(button("Open work", self.open_update_work))
+        layout.addLayout(row)
+        layout.addWidget(label(
+            "Track known chapters and crossposted sources of serialized stories. "
+            "Checks are manually requested; BookTracker will not bypass Cloudflare.",
+            "muted"
+        ))
+        filters = QHBoxLayout()
+        self.update_search = QLineEdit()
+        self.update_search.setPlaceholderText("Search serial titles or authors…")
+        self.update_search.textChanged.connect(self.refresh_updates_page)
+        filters.addWidget(self.update_search, stretch=2)
+        self.update_filter = QComboBox()
+        self.update_filter.addItem("All tracked stories", "all")
+        self.update_filter.addItem("Unread known chapters", "unread")
+        self.update_filter.addItem("Failed checks", "errors")
+        self.update_filter.addItem("Never checked", "unchecked")
+        self.update_filter.currentIndexChanged.connect(self.refresh_updates_page)
+        filters.addWidget(self.update_filter)
+        layout.addLayout(filters)
+        self.update_counts = label("", "subheading")
+        layout.addWidget(self.update_counts)
+        self.update_table = QTableWidget(0, 6)
+        self.update_table.setHorizontalHeaderLabels([
+            "Work", "Unread chapters", "Read / published",
+            "Sources", "Last checked", "Status"
+        ])
+        self.update_table.setSelectionBehavior(
+            QTableWidget.SelectionBehavior.SelectRows
+        )
+        self.update_table.setSelectionMode(
+            QTableWidget.SelectionMode.SingleSelection
+        )
+        self.update_table.setEditTriggers(
+            QTableWidget.EditTrigger.NoEditTriggers
+        )
+        self.update_table.verticalHeader().setVisible(False)
+        self.update_table.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.Stretch
+        )
+        for col in range(1, 6):
+            self.update_table.horizontalHeader().setSectionResizeMode(
+                col, QHeaderView.ResizeMode.ResizeToContents
+            )
+        self.update_table.itemDoubleClicked.connect(
+            lambda _: self.manage_update_source()
+        )
+        layout.addWidget(self.update_table, stretch=1)
+        layout.addWidget(label(
+            "Open a story's Sources & Editions dialog to check a supported "
+            "website or import a browser-saved HTML page. "
+            "Higher published chapter counts update your known total but "
+            "never reset your reading position.", "muted"
+        ))
+        self.pages.addWidget(page)
+
+    def refresh_updates_page(self, *_args):
+        rows = self.library.source_update_summary()
+        search = self.update_search.text().strip().casefold()
+        mode = self.update_filter.currentData()
+        filtered = []
+        for entry in rows:
+            if search and not (
+                search in entry["title"].casefold()
+                or search in entry["author"].casefold()
+            ):
+                continue
+            if mode == "unread" and not entry["unread"]:
+                continue
+            if mode == "errors" and not entry["has_error"]:
+                continue
+            if mode == "unchecked" and entry["last_checked_at"]:
+                continue
+            filtered.append(entry)
+        count_unread = sum(1 for entry in rows if entry["unread"])
+        total = sum(entry["unread"] for entry in rows)
+        self.update_counts.setText(
+            f"{len(rows)} tracked serials   ·   {count_unread} with unread chapters"
+            f"   ·   {total:,} known unread chapters"
+        )
+        selected = self.selected_update_work_id()
+        self.update_table.setRowCount(len(filtered))
+        selected_row = -1
+        for i,entry in enumerate(filtered):
+            if selected == entry["work_id"]:
+                selected_row = i
+            values = (
+                entry["title"], str(entry["unread"]),
+                f"{entry['progress']} / {entry['known_chapters']}",
+                str(entry["source_count"]),
+                local_timestamp(entry["last_checked_at"])
+                if entry["last_checked_at"] else "Never",
+                "Check failed" if entry["has_error"] else name(entry["status"]),
+            )
+            for col,value in enumerate(values):
+                cell=QTableWidgetItem(value)
+                if col==0:
+                    cell.setData(Qt.ItemDataRole.UserRole,entry["work_id"])
+                self.update_table.setItem(i,col,cell)
+            self.update_table.setRowHeight(i,39)
+        if selected_row>=0:
+            self.update_table.selectRow(selected_row)
+
+    def selected_update_work_id(self):
+        row = self.update_table.currentRow()
+        cell = self.update_table.item(row,0) if row>=0 else None
+        return cell.data(Qt.ItemDataRole.UserRole) if cell else None
+
+    def manage_update_source(self):
+        key = self.selected_update_work_id()
+        if not key:
+            QMessageBox.information(self,"Choose story","Select a tracked story.")
+            return
+        self.manage_catalog_for(key)
+
+    def open_update_work(self):
+        key=self.selected_update_work_id()
+        if not key:
+            return
+        self.clear_library_filters()
+        self.navigate(0)
+        self.refresh_library(select_id=key)
+
+    def manage_catalog_for(self, work_id):
+        if not self.library.get_work(work_id):
+            return
+        dialog = CatalogManagerDialog(self,self.library,work_id)
+        dialog.exec()
+        self.refresh_all(work_id)
+        if self.pages.currentIndex()==9:
+            self.refresh_updates_page()
+
+    def manage_work_catalog(self):
+        work=self.selected_work()
+        if not work:
+            QMessageBox.information(
+                self,"Select book","Choose a work before editing its sources."
+            )
+            return
+        self.manage_catalog_for(work["id"])
+
     def create_series_page(self):
         page = QWidget()
         layout = QVBoxLayout(page)
@@ -2674,6 +3307,8 @@ class MainWindow(QMainWindow):
             self.refresh_calendar_page()
         if self.pages.currentIndex() == 8:
             self.refresh_journal_page()
+        if self.pages.currentIndex() == 9:
+            self.refresh_updates_page()
 
     def refresh_library(self, *_args, select_id=None):
         active_view = self.saved_view_combo.currentData()
@@ -2800,6 +3435,15 @@ class MainWindow(QMainWindow):
         self.details.addWidget(self.current_cover_label, alignment=Qt.AlignmentFlag.AlignHCenter)
         self.details.addWidget(label(book["title"], "subheading"))
         self.details.addWidget(label(f"{book['author'] or 'Unknown author'} · {name(book['kind'])}", "muted"))
+        linked = len(self.library.list_sources(work_id))
+        editions = len(self.library.list_editions(work_id))
+        if linked or editions:
+            self.details.addWidget(label(
+                f"{linked} source links  ·  {editions} editions", "muted"
+            ))
+        self.details.addWidget(button(
+            "Manage sources && editions", self.manage_work_catalog
+        ))
         self.details.addSpacing(8)
         for text in (
             f"Reading: {name(book['status'])}",

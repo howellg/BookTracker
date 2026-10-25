@@ -181,7 +181,8 @@ def export_file(library: Library, path: str | Path):
         root = ET.Element("booktracker", schema_version=str(backup["schema_version"]))
         ET.SubElement(root, "exported_at").text = backup["exported_at"]
         for name in ("works", "reading_runs", "progress_events", "shelves", "work_shelves",
-                     "reading_goals", "saved_views", "reading_sessions", "annotations"):
+                     "reading_goals", "saved_views", "reading_sessions", "annotations",
+                     "work_sources", "work_editions", "source_checks"):
             parent = ET.SubElement(root, name)
             for entry in backup[name]:
                 node = ET.SubElement(parent, "item")
@@ -218,7 +219,8 @@ def import_file(library: Library, path: str | Path, *, strategy="merge") -> int:
             raise ValueError("Not a BookTracker XML file.")
         data = {"format": "booktracker", "schema_version": int(root.get("schema_version", "0"))}
         for name in ("works", "reading_runs", "progress_events", "shelves", "work_shelves",
-                     "reading_goals", "saved_views", "reading_sessions", "annotations"):
+                     "reading_goals", "saved_views", "reading_sessions", "annotations",
+                     "work_sources", "work_editions", "source_checks"):
             if name in ("shelves", "work_shelves") and data["schema_version"] == 1:
                 continue
             if name == "reading_goals" and data["schema_version"] < 3:
@@ -226,6 +228,8 @@ def import_file(library: Library, path: str | Path, *, strategy="merge") -> int:
             if name == "saved_views" and data["schema_version"] < 4:
                 continue
             if name in ("reading_sessions", "annotations") and data["schema_version"] < 5:
+                continue
+            if name in ("work_sources", "work_editions", "source_checks") and data["schema_version"] < 6:
                 continue
             parent = root.find(name)
             if parent is None:
