@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 from collections import deque
 from pathlib import Path
 
@@ -26,7 +27,7 @@ THUMB_SIZE = (124, 178)
 def cover_url_for(book: dict) -> str:
     """Use a source cover URL, or a public ISBN cover as a fallback."""
     url = str(book.get("cover_url") or "")
-    if is_allowed_cover(url):
+    if is_allowed_cover(url) or is_local_cover(url):
         return url
     isbn = str(book.get("isbn") or "").strip()
     if isbn and isbn.replace("-", "").isalnum():
@@ -39,6 +40,13 @@ def is_allowed_cover(url: str) -> bool:
     return parsed.isValid() and parsed.scheme() == "https" and parsed.host() in TRUSTED_COVERS
 
 
+def is_local_cover(value: str) -> bool:
+    """Only app-managed fingerprinted PNG covers; no arbitrary file URLs."""
+    return isinstance(value, str) and bool(
+        re.fullmatch(r"booktracker-cover:[0-9a-f]{64}\.png", value)
+    )
+
+
 def _cache_file(folder: Path, url: str) -> Path:
     return folder / (hashlib.sha256(url.encode("utf-8")).hexdigest() + ".png")
 
@@ -48,9 +56,11 @@ class CoverCache(QObject):
 
     cover_ready = Signal(str)
 
-    def __init__(self, parent=None, *, folder: str | Path | None = None):
+    def __init__(self, parent=None, *, folder: str | Path | None = None,
+                 local_covers: str | Path | None = None):
         super().__init__(parent)
         self.folder = Path(folder) if folder else Path(user_cache_dir("BookTracker", "BookTracker")) / "covers"
+        self.local_covers = Path(local_covers) if local_covers else None
         self.network = QNetworkAccessManager(self)
         self.memory: dict[str, QPixmap] = {}
         self.waiting: deque[str] = deque()
@@ -59,6 +69,21 @@ class CoverCache(QObject):
         self.max_active = 3
 
     def get(self, url: str) -> QPixmap | None:
+        if is_local_cover(url):
+            if self.local_covers is None:
+                return None
+            target = self.local_covers / url.partition(":")[2]
+            if not target.is_file():
+                return None
+            if url in self.memory:
+                return self.memory[url]
+            pixmap = QPixmap(str(target))
+            if pixmap.isNull() or pixmap.width() > 6000 or pixmap.height() > 6000:
+                return None
+            thumb = pixmap.scaled(*THUMB_SIZE, Qt.AspectRatioMode.KeepAspectRatio,
+                                  Qt.TransformationMode.SmoothTransformation)
+            self.memory[url] = thumb
+            return thumb
         if not is_allowed_cover(url):
             return None
         if url in self.memory:

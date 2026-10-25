@@ -10,7 +10,7 @@ Built with Python, PySide6, and SQLite. No account, cloud subscription, or alway
 - Record **reading progress** in chapters, pages, or percent, with dated milestones and optional notes.
 - Distinguish **caught up with an ongoing story** from **completed the work**.
 - Track **rereads** as independent reading runs without losing previous history.
-- Search titles, authors, fandoms, series and tags; filter by type, reading status and favorites.
+- Search titles, authors, fandoms, series and tags; filter by type, reading status, shelves, exact series, exact tags and favorites.
 - Store personal star ratings (0.5 increments), notes, publication status, word counts, source URLs and more.
 - Import a **Goodreads library CSV** (from Goodreads → My Books → Import and export).
 - Search by **title/ISBN or author** from **+ Add work → Find online**. Author search returns many matching works, with checkboxes and an **Add N selected** action.
@@ -21,10 +21,30 @@ Built with Python, PySide6, and SQLite. No account, cloud subscription, or alway
 - Cache successful public book searches locally for 12 hours, reducing API requests and allowing previously searched titles to be viewed if the catalogs temporarily go offline.
 - Paste story URLs for *best-effort* metadata extraction from AO3, FanFiction.net, Royal Road, Scribble Hub, SpaceBattles, and Sufficient Velocity.
 - When a website blocks automated requests, **import HTML saved from your browser** to fill in title, author, and (for AO3) tags, chapters, word count and fandom, without uploading the file.
-- Export and import **JSON/XML full backups**, preserving the books, reading runs and progress events across computers.
+- Export and import **portable .btbackup files** containing the entire reading history, shelves, goals, and locally imported EPUB covers. JSON/XML remain available for structured-data portability without images.
 - Export and import **CSV catalogs** for spreadsheets (CSV does *not* preserve reading-history events).
-- Review basic library statistics and recent progress history.
+- Use a **Reading dashboard** with goals for books, chapters and pages, a Continue Reading list, and recent milestones. Double-click a current book to open it.
+- Browse a **Series explorer** with progress counts and open its books directly.
+- **Import local EPUB metadata** offline, individually or in bulk, including embedded covers, authors, series, ISBNs, language, description, and tags where available. Recognize supported fanfiction source links embedded in EPUB metadata.
+- Review library statistics, recent progress history, reading goals and series progress.
 - All data is saved locally in an SQLite database; portable JSON/XML import uses stable UUIDs for merge.
+
+## New in v0.5.0
+
+- **Reading dashboard:** A new dashboard shows the books you're currently reading, recent activity and yearly goals. Set targets for completed books, chapters read and pages logged, and choose a year. It only counts works with real, known finish dates and recorded reading milestones; imported completed books without dates are not counted toward a year.
+- **Series explorer:** A new sidebar screen groups recorded series and shows books completed and currently in progress. Double-click a series to filter the library.
+- **Series and tag filters:** Filter by an exact series or tag in addition to shelves, types, favorites and reading status. A Clear filters action restores your full library.
+- **EPUB metadata imports:** In **+ Add work → Book & source**, click **Read metadata from EPUB…**; or use **Import EPUB files** in the sidebar to scan multiple EPUB files in the background. You'll preview titles before adding them. All parsing happens locally; it does not upload book files or download full ebooks.
+- **EPUB cover support:** Valid embedded images are resized, fingerprinted and stored in an imported_covers folder next to your database. They display in the same cover gallery and details panel as online covers.
+- **Enrich existing books:** Importing an EPUB that matches a book already in your library fills *missing* public fields and cover art without altering your notes, ratings, favorites or reading status.
+- **Portable full backup:** Export a **.btbackup** file to preserve your full library and local imported EPUB covers across computers. JSON and XML still preserve metadata, history, shelves and goals, but not local image files.
+- **Goodreads import fix:** Goodreads Date Added is not mistaken for Date Started; known Date Read values are normalized to ISO dates. Missing dates remain unknown.
+- **CSV tag fix:** Comma-containing tags round-trip as JSON arrays inside CSV fields.
+- **Shelf management:** Rename or delete shelves (without deleting their books), or remove selected books from a shelf.
+- **Settings and shortcuts:** Window size and list/gallery selection survive app restarts. Keyboard shortcuts include Ctrl+N (add work), Ctrl+Shift+E (EPUB import) and Ctrl+B (database backup).
+- **Safety:** Replacing a library automatically takes a timestamped SQLite snapshot before the import starts. v1/v2 backup imports remain supported.
+
+**Upgrade:** Close the app, run git pull and uv sync, then start the app. BookTracker automatically adds the goal table to existing SQLite libraries. Export a backup before major upgrades, even though an automatic daily SQLite backup is available.
 
 ## New in v0.4.0
 
@@ -77,22 +97,28 @@ The database is stored in your OS's user-data directory (platformdirs), not insi
 6. **If a story lookup fails:** Open that story in Firefox, press **Ctrl+S**, and save as **Web Page, HTML Only**. Back in BookTracker, leave the story URL in place and click **Import saved page…** to select the saved HTML. This is especially helpful for AO3, where Cloudflare may reject direct requests. You can also enter the title manually.
 7. Select a work and click **Log progress**. Enter the **chapter/page reached**, not the number read in that session. Each change becomes a dated history event.
 8. Use **Mark caught up** for ongoing serials you've reached the latest chapter; **Mark completed** for a finished read; **Start a reread** to begin a new reading run.
-9. Use **Import library** / **Export library** in the sidebar to move reading history between computers.
+9. Use **Import library** / **Export library** in the sidebar to move reading history between computers. For EPUB cover images, choose a **.btbackup** portable full backup.
+10. Set annual reading goals and double-click current reads on the **Dashboard**. Browse series from the **Series** sidebar page.
 
 For existing Goodreads history, use **File → Import Goodreads CSV**. It imports Goodreads shelves and ratings; it does not create a detailed historical progress log that Goodreads never exported.
 
 ## Backup and portability
 
-| Format | Works/metadata | Rereads | Progress history |
+| Format | Works & history | Shelves & goals | Local EPUB covers |
 |---|---|---|---|
-| JSON | Yes | Yes | Yes |
-| XML | Yes | Yes | Yes |
-| CSV | Yes | No | No |
-| Goodreads CSV (import) | Yes | No | No |
+| **.btbackup** portable bundle | Yes | Yes | **Yes** |
+| JSON (schema v3) | Yes | Yes | No |
+| XML (schema v3) | Yes | Yes | No |
+| CSV catalog | Works/metadata only | No | No |
+| Goodreads CSV (import) | Imported work fields | No | No |
 
-For cross-computer migration, **prefer JSON**. The default import mode merges known works and ignores already-seen event IDs. You can instead choose **Replace library**, which completely replaces your existing data. Make a backup before replacing. This is **manual file-based portability**, not automatic two-way cloud synchronization.
+**Prefer .btbackup for moving to another computer.** It is a ZIP bundle containing versioned JSON and your locally imported EPUB cover images. All referenced embedded images are verified with SHA-256 checksums on import; invalid images are rejected. Files inside the archive are never extracted to arbitrary paths.
 
-The SQLite database is another valid local backup, but copy it while BookTracker is closed (SQLite uses WAL files during runtime).
+JSON/XML remain useful for structured-data interchange and preserve reading runs, progress history, shelves and yearly goals, but do **not** carry local EPUB images. The default import mode merges reading data and preserves newer local personal fields; Replace fully overwrites your library and automatically creates a pre-import database snapshot first.
+
+Automatic SQLite snapshots are kept beside your database in the backups folder (14 daily snapshots retained). **The SQLite snapshot itself does not include the separate imported_covers directory**. For a portable, complete transfer of locally imported covers, use a .btbackup file.
+
+This is manual file-based portability, **not** continuous multi-device synchronization.
 
 ## Site-specific limitations
 
@@ -117,6 +143,8 @@ Project layout:
 - booktracker/database.py — reading runs, shelves, bulk editing, corrections and versioned merges
 - booktracker/backups.py — daily SQLite snapshots and retention
 - booktracker/integrations.py — Open Library/story metadata, Goodreads CSV, JSON/XML/CSV
+- booktracker/epub_import.py — offline EPUB metadata and embedded cover parsing
+- booktracker/portable_backup.py — checksum-validated ZIP bundles with local covers
 - booktracker/book_search.py — title/author catalog search and caching
 - booktracker/covers.py — async disk-cached cover thumbnails
 - booktracker/metadata.py — optional public metadata enrichment
@@ -125,7 +153,7 @@ Project layout:
 
 ## Roadmap
 
-Automatic site-specific word/chapter metadata adapters, richer reading analytics and timelines, reading goals, easier bulk URL import, EPUB metadata parsing, multi-source/edition grouping, optional AudiobookAI integration, and optional privacy-preserving synchronization.
+Automatic site-specific word/chapter adapters, deeper monthly reading analytics, easier bulk URL importing, multi-source/edition grouping, a browser helper for fanfiction, AudiobookAI integration, optional multi-device synchronization, and installable desktop binaries.
 
 ## License
 

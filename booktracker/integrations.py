@@ -8,6 +8,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -169,14 +170,18 @@ def openlibrary_author_lookup(author: str) -> list[dict]:
 def export_file(library: Library, path: str | Path):
     path = Path(path)
     suffix = path.suffix.lower()
-    if suffix == ".json":
+    if suffix == ".btbackup":
+        from .portable_backup import export_portable
+        export_portable(library, path)
+    elif suffix == ".json":
         content = json.dumps(library.export_data(), indent=2, ensure_ascii=False)
         path.write_text(content + "\n", encoding="utf-8")
     elif suffix == ".xml":
         backup = library.export_data()
         root = ET.Element("booktracker", schema_version=str(backup["schema_version"]))
         ET.SubElement(root, "exported_at").text = backup["exported_at"]
-        for name in ("works", "reading_runs", "progress_events", "shelves", "work_shelves"):
+        for name in ("works", "reading_runs", "progress_events", "shelves", "work_shelves",
+                     "reading_goals"):
             parent = ET.SubElement(root, name)
             for entry in backup[name]:
                 node = ET.SubElement(parent, "item")
@@ -191,15 +196,19 @@ def export_file(library: Library, path: str | Path):
             writer.writeheader()
             for book in library.list_works():
                 item = dict(book)
-                item["tags"] = ", ".join(book["tags"])
+                # JSON arrays round-trip even when individual tags contain commas.
+                item["tags"] = json.dumps(book["tags"], ensure_ascii=False)
                 writer.writerow(item)
     else:
-        raise ValueError("Supported exports are .json, .xml, and .csv.")
+        raise ValueError("Supported exports are .btbackup, .json, .xml, and .csv.")
 
 
 def import_file(library: Library, path: str | Path, *, strategy="merge") -> int:
     path = Path(path)
     suffix = path.suffix.lower()
+    if suffix == ".btbackup":
+        from .portable_backup import import_portable
+        return import_portable(library, path, strategy=strategy)
     if suffix == ".json":
         return library.import_data(json.loads(path.read_text(encoding="utf-8-sig")),
                                    strategy=strategy)
@@ -208,8 +217,11 @@ def import_file(library: Library, path: str | Path, *, strategy="merge") -> int:
         if root.tag != "booktracker":
             raise ValueError("Not a BookTracker XML file.")
         data = {"format": "booktracker", "schema_version": int(root.get("schema_version", "0"))}
-        for name in ("works", "reading_runs", "progress_events", "shelves", "work_shelves"):
+        for name in ("works", "reading_runs", "progress_events", "shelves", "work_shelves",
+                     "reading_goals"):
             if name in ("shelves", "work_shelves") and data["schema_version"] == 1:
+                continue
+            if name == "reading_goals" and data["schema_version"] < 3:
                 continue
             parent = root.find(name)
             if parent is None:
@@ -234,13 +246,38 @@ def import_file(library: Library, path: str | Path, *, strategy="merge") -> int:
                 continue
             item = {k: row[k] for k in WORK_FIELDS if k in row}
             if "tags" in item:
-                item["tags"] = [t.strip() for t in item["tags"].split(",") if t.strip()]
+                raw_tags = item["tags"]
+                if raw_tags.lstrip().startswith("["):
+                    try:
+                        tags = json.loads(raw_tags)
+                    except json.JSONDecodeError as exc:
+                        raise ValueError("CSV contains malformed JSON tags.") from exc
+                    if not isinstance(tags, list):
+                        raise ValueError("CSV tags must be a JSON list.")
+                    item["tags"] = tags
+                else:
+                    # Compatibility with old flat BookTracker CSV files.
+                    item["tags"] = [t.strip() for t in raw_tags.split(",") if t.strip()]
             item["id"] = row.get("id") or __import__("uuid").uuid4().hex
             works.append(item)
         return library.import_data({"format": "booktracker", "schema_version": 1,
                                     "works": works, "reading_runs": [],
                                     "progress_events": []}, strategy=strategy)
-    raise ValueError("Supported imports are .json, .xml, and .csv.")
+    raise ValueError("Supported imports are .btbackup, .json, .xml, and .csv.")
+
+
+def _goodreads_date(value: str) -> str:
+    """Normalize standard Goodreads exported YYYY/MM/DD dates; no guessed dates."""
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    for pattern in ("%Y/%m/%d", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(raw, pattern).date().isoformat()
+        except ValueError:
+            pass
+    # Explicitly refuse to invent or silently reinterpret a partial date.
+    raise ValueError(f"Unrecognized Goodreads date: {raw!r}")
 
 
 def import_goodreads(library: Library, path: str | Path) -> tuple[int, int]:
@@ -268,8 +305,9 @@ def import_goodreads(library: Library, path: str | Path) -> tuple[int, int]:
                 "total_units": row.get("Number of Pages") or 0,
                 "rating": row.get("My Rating") if row.get("My Rating") not in ("", "0", None) else None,
                 "notes": row.get("My Review") or "",
-                "started_at": row.get("Date Added") or "",
-                "finished_at": row.get("Date Read") or "",
+                # Goodreads Date Added means date shelved, NOT date started.
+                "finished_at": _goodreads_date(row.get("Date Read") or "")
+                if status == "completed" else "",
                 "published_at": row.get("Original Publication Year") or ""}
         if data["source_id"]:
             data["source_url"] = "https://www.goodreads.com/book/show/" + data["source_id"]
@@ -279,7 +317,6 @@ def import_goodreads(library: Library, path: str | Path) -> tuple[int, int]:
         try:
             library.add_work(data)
             created += 1
-        except (ValueError, Exception) as exc:
-            # Skip malformed Goodreads rows, but surface a clear error elsewhere.
+        except Exception as exc:
             raise ValueError(f"Could not import {title!r}: {exc}") from exc
     return created, skipped

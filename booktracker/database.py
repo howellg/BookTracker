@@ -129,8 +129,17 @@ class Library:
             PRIMARY KEY(work_id,shelf_id)
         );
         CREATE INDEX IF NOT EXISTS idx_shelf_work ON work_shelves(shelf_id,work_id);
+        CREATE TABLE IF NOT EXISTS reading_goals (
+            year INTEGER PRIMARY KEY CHECK(year BETWEEN 1900 AND 2200),
+            books_target INTEGER NOT NULL DEFAULT 0 CHECK(books_target BETWEEN 0 AND 100000),
+            chapters_target INTEGER NOT NULL DEFAULT 0 CHECK(chapters_target BETWEEN 0 AND 10000000),
+            pages_target INTEGER NOT NULL DEFAULT 0 CHECK(pages_target BETWEEN 0 AND 100000000),
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_works_series ON works(series COLLATE NOCASE);
+        CREATE INDEX IF NOT EXISTS idx_works_finished_at ON works(finished_at);
         """)
-        self.db.execute("PRAGMA user_version=2")
+        self.db.execute("PRAGMA user_version=3")
         self.db.commit()
 
     @staticmethod
@@ -210,7 +219,7 @@ class Library:
         return work
 
     def list_works(self, search="", status="all", kind="all", favorites=False, sort="updated",
-                   shelf_id=None) -> list[dict]:
+                   shelf_id=None, series=None, tag=None) -> list[dict]:
         sql = """SELECT w.*, COALESCE((
             SELECT current_progress FROM reading_runs
             WHERE work_id=w.id ORDER BY started_at DESC, rowid DESC LIMIT 1
@@ -218,8 +227,12 @@ class Library:
         FROM works w WHERE 1=1"""
         args = []
         if search:
-            sql += " AND (w.title LIKE ? OR w.author LIKE ? OR w.fandom LIKE ? OR w.tags LIKE ? OR w.series LIKE ?)"
-            args.extend([f"%{search}%"] * 5)
+            # Treat SQL wildcard characters as literal search text.
+            escaped = search.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            sql += (" AND (w.title LIKE ? ESCAPE '\\' OR w.author LIKE ? ESCAPE '\\'"
+                    " OR w.fandom LIKE ? ESCAPE '\\' OR w.tags LIKE ? ESCAPE '\\'"
+                    " OR w.series LIKE ? ESCAPE '\\')")
+            args.extend([f"%{escaped}%"] * 5)
         if status != "all":
             sql += " AND w.status=?"
             args.append(status)
@@ -231,10 +244,19 @@ class Library:
         if shelf_id:
             sql += " AND EXISTS (SELECT 1 FROM work_shelves ws WHERE ws.work_id=w.id AND ws.shelf_id=?)"
             args.append(shelf_id)
+        if series:
+            sql += " AND w.series=? COLLATE NOCASE"
+            args.append(series)
+        if tag:
+            sql += (" AND EXISTS (SELECT 1 FROM json_each(w.tags) t "
+                    "WHERE t.value=? COLLATE NOCASE)")
+            args.append(tag)
         order = {
             "updated": "w.updated_at DESC", "title": "w.title COLLATE NOCASE",
             "author": "w.author COLLATE NOCASE", "added": "w.added_at DESC",
             "rating": "w.rating DESC NULLS LAST",
+            "finished": "w.finished_at DESC",
+            "series": "w.series COLLATE NOCASE, w.title COLLATE NOCASE",
         }
         sql += " ORDER BY " + order.get(sort, order["updated"])
         rows = [dict(r) for r in self.db.execute(sql, args)]
@@ -381,7 +403,7 @@ class Library:
 
     def bulk_add_works(
         self, books: list[dict], *, status: str = "completed",
-        update_existing_status: bool = False,
+        update_existing_status: bool = False, enrich_duplicates: bool = False,
     ) -> dict:
         """Atomically import books, matching across catalog sources and editions.
 
@@ -397,7 +419,7 @@ class Library:
         if len(books) > 500:
             raise ValueError("Please import no more than 500 works at once.")
 
-        added, updated, duplicates = [], [], []
+        added, updated, enriched, duplicates = [], [], [], []
         with self.transaction():
             existing = list(self.db.execute(
                 "SELECT id,title,author,status,isbn,source_site,source_id,source_url FROM works"
@@ -434,16 +456,52 @@ class Library:
                     or (by_url.get(url) if url else None)
                 )
                 if existing_id:
+                    changes = {}
+                    changed_status = False
                     if (
                         update_existing_status and status == "completed"
                         and statuses.get(existing_id) in ("plan_to_read", "dropped")
                     ):
-                        self.db.execute(
-                            "UPDATE works SET status='completed',updated_at=? WHERE id=?",
-                            (now(), existing_id),
-                        )
+                        changes["status"] = "completed"
+                        changed_status = True
                         statuses[existing_id] = "completed"
-                        updated.append(existing_id)
+                    if enrich_duplicates:
+                        current = self.get_work(existing_id)
+                        public = (
+                            "author", "description", "isbn", "fandom", "series",
+                            "language", "cover_url", "total_units", "word_count",
+                            "published_at",
+                        )
+                        for field in public:
+                            incoming = fields.get(field)
+                            if not current.get(field) and incoming not in (None, "", 0):
+                                changes[field] = incoming
+                        if (
+                            current.get("publication_status") == "unknown"
+                            and fields.get("publication_status") not in (None, "", "unknown")
+                        ):
+                            changes["publication_status"] = fields["publication_status"]
+                        if not current["tags"] and fields.get("tags") not in (None, "[]"):
+                            changes["tags"] = fields["tags"]
+                        if (
+                            not current.get("source_site") and
+                            fields.get("source_site") and fields.get("source_id")
+                        ):
+                            changes["source_site"] = fields["source_site"]
+                            changes["source_id"] = fields["source_id"]
+                            if fields.get("source_url"):
+                                changes["source_url"] = fields["source_url"]
+                    if changes:
+                        changes["updated_at"] = now()
+                        assignments = ", ".join(f"{field}=?" for field in changes)
+                        self.db.execute(
+                            f"UPDATE works SET {assignments} WHERE id=?",
+                            (*changes.values(), existing_id),
+                        )
+                        if changed_status:
+                            updated.append(existing_id)
+                        if len(changes) > (2 if changed_status else 1):
+                            enriched.append(existing_id)
                     else:
                         duplicates.append(fields["title"])
                     continue
@@ -469,9 +527,9 @@ class Library:
 
         return {
             "added": len(added), "updated": len(updated),
-            "skipped": len(duplicates),
+            "enriched": len(enriched), "skipped": len(duplicates),
             "added_ids": added, "updated_ids": updated,
-            "skipped_titles": duplicates,
+            "enriched_ids": enriched, "skipped_titles": duplicates,
         }
 
     def list_shelves(self):
@@ -585,23 +643,117 @@ class Library:
                 raise ValueError("Database backup failed integrity check.")
         return dest
 
+    def series_summary(self):
+        """Series with counts, including historical completions without dates."""
+        rows = self.db.execute(
+            """SELECT series,COUNT(*) AS total,
+            SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) AS completed,
+            SUM(CASE WHEN status IN ('reading','caught_up') THEN 1 ELSE 0 END) AS active
+            FROM works WHERE TRIM(series) != ''
+            GROUP BY series COLLATE NOCASE ORDER BY series COLLATE NOCASE"""
+        )
+        return [dict(r) for r in rows]
+
+    def tag_summary(self):
+        """Tags remain user-controlled; calculate exact case-insensitive counts."""
+        counts = {}
+        for row in self.db.execute("SELECT tags FROM works"):
+            for tag in json.loads(row["tags"]):
+                cleaned = str(tag).strip()
+                if cleaned:
+                    key = cleaned.casefold()
+                    if key in counts:
+                        counts[key][1] += 1
+                    else:
+                        counts[key] = [cleaned, 1]
+        return [
+            {"tag": tag, "total": n}
+            for tag, n in sorted(counts.values(), key=lambda pair: pair[0].casefold())
+        ]
+
+    def save_goal(self, year: int, *, books: int = 0, chapters: int = 0, pages: int = 0):
+        year = int(year)
+        targets = [int(books), int(chapters), int(pages)]
+        if not 1900 <= year <= 2200 or any(n < 0 for n in targets):
+            raise ValueError("Goals require a valid year and nonnegative targets.")
+        if targets[0] > 100000 or targets[1] > 10000000 or targets[2] > 100000000:
+            raise ValueError("Goal exceeds the supported limit.")
+        with self.transaction():
+            self.db.execute(
+                """INSERT INTO reading_goals VALUES(?,?,?,?,?)
+                ON CONFLICT(year) DO UPDATE SET
+                books_target=excluded.books_target,
+                chapters_target=excluded.chapters_target,
+                pages_target=excluded.pages_target,
+                updated_at=excluded.updated_at""",
+                (year, *targets, now()),
+            )
+
+    def get_goal(self, year: int):
+        year = int(year)
+        row = self.db.execute("SELECT * FROM reading_goals WHERE year=?", (year,)).fetchone()
+        return dict(row) if row else {
+            "year": year, "books_target": 0, "chapters_target": 0,
+            "pages_target": 0, "updated_at": ""
+        }
+
+    def goal_progress(self, year: int):
+        """Count recorded activity only; unknown historical dates are excluded."""
+        year = int(year)
+        label = str(year)
+        books = self.db.execute(
+            """SELECT COUNT(*) FROM works w
+            WHERE (w.finished_at != '' AND SUBSTR(w.finished_at,1,4)=?)
+            OR EXISTS (
+                SELECT 1 FROM reading_runs r
+                WHERE r.work_id=w.id AND r.finished_at != ''
+                AND SUBSTR(r.finished_at,1,4)=?
+            )""", (label, label),
+        ).fetchone()[0]
+        totals = self.db.execute(
+            """SELECT w.progress_unit AS unit,
+                SUM(CASE WHEN e.new_progress > e.old_progress
+                    THEN e.new_progress - e.old_progress ELSE 0 END) AS amount
+            FROM progress_events e JOIN works w ON w.id=e.work_id
+            WHERE SUBSTR(e.recorded_at,1,4)=?
+            GROUP BY w.progress_unit""", (label,)
+        )
+        amounts = {r["unit"]: r["amount"] or 0 for r in totals}
+        return {
+            "year": year, "books": books,
+            "chapters": amounts.get("chapters", 0),
+            "pages": amounts.get("pages", 0),
+        }
+
+    def recent_activity(self, limit=10):
+        return [dict(row) for row in self.db.execute(
+            """SELECT e.recorded_at,e.new_progress,e.old_progress,
+            e.note,w.id AS work_id,w.title,w.progress_unit FROM progress_events e
+            JOIN works w ON w.id=e.work_id
+            ORDER BY e.recorded_at DESC,e.rowid DESC LIMIT ?""",
+            (max(1, min(100, int(limit))),)
+        )]
+
     def export_data(self):
-        return {"format": "booktracker", "schema_version": 2, "exported_at": now(),
+        return {"format": "booktracker", "schema_version": 3, "exported_at": now(),
                 "works": [dict(row) for row in self.db.execute("SELECT * FROM works")],
                 "reading_runs": [dict(row) for row in self.db.execute("SELECT * FROM reading_runs")],
                 "progress_events": [dict(row) for row in self.db.execute("SELECT * FROM progress_events")],
                 "shelves": [dict(row) for row in self.db.execute("SELECT * FROM shelves")],
-                "work_shelves": [dict(row) for row in self.db.execute("SELECT * FROM work_shelves")]}
+                "work_shelves": [dict(row) for row in self.db.execute("SELECT * FROM work_shelves")],
+                "reading_goals": [dict(row) for row in self.db.execute("SELECT * FROM reading_goals")]}
 
     def import_data(self, data, *, strategy="merge"):
         """Transactional import; duplicate event IDs are skipped when merging."""
-        if data.get("format") != "booktracker" or data.get("schema_version") not in (1, 2):
+        if data.get("format") != "booktracker" or data.get("schema_version") not in (1, 2, 3):
             raise ValueError("Unsupported BookTracker backup format or schema version.")
-        if data["schema_version"] == 2 and (
+        if data["schema_version"] >= 2 and (
             not isinstance(data.get("shelves"), list)
             or not isinstance(data.get("work_shelves"), list)
         ):
             raise ValueError("Backup is missing shelf information.")
+        if data["schema_version"] == 3 and not isinstance(data.get("reading_goals"), list):
+            raise ValueError("Backup is missing reading goals.")
         for key in ("works", "reading_runs", "progress_events"):
             if not isinstance(data.get(key), list):
                 raise ValueError(f"Backup is missing {key}.")
@@ -613,6 +765,7 @@ class Library:
             if strategy == "replace":
                 self.db.execute("DELETE FROM works")
                 self.db.execute("DELETE FROM shelves")
+                self.db.execute("DELETE FROM reading_goals")
             for item in data["works"]:
                 if not isinstance(item, dict) or not item.get("id"):
                     raise ValueError("Invalid work in backup.")
@@ -691,5 +844,23 @@ class Library:
                     raise ValueError("Orphaned shelf assignment.")
                 self.db.execute(
                     "INSERT OR IGNORE INTO work_shelves VALUES(?,?)", (work_id, shelf_id)
+                )
+            for goal in data.get("reading_goals", []):
+                try:
+                    year = int(goal["year"])
+                    books = int(goal["books_target"])
+                    chapters = int(goal["chapters_target"])
+                    pages = int(goal["pages_target"])
+                except (KeyError, ValueError, TypeError) as exc:
+                    raise ValueError("Malformed reading goal in backup.") from exc
+                if not 1900 <= year <= 2200 or min(books, chapters, pages) < 0:
+                    raise ValueError("Invalid goal targets in backup.")
+                if books > 100000 or chapters > 10000000 or pages > 100000000:
+                    raise ValueError("Goal targets exceed limits.")
+                self.db.execute(
+                    """INSERT OR IGNORE INTO reading_goals
+                    (year,books_target,chapters_target,pages_target,updated_at)
+                    VALUES(?,?,?,?,?)""",
+                    (year, books, chapters, pages, goal.get("updated_at") or now()),
                 )
         return count
