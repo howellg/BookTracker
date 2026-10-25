@@ -59,6 +59,7 @@ EDITABLE = {
     "serial_follows": {"notify","seen_units"},
     "saved_views": {"filters_json"},
     "epub_positions": {"section_index","section_href","scroll_ratio"},
+    "epub_bookmarks": {"label"},
 }
 IGNORE = {"updated_at","created_at","added_at","followed_at","checked_at"}
 
@@ -497,6 +498,8 @@ def _row_update(library, change, mapping, data):
             row.get("section_index"),row.get("section_href"),row.get("scroll_ratio")
         )
         value={"section_index":idx,"section_href":href,"scroll_ratio":ratio}[field]
+    elif table=="epub_bookmarks":
+        value=library._epub_bookmark_label(change.remote)
     elif table=="saved_views":
         library.validate_view_filters(json.loads(change.remote))
         value=change.remote

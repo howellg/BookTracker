@@ -8,11 +8,25 @@ from __future__ import annotations
 from pathlib import Path
 from threading import Event
 
-from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QSettings, Qt, QThread, QTimer, QUrl, Signal
-from PySide6.QtGui import QAction, QImageReader, QTextDocument
+from PySide6.QtCore import (
+    QBuffer,
+    QByteArray,
+    QIODevice,
+    QSaveFile,
+    QSettings,
+    Qt,
+    QThread,
+    QTimer,
+    QUrl,
+    Signal,
+)
+from PySide6.QtGui import QAction, QFont, QImageReader, QTextBlockFormat, QTextCursor, QTextDocument
 from PySide6.QtWidgets import (
+    QApplication,
     QComboBox,
     QDialog,
+    QFileDialog,
+    QGridLayout,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -20,8 +34,10 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QSplitter,
+    QTabWidget,
     QTextBrowser,
     QVBoxLayout,
     QWidget,
@@ -88,25 +104,61 @@ class EpubReader(QDialog):
         row.addWidget(self.heading,stretch=1)
         self._font_size=max(12,min(36,int(self.settings.value("reader_font_size",18))))
         self.theme=QComboBox()
-        for name in ("Dark","Sepia","Light"):
+        for name in ("Dark","Sepia","Light","High contrast"):
             self.theme.addItem(name)
         saved=self.settings.value("reader_theme","Dark")
-        self.theme.setCurrentText(saved if saved in ("Dark","Sepia","Light") else "Dark")
+        self.theme.setCurrentText(saved if saved in ("Dark","Sepia","Light","High contrast") else "Dark")
         self.theme.currentIndexChanged.connect(self.apply_theme)
         row.addWidget(QLabel("Theme"))
         row.addWidget(self.theme)
         row.addWidget(_action_button("A−",lambda:self.zoom(-1)))
         row.addWidget(_action_button("A+",lambda:self.zoom(1)))
         root.addLayout(row)
+        preferences=QHBoxLayout()
+        self.font_family=QComboBox()
+        self.font_family.addItems(["Serif","Sans","Mono"])
+        self.font_family.setCurrentText(self._reader_preference("reader_family","Serif",
+                                                            ("Serif","Sans","Mono")))
+        self.font_family.currentTextChanged.connect(self.apply_theme)
+        preferences.addWidget(QLabel("Font"))
+        preferences.addWidget(self.font_family)
+        self.line_spacing=QComboBox()
+        self.line_spacing.addItems(["Compact","Normal","Relaxed"])
+        self.line_spacing.setCurrentText(self._reader_preference(
+            "reader_line_spacing","Normal",("Compact","Normal","Relaxed")
+        ))
+        self.line_spacing.currentTextChanged.connect(self.apply_theme)
+        preferences.addWidget(QLabel("Spacing"))
+        preferences.addWidget(self.line_spacing)
+        self.page_margin=QComboBox()
+        self.page_margin.addItems(["Narrow","Comfortable","Wide"])
+        self.page_margin.setCurrentText(self._reader_preference(
+            "reader_margin","Comfortable",("Narrow","Comfortable","Wide")
+        ))
+        self.page_margin.currentTextChanged.connect(self.apply_theme)
+        preferences.addWidget(QLabel("Margins"))
+        preferences.addWidget(self.page_margin)
+        self.focus_button=QPushButton("Focus reading")
+        self.focus_button.setCheckable(True)
+        self.focus_button.toggled.connect(self.set_focus_mode)
+        preferences.addWidget(self.focus_button)
+        preferences.addStretch()
+        root.addLayout(preferences)
+
         self.splitter=QSplitter(Qt.Orientation.Horizontal)
         sidebar=QWidget()
         side=QVBoxLayout(sidebar)
         side.setContentsMargins(0,0,0,0)
-        side.addWidget(QLabel("Contents"))
+        self.sidebar_tabs=QTabWidget()
+        side.addWidget(self.sidebar_tabs)
+
+        toc_page=QWidget()
+        toc_layout=QVBoxLayout(toc_page)
+        toc_layout.setContentsMargins(5,8,5,5)
         self.toc_filter=QLineEdit()
         self.toc_filter.setPlaceholderText("Filter contents by title…")
         self.toc_filter.textChanged.connect(self.filter_contents)
-        side.addWidget(self.toc_filter)
+        toc_layout.addWidget(self.toc_filter)
         self.sections=QListWidget()
         self.sections.setMinimumWidth(155)
         self.sections.setTextElideMode(Qt.TextElideMode.ElideRight)
@@ -116,18 +168,47 @@ class EpubReader(QDialog):
             chapter.setData(Qt.ItemDataRole.UserRole,i)
             self.sections.addItem(chapter)
         self.sections.currentRowChanged.connect(self.go_section)
-        side.addWidget(self.sections,stretch=2)
-        side.addWidget(QLabel("Book-wide search results"))
+        toc_layout.addWidget(self.sections,stretch=1)
+        self.sidebar_tabs.addTab(toc_page,"Contents")
+
+        matches_page=QWidget()
+        matches_layout=QVBoxLayout(matches_page)
+        matches_layout.setContentsMargins(5,8,5,5)
+        matches_layout.addWidget(QLabel("Double-click a result to jump to its passage."))
         self.book_matches=QListWidget()
         self.book_matches.setWordWrap(True)
-        self.book_matches.setMinimumHeight(95)
         self.book_matches.itemDoubleClicked.connect(self.jump_to_search_hit)
-        side.addWidget(self.book_matches,stretch=1)
-        side.addWidget(QLabel("Bookmarks"))
+        matches_layout.addWidget(self.book_matches,stretch=1)
+        self.sidebar_tabs.addTab(matches_page,"Search")
+
+        saved_page=QWidget()
+        saved_layout=QVBoxLayout(saved_page)
+        saved_layout.setContentsMargins(5,8,5,5)
+        saved_layout.addWidget(QLabel("EPUB location bookmarks"))
         self.marks=QListWidget()
         self.marks.itemDoubleClicked.connect(self.goto_bookmark)
-        side.addWidget(self.marks,stretch=1)
-        side.addWidget(_action_button("Remove bookmark",self.remove_bookmark))
+        saved_layout.addWidget(self.marks,stretch=1)
+        mark_actions=QHBoxLayout()
+        mark_actions.addWidget(_action_button("Rename",self.rename_bookmark))
+        mark_actions.addWidget(_action_button("Remove",self.remove_bookmark))
+        saved_layout.addLayout(mark_actions)
+        saved_layout.addWidget(QLabel("Notes and quotes for this work"))
+        self.note_filter=QLineEdit()
+        self.note_filter.setPlaceholderText("Search saved notes…")
+        self.note_filter.textChanged.connect(self.refresh_notes)
+        saved_layout.addWidget(self.note_filter)
+        self.notes_list=QListWidget()
+        self.notes_list.setWordWrap(True)
+        self.notes_list.itemDoubleClicked.connect(self.edit_saved_note)
+        saved_layout.addWidget(self.notes_list,stretch=2)
+        note_actions=QGridLayout()
+        for index,(title,callback) in enumerate((
+            ("Edit",self.edit_saved_note),("Copy",self.copy_saved_note),
+            ("Delete",self.delete_saved_note),("Export",self.export_work_notes)
+        )):
+            note_actions.addWidget(_action_button(title,callback),index//2,index%2)
+        saved_layout.addLayout(note_actions)
+        self.sidebar_tabs.addTab(saved_page,"Saved")
         self.splitter.addWidget(sidebar)
         reading=QWidget()
         reading_layout=QVBoxLayout(reading)
@@ -138,12 +219,15 @@ class EpubReader(QDialog):
         self.search.returnPressed.connect(self.find_next)
         find_row.addWidget(self.search,stretch=1)
         find_row.addWidget(_action_button("Find next",self.find_next))
+        reading_layout.addLayout(find_row)
+        search_actions=QHBoxLayout()
         self.book_search_button=_action_button("Find in book",self.find_in_book)
-        find_row.addWidget(self.book_search_button)
+        search_actions.addWidget(self.book_search_button)
         self.cancel_search_button=_action_button("Cancel",self.cancel_book_search)
         self.cancel_search_button.setEnabled(False)
-        find_row.addWidget(self.cancel_search_button)
-        reading_layout.addLayout(find_row)
+        search_actions.addWidget(self.cancel_search_button)
+        search_actions.addStretch()
+        reading_layout.addLayout(search_actions)
         self.viewer=QTextBrowser()
         self.viewer.setOpenLinks(False)
         self.viewer.setOpenExternalLinks(False)
@@ -152,6 +236,7 @@ class EpubReader(QDialog):
         self.viewer.setUndoRedoEnabled(False)
         self.viewer.anchorClicked.connect(lambda _url:None)
         self.viewer.verticalScrollBar().valueChanged.connect(self.schedule_save)
+        self.viewer.verticalScrollBar().valueChanged.connect(self.update_section_meter)
         reading_layout.addWidget(self.viewer,stretch=1)
         controls=QHBoxLayout()
         controls.addWidget(_action_button("◀ Previous",lambda:self.step(-1)))
@@ -160,13 +245,23 @@ class EpubReader(QDialog):
         controls.addWidget(self.counter,stretch=1)
         controls.addWidget(_action_button("Next ▶",lambda:self.step(1)))
         reading_layout.addLayout(controls)
-        buttons=QHBoxLayout()
-        buttons.addWidget(_action_button("Bookmark",self.add_bookmark))
-        buttons.addWidget(_action_button("Save note / selected quote",self.save_note))
-        buttons.addWidget(_action_button("Log reading progress…",self.log_progress))
+        self.section_meter=QProgressBar()
+        self.section_meter.setRange(0,100)
+        self.section_meter.setValue(0)
+        self.section_meter.setFormat("Scroll position in this section: %p% (approx.)")
+        self.section_meter.setToolTip(
+            "Approximate scroll position, NOT a reading milestone or completion percentage."
+        )
+        reading_layout.addWidget(self.section_meter)
+        buttons=QGridLayout()
+        buttons.addWidget(_action_button("Bookmark",self.add_bookmark),0,0)
+        buttons.addWidget(_action_button("Save note / selected quote",self.save_note),0,1)
+        buttons.addWidget(_action_button("Copy selection",self.copy_selection),1,0)
+        buttons.addWidget(_action_button("Log reading progress…",self.log_progress),1,1)
         reading_layout.addLayout(buttons)
         self.splitter.addWidget(reading)
-        self.splitter.setSizes([220,910])
+        self.splitter.setSizes([265,865])
+        self.focus_button.setChecked(self.settings.value("reader_focus",False,type=bool))
         root.addWidget(self.splitter,stretch=1)
         self.message=QLabel(
             "Reading position saves automatically. Opening and scrolling do not log "
@@ -193,6 +288,7 @@ class EpubReader(QDialog):
             ratio=last["scroll_ratio"]
         self.load_section(start,ratio)
         self.refresh_bookmarks()
+        self.refresh_notes()
         # Avoid QDialog keyboard defaults reinterpreting arrow keys as accept.
         for key,call in (("Alt+Left",lambda:self.step(-1)),
                          ("Alt+Right",lambda:self.step(1)),
@@ -205,20 +301,63 @@ class EpubReader(QDialog):
             action.triggered.connect(call)
             self.addAction(action)
 
+    def _reader_preference(self,key,default,choices):
+        value=str(self.settings.value(key,default))
+        return value if value in choices else default
+
     def apply_theme(self,*_args):
+        """Apply Qt rich-text formatting, not only widget stylesheet fonts."""
         name=self.theme.currentText()
         palettes={
             "Dark":("#141a24","#e5ebf6","#a6b5c8"),
             "Sepia":("#f2e5cc","#493a2d","#72553a"),
             "Light":("#ffffff","#212936","#546375"),
+            "High contrast":("#000000","#ffffff","#ededed"),
         }
         background,foreground,subtle=palettes[name]
+        ratio=self.scroll_ratio()
         self.viewer.setStyleSheet(
             f"QTextBrowser {{ background:{background}; color:{foreground};"
-            f" border:1px solid {subtle};padding:22px;"
-            f"font-size:{self._font_size}px;line-height:1.5; }}"
+            f" border:1px solid {subtle}; }}"
         )
+        doc=self.viewer.document()
+        font=QFont({
+            "Serif":"DejaVu Serif","Sans":"DejaVu Sans",
+            "Mono":"DejaVu Sans Mono"
+        }[self.font_family.currentText()])
+        font.setPixelSize(self._font_size)
+        doc.setDefaultFont(font)
+        margin={"Narrow":10,"Comfortable":28,"Wide":55}[self.page_margin.currentText()]
+        doc.setDocumentMargin(margin)
+        spacing={"Compact":120,"Normal":150,"Relaxed":185}[self.line_spacing.currentText()]
+        if not doc.isEmpty():
+            cursor=QTextCursor(doc)
+            cursor.select(QTextCursor.SelectionType.Document)
+            fmt=QTextBlockFormat()
+            fmt.setLineHeight(spacing,QTextBlockFormat.LineHeightTypes.ProportionalHeight.value)
+            cursor.mergeBlockFormat(fmt)
         self.settings.setValue("reader_theme",name)
+        self.settings.setValue("reader_family",self.font_family.currentText())
+        self.settings.setValue("reader_line_spacing",self.line_spacing.currentText())
+        self.settings.setValue("reader_margin",self.page_margin.currentText())
+        if not self._restoring:
+            QTimer.singleShot(0,lambda:self.restore_scroll(ratio))
+
+    def set_focus_mode(self,enabled):
+        self.splitter.widget(0).setVisible(not enabled)
+        self.focus_button.setText("Show sidebar" if enabled else "Focus reading")
+        self.settings.setValue("reader_focus",bool(enabled))
+
+    def update_section_meter(self,*_args):
+        self.section_meter.setValue(round(self.scroll_ratio()/100))
+
+    def copy_selection(self):
+        value=self.viewer.textCursor().selectedText().replace("\u2029","\n").strip()
+        if not value:
+            self.message.setText("Select a passage in the reader to copy it.")
+            return
+        QApplication.clipboard().setText(value)
+        self.message.setText("Copied selected passage to clipboard.")
 
     def zoom(self,delta):
         self._font_size=max(12,min(36,self._font_size+delta))
@@ -296,6 +435,7 @@ class EpubReader(QDialog):
             except (ValueError,OSError,RuntimeError):
                 continue
         self.viewer.setHtml(content["html"])
+        self.apply_theme()
         self.counter.setText(
             f"Spine section {index+1} / {len(self.book)} · {content['title']}"
         )
@@ -306,6 +446,7 @@ class EpubReader(QDialog):
         self._restoring=False
         QTimer.singleShot(0,lambda:self.restore_scroll(ratio))
         QTimer.singleShot(40,self.schedule_save)
+        QTimer.singleShot(50,self.update_section_meter)
 
     def go_section(self,index):
         if 0<=index<len(self.book) and index!=self.index:
@@ -391,6 +532,7 @@ class EpubReader(QDialog):
         if report.skipped_sections:
             detail+=f" · {report.skipped_sections} unreadable sections skipped"
         self.message.setText(f"{state}: {detail}. Double-click a result to jump.")
+        self.sidebar_tabs.setCurrentIndex(1)
 
     def book_search_failed(self, error):
         if not self._closed:
@@ -427,6 +569,8 @@ class EpubReader(QDialog):
         QTimer.singleShot(55,show_match)
 
     def refresh_bookmarks(self):
+        old=self.marks.currentItem()
+        selected=old.data(Qt.ItemDataRole.UserRole)["id"] if old else None
         self.marks.clear()
         for row in self.library.list_epub_bookmarks(self.file_id):
             item=QListWidgetItem(
@@ -434,6 +578,26 @@ class EpubReader(QDialog):
             )
             item.setData(Qt.ItemDataRole.UserRole,row)
             self.marks.addItem(item)
+            if row["id"]==selected:
+                self.marks.setCurrentItem(item)
+
+    def rename_bookmark(self):
+        item=self.marks.currentItem()
+        if not item:
+            self.message.setText("Select a saved location bookmark to rename.")
+            return
+        row=item.data(Qt.ItemDataRole.UserRole)
+        label,okay=QInputDialog.getText(
+            self,"Rename EPUB bookmark","Label:",text=row["label"]
+        )
+        if not okay:
+            return
+        try:
+            self.library.rename_epub_bookmark(row["id"],label)
+            self.refresh_bookmarks()
+            self.message.setText("Bookmark renamed without changing its position.")
+        except ValueError as exc:
+            QMessageBox.warning(self,"Rename bookmark",str(exc))
 
     def add_bookmark(self):
         default=self.book._titles.get(self.index) or f"Section {self.index+1}"
@@ -448,6 +612,7 @@ class EpubReader(QDialog):
                 self.scroll_ratio(),title
             )
             self.refresh_bookmarks()
+            self.sidebar_tabs.setCurrentIndex(2)
         except ValueError as exc:
             QMessageBox.warning(self,"Bookmark",str(exc))
 
@@ -496,9 +661,120 @@ class EpubReader(QDialog):
                 body=content[:10000],location=self.index+1,
                 location_unit="chapters"
             )
+            self.refresh_notes()
+            self.sidebar_tabs.setCurrentIndex(2)
             self.message.setText("Saved in BookTracker Notes & quotes.")
         except ValueError as exc:
             QMessageBox.warning(self,"Reading note",str(exc))
+
+    def refresh_notes(self,*_args):
+        previous=self.notes_list.currentItem()
+        selected=previous.data(Qt.ItemDataRole.UserRole) if previous else None
+        self.notes_list.clear()
+        entries=self.library.list_annotations(
+            work_id=self.work["id"],search=self.note_filter.text(),limit=2500
+        )
+        for row in entries:
+            preview=" ".join(row["body"].split())[:115]
+            label=row["kind"].capitalize()
+            if row["body"].startswith("EPUB · "):
+                label+=" · From reader"
+            item=QListWidgetItem(f"{label} — {preview}")
+            item.setToolTip(row["body"][:1500])
+            item.setData(Qt.ItemDataRole.UserRole,row["id"])
+            self.notes_list.addItem(item)
+            if row["id"]==selected:
+                self.notes_list.setCurrentItem(item)
+
+    def selected_note(self):
+        item=self.notes_list.currentItem()
+        return self.library.get_annotation(
+            item.data(Qt.ItemDataRole.UserRole)
+        ) if item else None
+
+    def edit_saved_note(self,*_args):
+        row=self.selected_note()
+        if not row:
+            self.message.setText("Select a saved quote or note to edit.")
+            return
+        body,okay=QInputDialog.getMultiLineText(
+            self,"Edit saved annotation","Annotation text:",row["body"]
+        )
+        if not okay:
+            return
+        try:
+            self.library.update_annotation(
+                row["id"],kind=row["kind"],body=body,
+                location=row["location"],location_unit=row["location_unit"]
+            )
+            self.refresh_notes()
+            self.message.setText("Saved annotation changes.")
+        except ValueError as exc:
+            QMessageBox.warning(self,"Edit annotation",str(exc))
+
+    def copy_saved_note(self):
+        row=self.selected_note()
+        if not row:
+            self.message.setText("Select a saved quote or note to copy.")
+            return
+        QApplication.clipboard().setText(row["body"])
+        self.message.setText("Copied saved annotation.")
+
+    def delete_saved_note(self):
+        row=self.selected_note()
+        if not row:
+            self.message.setText("Select a saved quote or note to delete.")
+            return
+        if QMessageBox.question(
+            self,"Delete saved annotation?",
+            "Delete this note or quote? This does not delete the book."
+        )!=QMessageBox.StandardButton.Yes:
+            return
+        self.library.delete_annotation(row["id"])
+        self.refresh_notes()
+        self.message.setText("Deleted the selected annotation.")
+
+    def export_work_notes(self):
+        """Export only this work's notes to an atomically-written Markdown file."""
+        rows=self.library.list_annotations(work_id=self.work["id"],limit=5000)
+        if not rows:
+            self.message.setText("No saved notes or quotes to export.")
+            return
+        file_path,_=QFileDialog.getSaveFileName(
+            self,"Export this work's notes","BookTracker-work-notes.md",
+            "Markdown files (*.md)"
+        )
+        if not file_path:
+            return
+        title=self.work["title"].replace("\n"," ")
+        author=self.work["author"].replace("\n"," ")
+        parts=[f"# Notes and quotes — {title}\n\n*{author}*\n\n"]
+        total=len(parts[0])
+        for row in reversed(rows):
+            heading=row["kind"].capitalize()
+            if row["location"] is not None:
+                desc=("EPUB section" if row["body"].startswith("EPUB · ") else
+                      row["location_unit"].replace("_"," ") or "Position")
+                heading+=f" · {desc} {row['location']}"
+            piece=f"## {heading}\n\n{row['body']}\n\n"
+            total+=len(piece)
+            if total>12_000_000:
+                QMessageBox.warning(self,"Export too large",
+                                    "Export exceeds the 12 million character limit.")
+                return
+            parts.append(piece)
+        try:
+            data="".join(parts).encode("utf-8")
+            output=QSaveFile(file_path)
+            if not output.open(QIODevice.OpenModeFlag.WriteOnly):
+                raise OSError(output.errorString())
+            if output.write(data)!=len(data) or not output.commit():
+                raise OSError(output.errorString())
+            self.message.setText(
+                f"Exported {len(rows)} work annotations as Markdown."
+            )
+        except OSError as exc:
+            QMessageBox.warning(self,"Export notes",str(exc))
 
     def log_progress(self):
         work=self.library.get_work(self.link["work_id"])
