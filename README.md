@@ -40,10 +40,51 @@ Built with Python, PySide6, and SQLite. No account, cloud subscription, or alway
 - Manage global tags: rename/merge tag names or remove a tag across the library, keeping the books intact.
 - Quick-update serialized chapter counts, increment progress by one or five chapters, and mark a story caught up to its known published chapter count.
 - Explore the **Reading calendar**, marked dates, streaks, individual activities and time sessions. Export time logs as CSV.
+- Run a **reading/audiobook stopwatch** that can be paused, resumed and explicitly saved as a dated session.
+- Review **Reading habits** by day and week, weekday time patterns and annual goal pace, and export a daily CSV.
+- **Import Kindle highlights and notes** from My Clippings.txt, with preview, explicit matching and deduplication.
 - Search the **Notes & quotes** journal, copy selections to the clipboard and export selected annotations to Markdown.
 - Review library statistics, recent progress history, reading goals, time spent and series progress.
 - Manage crosspost source URLs, editions, and manually triggered chapter checks without altering work-level reading history.
 - All data is saved locally in an SQLite database; portable JSON/XML import uses stable UUIDs for merge.
+
+## New in v0.11.0
+
+A more complete personal reading journal: **a real stopwatch**, **habit analysis** and an offline **Kindle My Clippings.txt importer**. No schema migration is needed; the existing v7 SQLite database and full backups already support these features.
+
+### Reading & audiobook stopwatch
+
+- **Start timer** from the Reading calendar, Reading habits screen, a book's detail panel, or File → Start reading timer (Ctrl+Alt+T).
+- Choose an existing book and Reading or Listening. Start, pause and resume a real monotonic timer; optionally attach a date and session note.
+- **Save explicitly:** Only real, full elapsed minutes are recorded as a dated reading session. No chapter, page, percent or completion progress is inferred from this time.
+- Reset or close without saving and the elapsed time is discarded (with confirmation). A stopwatch does not run after BookTracker closes and is not a background-tracking service.
+- Existing calendar history and reading/listening summaries immediately include saved sessions.
+
+### Reading habits (new sidebar screen)
+
+- Choose a recent period: **7, 30, 90, 365 or 730 days**.
+- See actual active days, logged reading and listening hours, chapters/pages recorded, known dated completions, and the longest streak *within the selected period*.
+- Compare total reading/listening minutes across weekdays using bars and inspect **week-by-week** activity.
+- Review the books with the most **explicitly logged** time. No time is guessed from word count, chapter milestones or page turns.
+- Export a clean **daily CSV** of observed reading and listening minutes, chapters, pages, milestones and session counts.
+- **Annual goal pace** compares your existing Dashboard book/chapter/page targets against what you have recorded to date and projects a year-end pace. The projection is based only on actual dated records.
+
+### Kindle highlights and notes
+
+- Use **Notes & quotes → Import Kindle highlights**, or File → Import Kindle clippings, to load an English-language **My Clippings.txt** export from a Kindle device.
+- Parse Kindle Highlights and Notes locally, including multiline excerpts, title/author credit, page numbers and Kindle-specific locations.
+- **Preview and choose the destination** for each Kindle title. BookTracker auto-selects only one uniquely matching title and author. Other Kindle titles default to **Skip**, but you may manually select an existing library book or choose **Create a custom book**.
+- **Safe repeated imports:** deterministic annotation IDs skip duplicate passages, and custom books created from clippings also reuse stable IDs. Existing edited annotations and personal reading history are not overwritten.
+- Kindle locations now have a distinct **Kindle location** unit; a proprietary Kindle location is not misrepresented as an ordinary page or chapter.
+- No Kindle highlights, notes, reading files or account information are uploaded. Imported notes are included automatically in existing v7 JSON/XML/.btbackup exports.
+- Deliberately **does not** mark a book complete, generate fabricated historical reading dates, or infer reading progress from exported highlights.
+- Supports English My Clippings exports; some localized or nonstandard Kindle clippings formats may not parse. Files are limited to 20 MB and 100,000 blocks for safety.
+
+### Upgrade
+
+1. Export a .btbackup copy as a precaution and close BookTracker.
+2. In your checkout, run git pull, then uv sync.
+3. Launch with uv run python -m booktracker. No new database tables or migration are required.
 
 ## New in v0.10.0
 
@@ -337,10 +378,11 @@ To run a minimal GUI smoke test without a display on CI, set QT_QPA_PLATFORM=off
 
 Project layout:
 
-- booktracker/database.py — reading runs, queue, timed sessions, annotations, local file associations, calendar statistics, shelves, linked sources/editions, versioned merges
+- booktracker/database.py — reading runs, queue, timed sessions, habits and annual-goal analysis, deduplicated annotation imports, local file associations, calendar statistics, versioned merges
 - booktracker/backups.py — daily SQLite snapshots and retention
 - booktracker/integrations.py — Open Library/story metadata, Goodreads CSV, JSON/XML/CSV
 - booktracker/epub_import.py — offline EPUB metadata and embedded cover parsing
+- booktracker/clippings.py — safe local Kindle highlights/notes parsing
 - booktracker/portable_backup.py — checksum-validated ZIP bundles with local covers
 - booktracker/book_search.py — title/author catalog search and caching
 - booktracker/covers.py — async disk-cached cover thumbnails

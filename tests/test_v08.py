@@ -261,7 +261,7 @@ def test_gui_calendar_and_annotations_screen(app, lib):
     lib.record_progress_on(key, 100, date="2025-04-01")
     window = MainWindow(lib)
     try:
-        assert len(window.nav_buttons) == 11
+        assert len(window.nav_buttons) == 12
         window.navigate(7)
         window.calendar.setSelectedDate(QDate(2025, 4, 1))
         assert window.calendar_table.rowCount() == 2
