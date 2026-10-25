@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+from time import monotonic
 
 from PySide6.QtCore import QSettings, Qt, QTimer, QUrl, Signal
 from PySide6.QtWidgets import (
@@ -16,6 +17,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QPushButton,
@@ -111,6 +113,29 @@ def playlist_for_file(files, selected):
     ))
 
 
+def parse_timestamp(value):
+    """An explicit source-file position, not a listening-session duration."""
+    value = str(value).strip()
+    chunks = value.split(":")
+    if not 1 <= len(chunks) <= 3 or any(
+        not chunk.isascii() or not chunk.isdecimal() or not chunk
+        for chunk in chunks
+    ):
+        raise ValueError("Enter a time such as 2:35 or 1:02:35.")
+    numbers = list(map(int, chunks))
+    if len(numbers) == 3 and (numbers[1] >= 60 or numbers[2] >= 60):
+        raise ValueError("Minutes and seconds must be below 60.")
+    if len(numbers) == 2 and numbers[1] >= 60:
+        raise ValueError("Seconds must be below 60.")
+    seconds = 0
+    for number in numbers:
+        seconds = seconds * 60 + number
+    result = seconds * 1000
+    if result > MAX_AUDIO_POSITION_MS:
+        raise ValueError("Timestamp exceeds the supported maximum.")
+    return result
+
+
 def time_label(position, duration):
     return f"{fmt_duration(position)} / {fmt_duration(duration)}"
 
@@ -145,8 +170,9 @@ class AudioPlayerDialog(QDialog):
         self._advance_scheduled = False
         self._mpv_engine = None
         self._supports_pitch_safe_speed = True
+        self._sleep_deadline = None
         self.setWindowTitle("BookTracker — Audiobook player")
-        self.resize(680, 330)
+        self.resize(700, 580)
         self.setMinimumWidth(480)
         root = QVBoxLayout(self)
         self.title = QLabel("")
@@ -211,6 +237,32 @@ class AudioPlayerDialog(QDialog):
         options.addWidget(self.chapters, stretch=1)
         options.addWidget(self._button("Load markers", self.load_chapters))
         root.addLayout(options)
+        long_form = QHBoxLayout()
+        self.goto_time = QLineEdit()
+        self.goto_time.setPlaceholderText("Jump to 1:02:35")
+        self.goto_time.setMaximumWidth(150)
+        self.goto_time.setMaxLength(12)
+        self.goto_time.returnPressed.connect(self.jump_to_timestamp)
+        long_form.addWidget(self.goto_time)
+        long_form.addWidget(self._button("Go to time", self.jump_to_timestamp))
+        long_form.addWidget(self._button("−5 min", lambda:self.jump(-300_000)))
+        long_form.addWidget(self._button("+5 min", lambda:self.jump(300_000)))
+        long_form.addStretch()
+        root.addLayout(long_form)
+        sleep_row = QHBoxLayout()
+        sleep_row.addWidget(QLabel("Sleep timer"))
+        self.sleep = QComboBox()
+        for text, minutes in (
+            ("Off", 0), ("10 min", 10), ("15 min", 15),
+            ("20 min", 20), ("30 min", 30), ("45 min", 45),
+            ("60 min", 60), ("90 min", 90)
+        ):
+            self.sleep.addItem(text, minutes)
+        self.sleep.currentIndexChanged.connect(self.configure_sleep)
+        sleep_row.addWidget(self.sleep)
+        self.sleep_label = QLabel("Off")
+        sleep_row.addWidget(self.sleep_label, stretch=1)
+        root.addLayout(sleep_row)
         root.addWidget(QLabel("Play queue (double-click to play a part)"))
         self.queue_list = QListWidget()
         self.queue_list.setMaximumHeight(120)
@@ -261,6 +313,9 @@ class AudioPlayerDialog(QDialog):
         self._save_timer.setInterval(4000)
         self._save_timer.timeout.connect(self.save_position)
         self._save_timer.start()
+        self._sleep_tick = QTimer(self)
+        self._sleep_tick.setInterval(1000)
+        self._sleep_tick.timeout.connect(self.update_sleep)
         self.load_part()
         self.refresh_queue()
 
@@ -500,6 +555,64 @@ class AudioPlayerDialog(QDialog):
         self.player.setPosition(self.seek.value())
         self.save_position()
 
+    def seek_to_position(self, position_ms):
+        """Seek on an explicit command; if loading, defer to loaded duration."""
+        position = int(position_ms)
+        if not 0 <= position <= MAX_AUDIO_POSITION_MS:
+            raise ValueError("Invalid audio timestamp.")
+        self._finished_file = False
+        if self.player.duration() <= 0:
+            self._pending_resume = position
+        else:
+            self._pending_resume = 0
+            self.player.setPosition(min(position, self.player.duration()))
+            self.save_position()
+
+    def jump_to_timestamp(self):
+        try:
+            value = parse_timestamp(self.goto_time.text())
+        except ValueError as exc:
+            self.status.setText(str(exc))
+            return
+        duration = self.player.duration()
+        if duration > 0 and value > duration:
+            self.status.setText("Requested timestamp exceeds this audio part.")
+            return
+        self.seek_to_position(value)
+        self.status.setText(f"Moved to {fmt_duration(value)} in this audio file.")
+
+    def configure_sleep(self, *_args):
+        minutes = int(self.sleep.currentData() or 0)
+        if minutes:
+            self._sleep_deadline = monotonic() + minutes * 60
+            if hasattr(self, "_sleep_tick"):
+                self._sleep_tick.start()
+        else:
+            self._sleep_deadline = None
+            if hasattr(self, "_sleep_tick"):
+                self._sleep_tick.stop()
+        self.update_sleep()
+
+    def update_sleep(self):
+        if self._closed:
+            return
+        if self._sleep_deadline is None:
+            self.sleep_label.setText("Off")
+            return
+        seconds = max(0, int(self._sleep_deadline - monotonic() + 0.999))
+        if seconds == 0:
+            self._sleep_deadline = None
+            self._sleep_tick.stop()
+            self.sleep.blockSignals(True)
+            self.sleep.setCurrentIndex(0)
+            self.sleep.blockSignals(False)
+            self.sleep_label.setText("Timer finished — playback paused")
+            self.player.pause()
+            self.save_position()
+            return
+        minutes, remaining = divmod(seconds, 60)
+        self.sleep_label.setText(f"Pauses in {minutes}:{remaining:02d}")
+
     def jump(self, offset):
         duration = int(self.player.duration())
         if duration <= 0:
@@ -594,6 +707,7 @@ class AudioPlayerDialog(QDialog):
 
     def closeEvent(self, event):
         self._save_timer.stop()
+        self._sleep_tick.stop()
         self.save_position()
         self._closed = True
         self.player.stop()

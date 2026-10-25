@@ -51,6 +51,71 @@ Built with Python, PySide6, and SQLite. No account, cloud subscription, or alway
 - All data is saved locally in an SQLite database; portable JSON/XML import uses stable UUIDs for merge.
 - Use **Device sync** to exchange portable snapshots via a dedicated shared folder with per-field conflict review and recovery backups.
 
+## New in v0.20.0 — Listening comfort, audio shortcuts and EPUB links
+
+### Convenient long-form audiobook listening
+
+- **Sleep timer:** Choose 10, 15, 20, 30, 45, 60 or 90 minutes in the
+  built-in player. Its remaining wall-clock time is shown; at expiry BookTracker
+  **pauses** the audiobook and saves its resume point. Turn the selector back
+  to **Off** to cancel. A sleep timer never invents listening minutes and
+  is not persisted across launches.
+- **Precise seeking:** Type `45`, `12:34`, or `1:02:35` into the new
+  **Go to time** field to move to that position within the selected M4B part.
+  Invalid or out-of-range times are rejected without changing playback.
+- **Long jumps:** New **−5 min** and **+5 min** player controls join the
+  existing 30-second skips, chapter markers, speed, volume, and part queue.
+  Seeking always changes the playback position only, not reading progress.
+
+### Keyboard controls everywhere in BookTracker
+
+With a built-in audiobook player open, use:
+
+| Keyboard shortcut | Playback action |
+| --- | --- |
+| `Ctrl+Alt+Space` | Play or pause |
+| `Ctrl+Alt+J` | Back 30 seconds |
+| `Ctrl+Alt+L` | Forward 30 seconds |
+| `Ctrl+Alt+Page Up` | Previous part |
+| `Ctrl+Alt+Page Down` | Next part |
+
+They work when the main window, built-in player or EPUB reader has focus.
+They do nothing when no audio is open. A new **Shortcuts** action in the
+global audio toolbar shows the shortcut reference.
+
+### Deliberate EPUB ↔ audio position links
+
+The EPUB reader has a fourth sidebar tab, **Audio links**. With an M4B for
+the *same work* already open in BookTracker, choose **Save section ↔ time**
+to record a pairing between the current EPUB section/scroll position and
+the current M4B part/timestamp.
+
+A saved link can later be double-clicked or explicitly opened to revisit
+**both** the text section and the exact audio-file time. You can remove
+individual links. These mappings are user-created bookmarks, **not** a
+claim that EPUB sections correspond to M4B parts or embedded chapters;
+there is no automatic alignment or inferred reading progress.
+
+Links are stored in this computer's settings, separate from BookTracker's
+SQLite library, cross-device sync and portable backups. If either the
+linked EPUB or audiobook file is replaced or changed, its old links are
+hidden rather than applied to potentially incorrect content. The existing
+independent EPUB and audiobook resume points are preserved.
+
+### Compatibility and upgrade
+
+mpv continues to provide **pitch-preserving** variable-speed audio.
+If mpv is absent, Qt playback remains limited to **1.0×** to prevent
+chipmunk voices. No schema migration or changes to AudiobookAI Studio are
+required. To update, close BookTracker and run:
+
+```bash
+cd ~/BookTracker
+git pull --ff-only
+uv sync
+uv run python -m booktracker
+```
+
 ## New in v0.19.0 — Pitch-preserving audio and listening workflow upgrades
 
 ### Narrators keep their natural pitch at faster speed
