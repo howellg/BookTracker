@@ -50,7 +50,7 @@ class Library:
         self.db.execute("PRAGMA foreign_keys=ON")
         self.db.execute("PRAGMA busy_timeout=5000")
         self.db.execute("PRAGMA journal_mode=WAL")
-        self._snapshot_before_catalog_migration()
+        self._snapshot_before_schema_migration()
         self._initialize()
 
     def close(self):
@@ -65,18 +65,18 @@ class Library:
             self.db.rollback()
             raise
 
-    def _snapshot_before_catalog_migration(self):
-        """Create a recoverable WAL-aware copy *before* version 6 alters tables."""
+    def _snapshot_before_schema_migration(self):
+        """Save a WAL-consistent snapshot before an existing database moves to v7."""
         version = self.db.execute("PRAGMA user_version").fetchone()[0]
         exists = self.db.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='works'"
         ).fetchone()
-        if not exists or version >= 6:
+        if not exists or version >= 7:
             return
         folder = self.path.parent / "backups"
         folder.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-        target = folder / f"BookTracker-before-v09-{stamp}.sqlite3"
+        target = folder / f"BookTracker-before-v010-{stamp}.sqlite3"
         # sqlite3.backup copies committed WAL content safely.
         with sqlite3.connect(target) as destination:
             self.db.backup(destination)
@@ -236,8 +236,38 @@ class Library:
         );
         CREATE INDEX IF NOT EXISTS idx_source_checks_source
             ON source_checks(source_id,checked_at DESC);
+        CREATE TABLE IF NOT EXISTS reading_queue (
+            id TEXT PRIMARY KEY,
+            work_id TEXT NOT NULL UNIQUE REFERENCES works(id) ON DELETE CASCADE,
+            sort_order INTEGER NOT NULL CHECK(sort_order>=0),
+            priority TEXT NOT NULL DEFAULT 'normal'
+                CHECK(priority IN ('next','high','normal','low')),
+            target_date TEXT NOT NULL DEFAULT '',
+            note TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_reading_queue_order
+            ON reading_queue(sort_order,created_at);
+        CREATE TABLE IF NOT EXISTS local_files (
+            id TEXT PRIMARY KEY,
+            work_id TEXT NOT NULL REFERENCES works(id) ON DELETE CASCADE,
+            path TEXT NOT NULL DEFAULT '',
+            filename TEXT NOT NULL,
+            format TEXT NOT NULL CHECK(format IN (
+                'epub','m4b','pdf','mobi','azw3','cbz',
+                'mp3','flac','ogg','wav','txt'
+            )),
+            label TEXT NOT NULL DEFAULT '',
+            size_bytes INTEGER NOT NULL DEFAULT 0 CHECK(size_bytes>=0),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_local_files_unique_path
+            ON local_files(work_id,path) WHERE path!='';
+        CREATE INDEX IF NOT EXISTS idx_local_files_work ON local_files(work_id);
         """)
-        self.db.execute("PRAGMA user_version=6")
+        self.db.execute("PRAGMA user_version=7")
         self._backfill_catalog_relationships()
         self.db.commit()
 
@@ -897,7 +927,7 @@ class Library:
         if len(books) > 500:
             raise ValueError("Please import no more than 500 works at once.")
 
-        added, updated, enriched, duplicates = [], [], [], []
+        added, updated, enriched, duplicates, resolved = [], [], [], [], []
         with self.transaction():
             existing = list(self.db.execute(
                 "SELECT id,title,author,status,isbn,source_site,source_id,source_url FROM works"
@@ -999,6 +1029,7 @@ class Library:
                         by_site.setdefault(site_id,existing_id)
                     if url:
                         by_url.setdefault(url,existing_id)
+                    resolved.append(existing_id)
                     continue
 
                 timestamp = now()
@@ -1009,6 +1040,7 @@ class Library:
                     tuple(fields.values()),
                 )
                 added.append(fields["id"])
+                resolved.append(fields["id"])
                 statuses[fields["id"]] = status
                 if key[1]:
                     by_name[key] = fields["id"]
@@ -1026,6 +1058,7 @@ class Library:
             "enriched": len(enriched), "skipped": len(duplicates),
             "added_ids": added, "updated_ids": updated,
             "enriched_ids": enriched, "skipped_titles": duplicates,
+            "resolved_ids": resolved,
         }
 
     def list_shelves(self):
@@ -2190,8 +2223,336 @@ class Library:
             item["unread"] == 0, -item["unread"], item["title"].casefold()
         ))
 
+    @staticmethod
+    def _queue_values(priority="normal", target_date="", note=""):
+        priority = str(priority or "normal").strip()
+        if priority not in ("next", "high", "normal", "low"):
+            raise ValueError("Priority must be next, high, normal, or low.")
+        target_date = str(target_date or "").strip()
+        if target_date:
+            try:
+                parsed = date_class.fromisoformat(target_date)
+            except ValueError as exc:
+                raise ValueError("Target date must be a real YYYY-MM-DD date.") from exc
+            if not 1900 <= parsed.year <= 2200:
+                raise ValueError("Target date is outside the supported range.")
+        note = str(note or "").strip()
+        if len(note) > 6000:
+            raise ValueError("Queue note may not exceed 6,000 characters.")
+        return priority, target_date, note
+
+    def list_queue(self, *, search="", priority=None):
+        sql = """SELECT q.*,w.title,w.author,w.kind,w.status,w.progress_unit,
+                w.total_units,COALESCE((
+                  SELECT current_progress FROM reading_runs
+                  WHERE work_id=w.id ORDER BY started_at DESC,rowid DESC LIMIT 1
+                ),0) AS progress
+                FROM reading_queue q JOIN works w ON w.id=q.work_id WHERE 1=1"""
+        args = []
+        if priority is not None:
+            if priority not in ("next", "high", "normal", "low"):
+                raise ValueError("Invalid queue priority filter.")
+            sql += " AND q.priority=?"
+            args.append(priority)
+        if search.strip():
+            escaped = (
+                search.strip().replace("\\", "\\\\")
+                .replace("%", "\\%").replace("_", "\\_")
+            )
+            sql += (" AND (w.title LIKE ? ESCAPE '\\' OR w.author LIKE ? ESCAPE '\\'"
+                    " OR q.note LIKE ? ESCAPE '\\')")
+            args.extend(["%"+escaped+"%"]*3)
+        sql += " ORDER BY q.sort_order,q.created_at,q.id"
+        return [dict(row) for row in self.db.execute(sql,args)]
+
+    def get_queue_entry(self, work_id):
+        row = self.db.execute(
+            "SELECT * FROM reading_queue WHERE work_id=?", (work_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def enqueue_work(self, work_id, *, priority="normal", target_date="", note=""):
+        priority, target_date, note = self._queue_values(priority, target_date, note)
+        if not self.get_work(work_id):
+            raise KeyError(work_id)
+        with self.transaction():
+            row = self.get_queue_entry(work_id)
+            if row:
+                return row["id"]
+            position = self.db.execute(
+                "SELECT COALESCE(MAX(sort_order),-1)+1 FROM reading_queue"
+            ).fetchone()[0]
+            ident = new_id()
+            timestamp = now()
+            self.db.execute(
+                """INSERT INTO reading_queue
+                (id,work_id,sort_order,priority,target_date,note,created_at,updated_at)
+                VALUES(?,?,?,?,?,?,?,?)""",
+                (ident,work_id,position,priority,target_date,note,timestamp,timestamp)
+            )
+        return ident
+
+    def update_queue_entry(self, work_id, *, priority="normal", target_date="", note=""):
+        values = self._queue_values(priority, target_date, note)
+        with self.transaction():
+            cursor = self.db.execute(
+                """UPDATE reading_queue SET priority=?,target_date=?,note=?,updated_at=?
+                WHERE work_id=?""", (*values,now(),work_id)
+            )
+            if not cursor.rowcount:
+                raise KeyError(work_id)
+
+    def move_queue_entry(self, work_id, delta):
+        if not isinstance(delta,int) or delta not in (-1,1):
+            raise ValueError("Queue movement must be up or down by one position.")
+        with self.transaction():
+            ids=[row["work_id"] for row in self.db.execute(
+                "SELECT work_id FROM reading_queue ORDER BY sort_order,created_at,id"
+            )]
+            if work_id not in ids:
+                raise KeyError(work_id)
+            old = ids.index(work_id)
+            new = min(max(0,old+delta),len(ids)-1)
+            if old==new:
+                return False
+            ids.insert(new,ids.pop(old))
+            timestamp=now()
+            self.db.executemany(
+                "UPDATE reading_queue SET sort_order=?,updated_at=? WHERE work_id=?",
+                [(index,timestamp,key) for index,key in enumerate(ids)]
+            )
+        return True
+
+    def remove_from_queue(self, work_id):
+        with self.transaction():
+            cursor=self.db.execute(
+                "DELETE FROM reading_queue WHERE work_id=?", (work_id,)
+            )
+            if not cursor.rowcount:
+                return False
+            self.db.execute(
+                """UPDATE reading_queue SET sort_order=(
+                  SELECT COUNT(*) FROM reading_queue AS earlier
+                  WHERE earlier.sort_order<reading_queue.sort_order
+                )"""
+            )
+        return True
+
+    def queue_summary(self, *, today=None):
+        day = self._day(today) if today else date_class.today().isoformat()
+        queue=self.list_queue()
+        return {
+            "total":len(queue),
+            "overdue":sum(bool(q["target_date"] and q["target_date"]<day) for q in queue),
+            "due_today":sum(q["target_date"]==day for q in queue),
+            "next":sum(q["priority"]=="next" for q in queue),
+            "in_progress":sum(q["status"] in ("reading","caught_up") for q in queue),
+        }
+
+    FILE_FORMATS = frozenset((
+        "epub", "m4b", "pdf", "mobi", "azw3", "cbz",
+        "mp3", "flac", "ogg", "wav", "txt"
+    ))
+
+    @classmethod
+    def _local_path(cls, path):
+        if not str(path or "").strip():
+            raise ValueError("Select a real local reading or audiobook file.")
+        candidate=Path(path).expanduser()
+        if candidate.suffix.casefold().lstrip(".") not in cls.FILE_FORMATS:
+            raise ValueError("Unsupported local book/audio file type.")
+        try:
+            resolved=candidate.resolve(strict=True)
+            if not resolved.is_file():
+                raise ValueError("Local reading link must refer to a file.")
+            size=resolved.stat().st_size
+        except OSError as exc:
+            raise ValueError("Local reading file could not be accessed.") from exc
+        fmt=resolved.suffix.casefold().lstrip(".")
+        if fmt not in cls.FILE_FORMATS:
+            raise ValueError("Local file target type is not supported.")
+        if len(str(resolved))>4096:
+            raise ValueError("Local file path is too long.")
+        return str(resolved),resolved.name,fmt,size
+
+    @staticmethod
+    def _file_label(label):
+        value=str(label or "").strip()
+        if len(value)>180:
+            raise ValueError("Local file label exceeds 180 characters.")
+        return value
+
+    def add_local_file(self, work_id, path, *, label=""):
+        if not self.get_work(work_id):
+            raise KeyError(work_id)
+        path, filename, fmt, size = self._local_path(path)
+        label=self._file_label(label)
+        with self.transaction():
+            previous=self.db.execute(
+                "SELECT id FROM local_files WHERE work_id=? AND path=?",
+                (work_id,path)
+            ).fetchone()
+            if previous:
+                return previous["id"]
+            ident=new_id()
+            timestamp=now()
+            self.db.execute(
+                """INSERT INTO local_files
+                (id,work_id,path,filename,format,label,size_bytes,created_at,updated_at)
+                VALUES(?,?,?,?,?,?,?,?,?)""",
+                (ident,work_id,path,filename,fmt,label,size,timestamp,timestamp)
+            )
+        return ident
+
+    def list_local_files(self, work_id=None):
+        if work_id is not None and not self.get_work(work_id):
+            raise KeyError(work_id)
+        if work_id:
+            rows=self.db.execute(
+                """SELECT f.*,w.title FROM local_files f
+                JOIN works w ON w.id=f.work_id
+                WHERE f.work_id=? ORDER BY f.created_at,f.id""",(work_id,)
+            )
+        else:
+            rows=self.db.execute(
+                """SELECT f.*,w.title FROM local_files f
+                JOIN works w ON w.id=f.work_id
+                ORDER BY w.title COLLATE NOCASE,f.created_at"""
+            )
+        records=[dict(row) for row in rows]
+        for record in records:
+            record["available"]=bool(
+                record["path"] and Path(record["path"]).is_file()
+            )
+        return records
+
+    def get_local_file(self, file_id):
+        row=self.db.execute(
+            "SELECT * FROM local_files WHERE id=?",(file_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def relink_local_file(self, file_id, path):
+        path,filename,fmt,size=self._local_path(path)
+        with self.transaction():
+            record=self.get_local_file(file_id)
+            if not record:
+                raise KeyError(file_id)
+            prior=self.db.execute(
+                """SELECT id FROM local_files WHERE work_id=? AND path=? AND id!=?""",
+                (record["work_id"],path,file_id)
+            ).fetchone()
+            if prior:
+                raise ValueError("This file is already linked to the work.")
+            self.db.execute(
+                """UPDATE local_files SET path=?,filename=?,format=?,
+                size_bytes=?,updated_at=? WHERE id=?""",
+                (path,filename,fmt,size,now(),file_id)
+            )
+
+    def relink_from_directory(self, directory, *, work_id=None, max_files=20000):
+        """Match unavailable associations by filename within one chosen folder.
+
+        Scans at most 20k files, four directory levels; skips symlink files
+        and ambiguous duplicate names. No downloads, writes or file moves.
+        """
+        import os
+        from collections import defaultdict
+
+        try:
+            root=Path(directory).expanduser().resolve(strict=True)
+        except OSError as exc:
+            raise ValueError("Choose an accessible folder to scan.") from exc
+        if not root.is_dir():
+            raise ValueError("Choose a folder, not an individual file.")
+        max_files=int(max_files)
+        if not 1<=max_files<=20000:
+            raise ValueError("Maximum scan size must be between 1 and 20,000 files.")
+        records=self.list_local_files(work_id)
+        missing=[entry for entry in records if not entry["available"]]
+        if not missing:
+            return {"relinked":0,"missing":0,"ambiguous":0,"scanned":0}
+        targets={entry["filename"].casefold() for entry in missing}
+        matched=defaultdict(set)
+        scanned=0
+        for current,dirs,files in os.walk(root,followlinks=False):
+            current_path=Path(current)
+            depth=len(current_path.relative_to(root).parts)
+            if depth>=4:
+                dirs.clear()
+            else:
+                dirs[:]=sorted(
+                    folder for folder in dirs
+                    if not (current_path/folder).is_symlink()
+                )
+            for name in files:
+                scanned+=1
+                if scanned>max_files:
+                    raise ValueError(
+                        "Folder scan exceeded 20,000 files. Choose a smaller folder."
+                    )
+                if name.casefold() not in targets:
+                    continue
+                candidate=current_path/name
+                if candidate.is_symlink():
+                    continue
+                try:
+                    real, _, fmt, _=self._local_path(candidate)
+                except (OSError,ValueError):
+                    continue
+                if fmt==name.rsplit(".",1)[-1].casefold():
+                    matched[name.casefold()].add(real)
+        linked=0
+        ambiguous=0
+        unmatched=0
+        with self.transaction():
+            for entry in missing:
+                choices=matched.get(entry["filename"].casefold(),set())
+                if not choices:
+                    unmatched+=1
+                    continue
+                if len(choices)>1:
+                    ambiguous+=1
+                    continue
+                path=next(iter(choices))
+                existing=self.db.execute(
+                    "SELECT id FROM local_files WHERE work_id=? AND path=? AND id!=?",
+                    (entry["work_id"],path,entry["id"])
+                ).fetchone()
+                if existing:
+                    ambiguous+=1
+                    continue
+                resolved,filename,fmt,size=self._local_path(path)
+                self.db.execute(
+                    """UPDATE local_files SET path=?,filename=?,format=?,
+                       size_bytes=?,updated_at=? WHERE id=?""",
+                    (resolved,filename,fmt,size,now(),entry["id"])
+                )
+                linked+=1
+        return {
+            "relinked":linked,"missing":unmatched,
+            "ambiguous":ambiguous,"scanned":scanned
+        }
+
+    def rename_local_file(self, file_id, label):
+        label=self._file_label(label)
+        with self.transaction():
+            cursor=self.db.execute(
+                "UPDATE local_files SET label=?,updated_at=? WHERE id=?",
+                (label,now(),file_id)
+            )
+            if not cursor.rowcount:
+                raise KeyError(file_id)
+
+    def remove_local_file(self, file_id):
+        with self.transaction():
+            cursor=self.db.execute(
+                "DELETE FROM local_files WHERE id=?", (file_id,)
+            )
+            return bool(cursor.rowcount)
+
     def export_data(self):
-        return {"format": "booktracker", "schema_version": 6, "exported_at": now(),
+        return {"format": "booktracker", "schema_version": 7, "exported_at": now(),
                 "works": [dict(row) for row in self.db.execute("SELECT * FROM works")],
                 "reading_runs": [dict(row) for row in self.db.execute("SELECT * FROM reading_runs")],
                 "progress_events": [dict(row) for row in self.db.execute("SELECT * FROM progress_events")],
@@ -2203,11 +2564,19 @@ class Library:
                 "annotations": [dict(row) for row in self.db.execute("SELECT * FROM annotations")],
                 "work_sources": [dict(row) for row in self.db.execute("SELECT * FROM work_sources")],
                 "work_editions": [dict(row) for row in self.db.execute("SELECT * FROM work_editions")],
-                "source_checks": [dict(row) for row in self.db.execute("SELECT * FROM source_checks")]}
+                "source_checks": [dict(row) for row in self.db.execute("SELECT * FROM source_checks")],
+                "reading_queue": [dict(row) for row in self.db.execute(
+                    "SELECT * FROM reading_queue ORDER BY sort_order,created_at,id"
+                )],
+                # Never export absolute file paths or bulky EPUB/M4B/PDF bytes.
+                # Portable metadata can be relinked on the destination computer.
+                "local_files": [dict(row, path="") for row in self.db.execute(
+                    "SELECT * FROM local_files"
+                )]}
 
     def import_data(self, data, *, strategy="merge"):
         """Transactional import; duplicate event IDs are skipped when merging."""
-        if data.get("format") != "booktracker" or data.get("schema_version") not in (1, 2, 3, 4, 5, 6):
+        if data.get("format") != "booktracker" or data.get("schema_version") not in (1, 2, 3, 4, 5, 6, 7):
             raise ValueError("Unsupported BookTracker backup format or schema version.")
         if data["schema_version"] >= 2 and (
             not isinstance(data.get("shelves"), list)
@@ -2228,6 +2597,11 @@ class Library:
             for key in ("work_sources", "work_editions", "source_checks")
         ):
             raise ValueError("Backup is missing linked sources, editions, or source checks.")
+        if data["schema_version"] >= 7 and (
+            not isinstance(data.get("reading_queue"), list)
+            or not isinstance(data.get("local_files"), list)
+        ):
+            raise ValueError("Backup is missing reading queue or local-file metadata.")
         for key in ("works", "reading_runs", "progress_events"):
             if not isinstance(data.get(key), list):
                 raise ValueError(f"Backup is missing {key}.")
@@ -2510,6 +2884,90 @@ class Library:
                     VALUES (?,?,?,?,?,?,?)""",
                     (check["id"], source_id,check.get("checked_at") or now(),
                      status, old, observed, str(check.get("message") or "")[:500]),
+                )
+            queue = data.get("reading_queue", [])
+            if len(queue)>100000:
+                raise ValueError("Reading queue backup is too large.")
+            for row in sorted(queue, key=lambda item: (
+                item.get("sort_order", 0) if isinstance(item,dict) else 0,
+                str(item.get("created_at", "")) if isinstance(item,dict) else "",
+            )):
+                if not isinstance(row,dict) or not row.get("id"):
+                    raise ValueError("Malformed reading-queue entry in backup.")
+                work_id=mapping.get(row.get("work_id"))
+                if not work_id:
+                    raise ValueError("Orphaned reading-queue entry.")
+                priority, target_date, note = self._queue_values(
+                    row.get("priority"), row.get("target_date"), row.get("note")
+                )
+                try:
+                    position=int(row.get("sort_order",0))
+                except (ValueError,TypeError) as exc:
+                    raise ValueError("Invalid queue position in backup.") from exc
+                if not 0<=position<=1000000:
+                    raise ValueError("Invalid queue position in backup.")
+                existing=self.db.execute(
+                    "SELECT id,work_id FROM reading_queue WHERE id=?", (row["id"],)
+                ).fetchone()
+                if existing and existing["work_id"] != work_id:
+                    raise ValueError("Queue entry ID belongs to a different work.")
+                if self.db.execute(
+                    "SELECT id FROM reading_queue WHERE work_id=?",(work_id,)
+                ).fetchone():
+                    continue
+                next_order=self.db.execute(
+                    "SELECT COALESCE(MAX(sort_order),-1)+1 FROM reading_queue"
+                ).fetchone()[0]
+                self.db.execute(
+                    """INSERT INTO reading_queue
+                    (id,work_id,sort_order,priority,target_date,note,created_at,updated_at)
+                    VALUES(?,?,?,?,?,?,?,?)""",
+                    (row["id"],work_id,next_order,priority,target_date,note,
+                     row.get("created_at") or now(),row.get("updated_at") or now()),
+                )
+            files=data.get("local_files",[])
+            if len(files)>100000:
+                raise ValueError("Local-file metadata backup is too large.")
+            for row in files:
+                if not isinstance(row,dict) or not row.get("id"):
+                    raise ValueError("Malformed local-file metadata in backup.")
+                work_id=mapping.get(row.get("work_id"))
+                if not work_id:
+                    raise ValueError("Orphaned local-file link in backup.")
+                if row.get("path"):
+                    raise ValueError(
+                        "Portable backups must not contain machine-specific file paths."
+                    )
+                fmt=str(row.get("format") or "")
+                filename=str(row.get("filename") or "").strip()
+                if (
+                    fmt not in self.FILE_FORMATS or not filename
+                    or len(filename)>300 or filename in (".","..")
+                    or "/" in filename or "\\" in filename
+                    or not filename.casefold().endswith("."+fmt)
+                ):
+                    raise ValueError("Invalid local-file name or format in backup.")
+                label=self._file_label(row.get("label"))
+                try:
+                    size=int(row.get("size_bytes") or 0)
+                except (TypeError,ValueError) as exc:
+                    raise ValueError("Invalid local-file size in backup.") from exc
+                if not 0<=size<=100_000_000_000_000:
+                    raise ValueError("Local-file size exceeds supported range.")
+                existing=self.db.execute(
+                    "SELECT work_id FROM local_files WHERE id=?", (row["id"],)
+                ).fetchone()
+                if existing:
+                    if existing["work_id"]!=work_id:
+                        raise ValueError("Local-file link belongs to a different work.")
+                    # Merge must not replace a valid local path with a blank hint.
+                    continue
+                self.db.execute(
+                    """INSERT INTO local_files
+                    (id,work_id,path,filename,format,label,size_bytes,created_at,updated_at)
+                    VALUES(?,?,'',?,?,?,?,?,?)""",
+                    (row["id"],work_id,filename,fmt,label,size,
+                     row.get("created_at") or now(),row.get("updated_at") or now())
                 )
             self._backfill_catalog_relationships()
         return count

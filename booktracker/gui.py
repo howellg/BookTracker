@@ -11,6 +11,7 @@ from PySide6.QtCore import QDate, QSettings, QSize, Qt, QThread, QUrl, Signal
 from PySide6.QtGui import (
     QAction,
     QColor,
+    QDesktopServices,
     QFont,
     QIcon,
     QPainter,
@@ -1669,6 +1670,286 @@ class CatalogManagerDialog(QDialog):
         super().done(code)
 
 
+class QueueEntryDialog(QDialog):
+    """A queue preference is independent of book status and reading history."""
+
+    def __init__(self, parent, library, *, work_id=None, existing=None):
+        super().__init__(parent)
+        self.setWindowTitle("Edit reading plan" if existing else "Add to reading queue")
+        self.resize(590, 360)
+        layout=QVBoxLayout(self)
+        layout.addWidget(label(
+            "Keep a planned reading order without changing any book's status or history.",
+            "muted"
+        ))
+        form=QFormLayout()
+        self.book=QComboBox()
+        self.book.setEditable(True)
+        self.book.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.book.completer().setFilterMode(Qt.MatchFlag.MatchContains)
+        books=library.list_works(sort="title")
+        for book in books:
+            self.book.addItem(f"{book['title']} — {book['author'] or 'Unknown author'}",book["id"])
+        chosen = (existing or {}).get("work_id") or work_id
+        if chosen:
+            index=self.book.findData(chosen)
+            if index>=0:
+                self.book.setCurrentIndex(index)
+        if existing or work_id:
+            self.book.setEnabled(False)
+        self.priority=QComboBox()
+        for key, text in (
+            ("next","Next up — highest priority"),
+            ("high","High priority"),
+            ("normal","Normal priority"),
+            ("low","Someday / low priority"),
+        ):
+            self.priority.addItem(text,key)
+        self.priority.setCurrentIndex(max(
+            0,self.priority.findData((existing or {}).get("priority","normal"))
+        ))
+        self.target=QLineEdit((existing or {}).get("target_date",""))
+        self.target.setPlaceholderText("Optional target date (YYYY-MM-DD)")
+        self.note=QTextEdit((existing or {}).get("note",""))
+        self.note.setPlaceholderText("Why you want to read it, plans or other reminders…")
+        self.note.setMinimumHeight(85)
+        form.addRow("Book",self.book)
+        form.addRow("Priority",self.priority)
+        form.addRow("Target date",self.target)
+        form.addRow("Plan / notes",self.note)
+        layout.addLayout(form)
+        layout.addWidget(label(
+            "Dates are optional. No reminders are sent automatically.", "muted"
+        ))
+        buttons=QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.validate_accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def values(self):
+        return {
+            "priority":self.priority.currentData(),
+            "target_date":self.target.text().strip(),
+            "note":self.note.toPlainText(),
+        }
+
+    def validate_accept(self):
+        if (
+            not self.book.currentData()
+            or self.book.currentIndex()<0
+            or self.book.currentText()!=self.book.itemText(self.book.currentIndex())
+        ):
+            QMessageBox.warning(
+                self,"Choose book","Choose an existing book from the suggestions."
+            )
+            return
+        try:
+            Library._queue_values(**self.values())
+        except ValueError as exc:
+            QMessageBox.warning(self,"Reading plan",str(exc))
+            return
+        self.accept()
+
+
+class LocalFilesDialog(QDialog):
+    """Link existing files without moving or importing their content."""
+
+    FILE_FILTER=(
+        "Reading / audiobook files "
+        "(*.epub *.m4b *.pdf *.mobi *.azw3 *.cbz "
+        "*.mp3 *.flac *.ogg *.wav *.txt)"
+    )
+
+    def __init__(self,parent,library,work_id):
+        super().__init__(parent)
+        self.library=library
+        self.work_id=work_id
+        work=library.get_work(work_id)
+        self.setWindowTitle("Local files — "+work["title"])
+        self.resize(850,550)
+        self.setMinimumSize(650,460)
+        layout=QVBoxLayout(self)
+        layout.addWidget(label(work["title"],"headline"))
+        layout.addWidget(label(
+            "Associate existing EPUB, M4B, PDF and other book/audio files. "
+            "BookTracker stores links only, not file content or playback progress.",
+            "muted"
+        ))
+        self.file_table=QTableWidget(0,5)
+        self.file_table.setHorizontalHeaderLabels([
+            "File", "Type", "Location", "Status", "Label"
+        ])
+        self.file_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.file_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.file_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.file_table.verticalHeader().setVisible(False)
+        self.file_table.horizontalHeader().setSectionResizeMode(
+            0,QHeaderView.ResizeMode.Stretch
+        )
+        self.file_table.horizontalHeader().setSectionResizeMode(
+            2,QHeaderView.ResizeMode.Stretch
+        )
+        for col in (1,3,4):
+            self.file_table.horizontalHeader().setSectionResizeMode(
+                col,QHeaderView.ResizeMode.ResizeToContents
+            )
+        self.file_table.itemDoubleClicked.connect(lambda _:self.open_file())
+        layout.addWidget(self.file_table,stretch=1)
+        actions=QHBoxLayout()
+        for caption,callback in (
+            ("+ Attach files",self.attach),
+            ("Open selected",self.open_file),
+            ("Relink selected",self.relink),
+            ("Find in folder",self.relink_folder),
+            ("Rename label",self.rename),
+        ):
+            actions.addWidget(button(caption,callback))
+        layout.addLayout(actions)
+        layout.addWidget(button(
+            "Unlink selected file (does not delete the file)",
+            self.remove, danger=True
+        ))
+        layout.addWidget(label(
+            "Portable backups include only file names and metadata, never the "
+            "full device path or large audio/ebook contents. On another computer, "
+            "use Relink to point to your copy.", "muted"
+        ))
+        close=QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        close.rejected.connect(self.reject)
+        layout.addWidget(close)
+        self.refresh()
+
+    def refresh(self):
+        previous=self.selected_file_id()
+        records=self.library.list_local_files(self.work_id)
+        self.file_table.setRowCount(len(records))
+        chosen=0
+        for row, item in enumerate(records):
+            if item["id"]==previous:
+                chosen=row
+            columns=(
+                item["filename"],item["format"].upper(),
+                item["path"] or "(not linked on this computer)",
+                "Available" if item["available"] else "Missing — relink",
+                item["label"] or "—",
+            )
+            for col,value in enumerate(columns):
+                cell=QTableWidgetItem(value)
+                if col==0:
+                    cell.setData(Qt.ItemDataRole.UserRole,item["id"])
+                self.file_table.setItem(row,col,cell)
+            self.file_table.setRowHeight(row,38)
+        if records:
+            self.file_table.selectRow(chosen)
+
+    def selected_file_id(self):
+        row=self.file_table.currentRow()
+        cell=self.file_table.item(row,0) if row>=0 else None
+        return cell.data(Qt.ItemDataRole.UserRole) if cell else None
+
+    def attach(self):
+        paths,_=QFileDialog.getOpenFileNames(
+            self,"Attach local reading or audio files","",self.FILE_FILTER
+        )
+        if not paths:
+            return
+        errors=[]
+        for path in paths:
+            try:
+                self.library.add_local_file(self.work_id,path)
+            except (OSError,ValueError) as exc:
+                errors.append(f"{Path(path).name}: {exc}")
+        self.refresh()
+        if errors:
+            QMessageBox.warning(self,"Some files not linked","\n".join(errors[:12]))
+
+    def open_file(self):
+        key=self.selected_file_id()
+        entry=self.library.get_local_file(key) if key else None
+        if not entry:
+            return
+        if not entry["path"] or not Path(entry["path"]).is_file():
+            QMessageBox.information(
+                self,"File unavailable",
+                "This file is missing or belongs to another computer. "
+                "Choose Relink missing file to locate your copy."
+            )
+            self.refresh()
+            return
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(entry["path"])):
+            QMessageBox.warning(
+                self,"Cannot open file","No system application could open this file."
+            )
+
+    def relink(self):
+        key=self.selected_file_id()
+        if not key:
+            return
+        path,_=QFileDialog.getOpenFileName(
+            self,"Locate the existing book or audiobook","",self.FILE_FILTER
+        )
+        if not path:
+            return
+        try:
+            self.library.relink_local_file(key,path)
+            self.refresh()
+        except (OSError,ValueError) as exc:
+            fail(self,exc)
+
+    def relink_folder(self):
+        folder=QFileDialog.getExistingDirectory(
+            self,"Find matching filenames in a folder"
+        )
+        if not folder:
+            return
+        try:
+            result=self.library.relink_from_directory(
+                folder,work_id=self.work_id
+            )
+            self.refresh()
+            QMessageBox.information(
+                self,"Bulk file relinking",
+                f"Relinked: {result['relinked']}\n"
+                f"Missing: {result['missing']}\n"
+                f"Ambiguous matches skipped: {result['ambiguous']}\n"
+                f"Files scanned: {result['scanned']}"
+            )
+        except Exception as exc:
+            fail(self,exc)
+
+    def rename(self):
+        key=self.selected_file_id()
+        item=self.library.get_local_file(key) if key else None
+        if not item:
+            return
+        value,okay=QInputDialog.getText(
+            self,"File label","Optional label:",text=item["label"]
+        )
+        if not okay:
+            return
+        try:
+            self.library.rename_local_file(key,value)
+            self.refresh()
+        except ValueError as exc:
+            fail(self,exc)
+
+    def remove(self):
+        key=self.selected_file_id()
+        if not key:
+            return
+        if QMessageBox.question(
+            self,"Unlink file?",
+            "Remove this association from BookTracker? "
+            "The real file on disk will not be deleted."
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        self.library.remove_local_file(key)
+        self.refresh()
+
+
 class MainWindow(QMainWindow):
     def __init__(self, library):
         super().__init__()
@@ -1700,7 +1981,26 @@ class MainWindow(QMainWindow):
         sidebar.setSpacing(7)
         sidebar.addWidget(label("◈  BookTracker", "subheading"))
         sidebar.addWidget(label("Your reading, remembered.", "muted"))
-        sidebar.addSpacing(24)
+        sidebar.addSpacing(10)
+        nav_scroller=QScrollArea()
+        nav_scroller.setObjectName("navScroll")
+        nav_scroller.setFrameShape(QFrame.Shape.NoFrame)
+        nav_scroller.setWidgetResizable(True)
+        nav_scroller.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        nav_panel=QWidget()
+        nav_panel.setObjectName("navPanel")
+        nav_scroller.setStyleSheet(
+            "QScrollArea#navScroll { background-color: #192231; border: none; }"
+            "QWidget#navPanel { background-color: #192231; }"
+        )
+        for surface in (nav_scroller, nav_scroller.viewport(), nav_panel):
+            palette=surface.palette()
+            palette.setColor(QPalette.ColorRole.Window, QColor("#192231"))
+            surface.setPalette(palette)
+            surface.setAutoFillBackground(True)
+        nav_layout=QVBoxLayout(nav_panel)
+        nav_layout.setContentsMargins(0,0,0,0)
+        nav_layout.setSpacing(6)
         self.nav_buttons = []
         for title, index in (("▤   Library", 0), ("◷   Reading history", 1),
                              ("▥   Dashboard", 2), ("▦   Series", 3),
@@ -1708,13 +2008,16 @@ class MainWindow(QMainWindow):
                              ("◇   Library health", 6),
                              ("▦   Reading calendar", 7),
                              ("✎   Notes && quotes", 8),
-                             ("◉   Update center", 9)):
+                             ("◉   Update center", 9),
+                             ("☷   Reading queue", 10)):
             nav = button(title, lambda _, i=index: self.navigate(i))
             nav.setObjectName("nav")
             nav.setCheckable(True)
-            sidebar.addWidget(nav)
+            nav_layout.addWidget(nav)
             self.nav_buttons.append(nav)
-        sidebar.addStretch()
+        nav_layout.addStretch()
+        nav_scroller.setWidget(nav_panel)
+        sidebar.addWidget(nav_scroller,stretch=1)
         sidebar.addWidget(button("Import EPUB files", self.import_epub_files))
         sidebar.addWidget(button("Import library", self.import_library))
         sidebar.addWidget(button("Export library", self.export_library))
@@ -1734,6 +2037,7 @@ class MainWindow(QMainWindow):
         self.create_calendar_page()
         self.create_journal_page()
         self.create_updates_page()
+        self.create_queue_page()
         geometry = self.settings.value("window_geometry")
         if geometry:
             self.restoreGeometry(geometry)
@@ -1769,6 +2073,9 @@ class MainWindow(QMainWindow):
             ("Log reading or listening time", self.log_reading_session, "Ctrl+Shift+T"),
             ("Sources and editions", self.manage_work_catalog, "Ctrl+Shift+M"),
             ("Update center", lambda: self.navigate(9), "Ctrl+Shift+U"),
+            ("Reading queue", lambda: self.navigate(10), "Ctrl+Shift+Q"),
+            ("Local book/audio files", self.manage_local_files, "Ctrl+Shift+F"),
+            ("Relink library files from folder", self.relink_library_files, ""),
         ):
             action = QAction(title, self)
             action.triggered.connect(callback)
@@ -1802,6 +2109,8 @@ class MainWindow(QMainWindow):
             self.refresh_journal_page()
         elif index == 9:
             self.refresh_updates_page()
+        elif index == 10:
+            self.refresh_queue_page()
 
     def focus_library_search(self):
         self.navigate(0)
@@ -1895,6 +2204,7 @@ class MainWindow(QMainWindow):
         commands.addWidget(button("Select all", self.select_all_visible))
         commands.addWidget(button("Bulk edit", self.bulk_edit_selected))
         commands.addWidget(button("Add to shelf", self.add_selected_to_shelf))
+        commands.addWidget(button("Queue selected", self.queue_selected_books))
         commands.addWidget(button("New shelf", self.create_shelf))
         commands.addWidget(button("Manage shelves", self.manage_shelves))
         commands.addStretch()
@@ -3101,6 +3411,303 @@ class MainWindow(QMainWindow):
             return
         self.manage_catalog_for(work["id"])
 
+    def create_queue_page(self):
+        page=QWidget()
+        layout=QVBoxLayout(page)
+        top=QHBoxLayout()
+        top.addWidget(label("Reading queue","headline"),stretch=1)
+        top.addWidget(button("+ Plan a book",self.queue_new_book,primary=True))
+        top.addWidget(button("Surprise me",self.pick_queue_book))
+        layout.addLayout(top)
+        layout.addWidget(label(
+            "Plan what to read next without changing completion status or "
+            "inventing historical reading sessions. Reorder works, set "
+            "priorities and optional target dates.", "muted"
+        ))
+        filters=QHBoxLayout()
+        self.queue_search=QLineEdit()
+        self.queue_search.setPlaceholderText(
+            "Search queued titles, authors and planning notes…"
+        )
+        self.queue_search.textChanged.connect(self.refresh_queue_page)
+        filters.addWidget(self.queue_search,stretch=3)
+        self.queue_priority=QComboBox()
+        self.queue_priority.addItem("All priorities",None)
+        for key, text in (
+            ("next","Next up"),("high","High"),("normal","Normal"),("low","Someday")
+        ):
+            self.queue_priority.addItem(text,key)
+        self.queue_priority.currentIndexChanged.connect(self.refresh_queue_page)
+        filters.addWidget(self.queue_priority,stretch=1)
+        layout.addLayout(filters)
+        self.queue_summary_label=label("","subheading")
+        layout.addWidget(self.queue_summary_label)
+        self.queue_table=QTableWidget(0,7)
+        self.queue_table.setHorizontalHeaderLabels([
+            "#","Title","Priority","Target","Reading","Progress","Plan / note"
+        ])
+        self.queue_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.queue_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.queue_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.queue_table.verticalHeader().setVisible(False)
+        self.queue_table.horizontalHeader().setSectionResizeMode(
+            1,QHeaderView.ResizeMode.Stretch
+        )
+        self.queue_table.horizontalHeader().setSectionResizeMode(
+            6,QHeaderView.ResizeMode.Stretch
+        )
+        for index in (0,2,3,4,5):
+            self.queue_table.horizontalHeader().setSectionResizeMode(
+                index,QHeaderView.ResizeMode.ResizeToContents
+            )
+        self.queue_table.itemDoubleClicked.connect(lambda _:self.open_queue_book())
+        layout.addWidget(self.queue_table,stretch=1)
+        actions=QHBoxLayout()
+        for caption,func in (
+            ("Move ↑",lambda:self.move_queued(-1)),
+            ("Move ↓",lambda:self.move_queued(1)),
+            ("Edit plan",self.edit_queue_plan),
+            ("Open book",self.open_queue_book),
+            ("Start reading",self.start_queue_book),
+        ):
+            actions.addWidget(button(caption,func))
+        layout.addLayout(actions)
+        layout.addWidget(button(
+            "Remove selected from queue (book remains in your library)",
+            self.remove_queue_book,danger=True
+        ))
+        layout.addWidget(label(
+            "Moving entries changes the full queue order, even when a search or "
+            "priority filter is active. Dates are private planning targets, "
+            "not scheduled reminders.", "muted"
+        ))
+        self.pages.addWidget(page)
+
+    def selected_queue_work_id(self):
+        row=self.queue_table.currentRow()
+        item=self.queue_table.item(row,1) if row>=0 else None
+        return item.data(Qt.ItemDataRole.UserRole) if item else None
+
+    def refresh_queue_page(self,*_args):
+        current=self.selected_queue_work_id()
+        entries=self.library.list_queue(
+            search=self.queue_search.text(),
+            priority=self.queue_priority.currentData()
+        )
+        full=self.library.list_queue()
+        order={entry["work_id"]:i+1 for i,entry in enumerate(full)}
+        self.queue_table.blockSignals(True)
+        self.queue_table.setRowCount(len(entries))
+        chosen=-1
+        today=QDate.currentDate().toString("yyyy-MM-dd")
+        for i,entry in enumerate(entries):
+            if entry["work_id"]==current:
+                chosen=i
+            current_progress=entry["progress"]
+            total=entry["total_units"]
+            progress=(f"{current_progress} / {total}" if total
+                      else str(current_progress))
+            target=entry["target_date"] or "—"
+            if entry["target_date"] and entry["target_date"]<today:
+                target += " · overdue"
+            values=(
+                str(order[entry["work_id"]]),entry["title"],
+                name(entry["priority"]),target,
+                name(entry["status"]),progress,
+                entry["note"].replace("\n"," ")[:150] or "—"
+            )
+            for col,value in enumerate(values):
+                item=QTableWidgetItem(value)
+                if col==1:
+                    item.setData(Qt.ItemDataRole.UserRole,entry["work_id"])
+                self.queue_table.setItem(i,col,item)
+            self.queue_table.setRowHeight(i,39)
+        self.queue_table.blockSignals(False)
+        if chosen>=0:
+            self.queue_table.selectRow(chosen)
+        elif entries:
+            self.queue_table.selectRow(0)
+        summary=self.library.queue_summary()
+        self.queue_summary_label.setText(
+            f"{summary['total']} queued  ·  {summary['next']} marked next up  ·  "
+            f"{summary['in_progress']} in progress  ·  "
+            f"{summary['overdue']} overdue targets"
+        )
+
+    def queue_new_book(self):
+        if not self.library.list_works():
+            QMessageBox.information(
+                self,"Empty library","Add a book before creating a reading plan."
+            )
+            return
+        dialog=QueueEntryDialog(self,self.library)
+        if dialog.exec()!=QDialog.DialogCode.Accepted:
+            return
+        key=dialog.book.currentData()
+        try:
+            current=self.library.get_queue_entry(key)
+            if current:
+                QMessageBox.information(
+                    self,"Already queued",
+                    "This book is already in your queue. Select it and choose Edit plan."
+                )
+                return
+            self.library.enqueue_work(key,**dialog.values())
+            self.refresh_all(key)
+            self.refresh_queue_page()
+        except Exception as exc:
+            fail(self,exc)
+
+    def queue_current_book(self):
+        book=self.selected_work()
+        if not book:
+            return
+        try:
+            self.library.enqueue_work(book["id"])
+            self.refresh_all(book["id"])
+            self.statusBar().showMessage("Added to reading queue.",6000)
+        except Exception as exc:
+            fail(self,exc)
+
+    def queue_selected_books(self):
+        selected=self.selected_ids()
+        if not selected:
+            QMessageBox.information(
+                self,"Choose books","Select one or more library entries first."
+            )
+            return
+        added=0
+        try:
+            for key in dict.fromkeys(selected):
+                if self.library.get_queue_entry(key):
+                    continue
+                self.library.enqueue_work(key)
+                added+=1
+            self.refresh_all()
+            self.statusBar().showMessage(
+                f"Added {added} works to reading queue.",8000
+            )
+        except Exception as exc:
+            fail(self,exc)
+
+    def edit_queue_plan(self):
+        key=self.selected_queue_work_id()
+        if not key:
+            return
+        current=self.library.get_queue_entry(key)
+        if not current:
+            return
+        dialog=QueueEntryDialog(self,self.library,existing=current)
+        if dialog.exec()!=QDialog.DialogCode.Accepted:
+            return
+        try:
+            self.library.update_queue_entry(key,**dialog.values())
+            self.refresh_all()
+            self.refresh_queue_page()
+        except Exception as exc:
+            fail(self,exc)
+
+    def move_queued(self,delta):
+        key=self.selected_queue_work_id()
+        if not key:
+            return
+        try:
+            self.library.move_queue_entry(key,delta)
+            self.refresh_queue_page()
+        except Exception as exc:
+            fail(self,exc)
+
+    def remove_queue_book(self):
+        key=self.selected_queue_work_id()
+        if not key:
+            return
+        if QMessageBox.question(
+            self,"Remove from reading queue?",
+            "Remove this reading plan? The book and all reading history remain."
+        )!=QMessageBox.StandardButton.Yes:
+            return
+        self.library.remove_from_queue(key)
+        self.refresh_all()
+        self.refresh_queue_page()
+
+    def open_queue_book(self):
+        key=self.selected_queue_work_id()
+        if not key:
+            return
+        self.clear_library_filters()
+        self.navigate(0)
+        self.refresh_library(select_id=key)
+
+    def start_queue_book(self):
+        key=self.selected_queue_work_id()
+        if not key:
+            return
+        work=self.library.get_work(key)
+        if work["status"]=="completed" and QMessageBox.question(
+            self,"Start reread?",
+            "This work is already completed. Create a new reread?"
+        )!=QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self.library.start_reading(
+                key,reread=work["status"]=="completed"
+            )
+            self.library.remove_from_queue(key)
+            self.refresh_all(key)
+            self.refresh_queue_page()
+            self.statusBar().showMessage(
+                f"Started reading {work['title']}.",6500
+            )
+        except Exception as exc:
+            fail(self,exc)
+
+    def pick_queue_book(self):
+        entries=self.library.list_queue(
+            search=self.queue_search.text(),
+            priority=self.queue_priority.currentData()
+        )
+        if not entries:
+            QMessageBox.information(self,"Queue empty","No queued books match these filters.")
+            return
+        import secrets
+        picked=secrets.choice(entries)
+        self.queue_table.selectRow(next(
+            i for i in range(self.queue_table.rowCount())
+            if self.queue_table.item(i,1).data(Qt.ItemDataRole.UserRole)==picked["work_id"]
+        ))
+        self.statusBar().showMessage(
+            f"Random pick: {picked['title']}",7500
+        )
+
+    def relink_library_files(self):
+        folder=QFileDialog.getExistingDirectory(
+            self,"Find missing book and audiobook files"
+        )
+        if not folder:
+            return
+        try:
+            result=self.library.relink_from_directory(folder)
+            self.refresh_all()
+            QMessageBox.information(
+                self,"Library file relinking",
+                f"Relinked: {result['relinked']}\n"
+                f"Missing: {result['missing']}\n"
+                f"Ambiguous matches skipped: {result['ambiguous']}\n"
+                f"Files scanned: {result['scanned']}\n\n"
+                "No book/audio files were changed or copied."
+            )
+        except Exception as exc:
+            fail(self,exc)
+
+    def manage_local_files(self):
+        work=self.selected_work()
+        if not work:
+            QMessageBox.information(self,"Choose book","Select a book first.")
+            return
+        dialog=LocalFilesDialog(self,self.library,work["id"])
+        dialog.exec()
+        self.refresh_all(work["id"])
+
     def create_series_page(self):
         page = QWidget()
         layout = QVBoxLayout(page)
@@ -3309,6 +3916,8 @@ class MainWindow(QMainWindow):
             self.refresh_journal_page()
         if self.pages.currentIndex() == 9:
             self.refresh_updates_page()
+        if self.pages.currentIndex() == 10:
+            self.refresh_queue_page()
 
     def refresh_library(self, *_args, select_id=None):
         active_view = self.saved_view_combo.currentData()
@@ -3444,6 +4053,24 @@ class MainWindow(QMainWindow):
         self.details.addWidget(button(
             "Manage sources && editions", self.manage_work_catalog
         ))
+        self.details.addWidget(button(
+            f"Local files ({len(self.library.list_local_files(work_id))})",
+            self.manage_local_files
+        ))
+        queued=self.library.get_queue_entry(work_id)
+        if queued:
+            self.details.addWidget(label(
+                f"Reading queue: {name(queued['priority'])}"
+                + (f" · Target {queued['target_date']}" if queued["target_date"] else ""),
+                "muted"
+            ))
+            self.details.addWidget(button(
+                "View reading queue", lambda: self.navigate(10)
+            ))
+        else:
+            self.details.addWidget(button(
+                "+ Add to reading queue", self.queue_current_book
+            ))
         self.details.addSpacing(8)
         for text in (
             f"Reading: {name(book['status'])}",
@@ -4239,8 +4866,10 @@ class MainWindow(QMainWindow):
             export_file(self.library, path)
             message = (
                 "Export complete.\n\nPortable .btbackup files include your reading history, "
-                "shelves, goals and imported EPUB covers. JSON/XML include reading data "
-                "but not local images; CSV is a flat catalog."
+                "shelves, goals, the reading queue, file-link metadata and imported EPUB covers. "
+                "JSON/XML include reading data and file-link metadata but not local images; "
+                "CSV is a flat catalog. EPUB/M4B/PDF contents and absolute paths are not "
+                "included in any portable export."
             )
             QMessageBox.information(self, "Exported", message)
         except Exception as exc:
@@ -4287,7 +4916,9 @@ class MainWindow(QMainWindow):
         errors = []
         for filename in paths:
             try:
-                works.append(read_epub_metadata(filename, cover_dir=cover_dir))
+                data=read_epub_metadata(filename, cover_dir=cover_dir)
+                data["_local_file_path"]=str(Path(filename).expanduser().resolve())
+                works.append(data)
             except (OSError, ValueError, KeyError) as exc:
                 errors.append(f"{Path(filename).name}: {exc}")
         return {"works": works, "errors": errors}
@@ -4346,14 +4977,31 @@ class MainWindow(QMainWindow):
                     report = self.library.bulk_add_works(
                         works, status=status, enrich_duplicates=True
                     )
+                    linked=0
+                    link_errors=[]
+                    for work_id, item in zip(report["resolved_ids"], works):
+                        filename=item.get("_local_file_path")
+                        if not filename:
+                            continue
+                        try:
+                            self.library.add_local_file(work_id,filename)
+                            linked+=1
+                        except (OSError,ValueError) as exc:
+                            link_errors.append(f"{Path(filename).name}: {exc}")
                     self.refresh_all()
                     QMessageBox.information(
                         self, "EPUB import complete",
                         f"Added: {report['added']}\n"
                         f"Existing books enriched: {report['enriched']}\n"
-                        f"Skipped duplicates: {report['skipped']}"
+                        f"Skipped duplicates: {report['skipped']}\n"
+                        f"EPUB file links: {linked}"
                         + (f"\nUnreadable EPUBs: {len(errors)}" if errors else "")
+                        + (f"\nFiles not linked: {len(link_errors)}" if link_errors else "")
                     )
+                    if link_errors:
+                        QMessageBox.warning(
+                            self,"Some EPUB links failed","\n".join(link_errors[:12])
+                        )
                 except Exception as exc:
                     fail(self, exc)
         if errors:

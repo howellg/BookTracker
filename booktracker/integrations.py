@@ -182,7 +182,7 @@ def export_file(library: Library, path: str | Path):
         ET.SubElement(root, "exported_at").text = backup["exported_at"]
         for name in ("works", "reading_runs", "progress_events", "shelves", "work_shelves",
                      "reading_goals", "saved_views", "reading_sessions", "annotations",
-                     "work_sources", "work_editions", "source_checks"):
+                     "work_sources", "work_editions", "source_checks", "reading_queue", "local_files"):
             parent = ET.SubElement(root, name)
             for entry in backup[name]:
                 node = ET.SubElement(parent, "item")
@@ -199,6 +199,13 @@ def export_file(library: Library, path: str | Path):
                 item = dict(book)
                 # JSON arrays round-trip even when individual tags contain commas.
                 item["tags"] = json.dumps(book["tags"], ensure_ascii=False)
+                # CSV is for spreadsheet viewing; prevent formula injection
+                # from untrusted book titles and authors. JSON/XML are lossless.
+                for key, value in list(item.items()):
+                    if isinstance(value, str) and value.lstrip().startswith(
+                        ("=", "+", "-", "@")
+                    ):
+                        item[key] = "'" + value
                 writer.writerow(item)
     else:
         raise ValueError("Supported exports are .btbackup, .json, .xml, and .csv.")
@@ -220,7 +227,7 @@ def import_file(library: Library, path: str | Path, *, strategy="merge") -> int:
         data = {"format": "booktracker", "schema_version": int(root.get("schema_version", "0"))}
         for name in ("works", "reading_runs", "progress_events", "shelves", "work_shelves",
                      "reading_goals", "saved_views", "reading_sessions", "annotations",
-                     "work_sources", "work_editions", "source_checks"):
+                     "work_sources", "work_editions", "source_checks", "reading_queue", "local_files"):
             if name in ("shelves", "work_shelves") and data["schema_version"] == 1:
                 continue
             if name == "reading_goals" and data["schema_version"] < 3:
@@ -230,6 +237,8 @@ def import_file(library: Library, path: str | Path, *, strategy="merge") -> int:
             if name in ("reading_sessions", "annotations") and data["schema_version"] < 5:
                 continue
             if name in ("work_sources", "work_editions", "source_checks") and data["schema_version"] < 6:
+                continue
+            if name in ("reading_queue", "local_files") and data["schema_version"] < 7:
                 continue
             parent = root.find(name)
             if parent is None:

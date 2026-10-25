@@ -11,6 +11,8 @@ Built with Python, PySide6, and SQLite. No account, cloud subscription, or alway
 - Independently log **time spent reading or listening to audiobooks**, using explicit dates and durations. Time records do not invent chapter/page progress.
 - Save **bookmarks, quotations, and reading notes** associated with books and optional chapter/page positions.
 - Distinguish **caught up with an ongoing story** from **completed the work**.
+- Build a **reading queue** with priority, planned dates, personal notes, manual order and random suggestions.
+- Associate existing EPUB/M4B/PDF and other reading files with a book; bulk-relink missing files from a folder across computers.
 - Associate **multiple crossposted story sources** with the same work, instead of creating duplicate reading histories.
 - Track **print, ebook, web, and audiobook editions** under one work; choose which edition should supply the main ISBN and page count.
 - Use the **Update center** to review known unread chapters and previously failed checks, and check supported sites manually.
@@ -30,7 +32,7 @@ Built with Python, PySide6, and SQLite. No account, cloud subscription, or alway
 - Export and import **CSV catalogs** for spreadsheets (CSV does *not* preserve reading-history events).
 - Use a **Reading dashboard** with goals, current reads, serialized works with unread published chapters and recent milestones.
 - Browse **Series** and **Authors** explorers; double-click to filter your library by that series or author.
-- **Import local EPUB metadata** offline, individually or in bulk, including embedded covers, authors, series, ISBNs, language, description, and tags where available. Recognize supported fanfiction source links embedded in EPUB metadata.
+- **Import local EPUB metadata** offline, individually or in bulk, including embedded covers, authors, series, ISBNs, language, description, and tags where available. Recognize supported fanfiction source links embedded in EPUB metadata and link the original EPUB files.
 - Search and filter your reading-event history by book, author, note and year. Edit milestones and backdate progress without corrupting the most recent reading position. Export the filtered history as CSV.
 - Save and restore **named library views** with complex filters and sorting rules. These travel in JSON/XML/.btbackup exports.
 - Explore **Insights** by month, including dated chapter/page progress, active reading days, reading/listening time and completions, and export a monthly CSV.
@@ -42,6 +44,45 @@ Built with Python, PySide6, and SQLite. No account, cloud subscription, or alway
 - Review library statistics, recent progress history, reading goals, time spent and series progress.
 - Manage crosspost source URLs, editions, and manually triggered chapter checks without altering work-level reading history.
 - All data is saved locally in an SQLite database; portable JSON/XML import uses stable UUIDs for merge.
+
+## New in v0.10.0
+
+This release introduces an **offline reading planner** and **file associations** for EPUBs, audiobooks and other supported reading formats. Both are optional additions around the existing book records. No cloud accounts or external services are needed.
+
+### Reading queue and planning
+
+- **Reading queue (sidebar):** Make an ordered list of the books, fanfiction and web novels you want to tackle next.
+- **Priorities:** Mark items Next up, High, Normal or Someday. Add an optional target date and a personal planning note.
+- **Reorder freely:** Move an entry up or down without changing its book status, completion dates, ratings, or reading history.
+- **Bulk planning:** In the library list or gallery, select several books and choose Queue selected. Existing queued works are not duplicated.
+- **Flexible planning:** Search queue titles/authors/notes, filter by priority, view overdue target dates, and use Surprise me to choose a random matching title.
+- **One-click start:** Select a plan and choose Start reading to create or resume an actual reading run and remove the item from the queue. When the work is completed, BookTracker asks before creating a new reread.
+- **No fabricated history:** Adding to the queue does not mark a book as read or create a reading session. Targets are personal planning dates, not automatic reminders.
+
+### Local EPUB / audiobook file associations
+
+- **Attach files to a book:** From its detail panel choose Local files to associate existing EPUB, M4B, PDF, MOBI, AZW3, CBZ, MP3, FLAC, OGG, WAV or TXT files.
+- **Open with the system default application:** Double-click a linked file or choose Open selected. BookTracker does not attempt to read DRM-protected content or implement an audio player.
+- **No duplicate storage:** Files stay in place. Unlinking an association cannot delete the underlying ebook, audio file or document.
+- **Missing-file detection:** Files moved from a drive or absent on another computer are clearly marked Missing — relink.
+- **Relink selected:** Attach an existing local-file record to a new file path while preserving its metadata and work relationship.
+- **Bulk relink by folder:** Choose Find in folder from a book's file manager, or File → Relink library files from folder to locate unavailable files across the library. This search checks filenames within up to four nested folder levels and scans at most 20,000 files.
+- **Ambiguity safeguards:** If two files have the same matching filename in different locations, BookTracker will not choose arbitrarily. A skipped match can be resolved manually.
+- **Automatic EPUB association:** Import EPUB files now also links the original local EPUBs to newly added or already matching works. Importing the same EPUB again does not duplicate the association.
+- **Safe file linking:** Executable and unrelated file types are not accepted for local-file associations.
+
+### Backups, upgrades and security
+
+- **Schema v7:** Adds the reading_queue and local_files SQLite tables without replacing existing works, editions, sources, shelves, notes or historical reading runs.
+- **Pre-upgrade snapshot:** Before an existing library is migrated to v7, BookTracker creates an SQLite snapshot in its adjacent backups/ directory, named BookTracker-before-v010-...sqlite3.
+- **Portable queue:** JSON, XML and .btbackup exports preserve queue order, priorities, notes and target dates. Imports merge entries by stable ID or matched work without overwriting existing local plans.
+- **Portable file metadata:** Backups store filenames, types, sizes and labels, *not* absolute local paths or actual EPUB/M4B/PDF file contents. When restoring on another machine (or replacing a database from a portable export), choose Relink or Find in folder to reconnect your files.
+- **Previous exports supported:** Old v1–v6 JSON/XML/.btbackup imports remain compatible.
+- **Safe CSV viewing:** Exported CSV catalog text cells that could be interpreted as spreadsheet formulas are escaped. Structured JSON/XML backups remain unmodified.
+
+**Important:** .btbackup still includes locally imported cover images, but deliberately does not package books or audiobook files, which may be very large or subject to licensing restrictions. Keep your original media files separately.
+
+**Upgrade:** Close BookTracker, export a .btbackup copy, and run git pull and uv sync in the repository. Then launch with uv run python -m booktracker. Existing records will be migrated automatically.
 
 ## New in v0.9.0
 
@@ -252,27 +293,29 @@ The database is stored in your OS's user-data directory (platformdirs), not insi
 14. Use **Notes & quotes** or the selected book's **Add bookmark / quote / note** action to store passages or reading reactions.
 15. From the selected book, choose **Manage sources & editions** to attach crossposts, alternate ISBNs, ebook editions or audiobooks.
 16. Open **Update center** to review serial backlogs, failed checks and source chapter history.
+17. Open **Reading queue**, use **+ Plan a book** or choose **Queue selected** in your library, then set priorities and optionally target dates.
+18. Select a book and choose **Local files** to attach existing EPUB or M4B files. Use **Find in folder** to relink missing media after transferring your library.
 11. To record something you read last year, choose **Log progress**, check **Set a specific reading date**, then select the historical date. To correct an older log, use **Reading history → Edit selected**.
 
 For existing Goodreads history, use **File → Import Goodreads CSV**. It imports Goodreads shelves and ratings; it does not create a detailed historical progress log that Goodreads never exported.
 
 ## Backup and portability
 
-| Format | Works & history | Sources, editions, personal journal | Local EPUB covers |
+| Format | Works & history | Queue, editions, journal, file-link metadata | Local EPUB covers |
 |---|---|---|---|
 | **.btbackup** portable bundle | Yes | Yes (including time, notes and saved views) | **Yes** |
-| JSON (schema v6) | Yes | Yes (including time, notes and saved views) | No |
-| XML (schema v6) | Yes | Yes (including time, notes and saved views) | No |
+| JSON (schema v7) | Yes | Yes (including time, notes and saved views) | No |
+| XML (schema v7) | Yes | Yes (including time, notes and saved views) | No |
 | CSV catalog | Works/metadata only | No | No |
 | Goodreads CSV (import) | Imported work fields | No | No |
 
 **Prefer .btbackup for moving to another computer.** It is a ZIP bundle containing versioned JSON and your locally imported EPUB cover images. All referenced embedded images are verified with SHA-256 checksums on import; invalid images are rejected. Files inside the archive are never extracted to arbitrary paths.
 
-JSON/XML remain useful for structured-data interchange and preserve reading runs, progress history, shelves, yearly goals and the personal journal, but do **not** carry local EPUB images. The default import mode merges reading data and preserves newer local personal fields; Replace fully overwrites your library and automatically creates a pre-import database snapshot first.
+JSON/XML remain useful for structured-data interchange and preserve reading runs, progress history, shelves, yearly goals, queue plans, local-file metadata and the personal journal, but do **not** carry local EPUB images. The default import mode merges reading data and preserves newer local personal fields; Replace fully overwrites your library and automatically creates a pre-import database snapshot first.
 
 Automatic SQLite snapshots are kept beside your database in the backups folder (14 daily snapshots retained). **The SQLite snapshot itself does not include the separate imported_covers directory**. For a portable, complete transfer of locally imported covers, use a .btbackup file.
 
-This is manual file-based portability, **not** continuous multi-device synchronization.
+Local EPUB, M4B and other book/audio files are never copied into BookTracker exports. Only filenames and metadata are saved for them; the original files must be transferred separately and relinked on another machine. This is manual file-based portability, **not** continuous multi-device synchronization.
 
 ## Site-specific limitations
 
@@ -294,7 +337,7 @@ To run a minimal GUI smoke test without a display on CI, set QT_QPA_PLATFORM=off
 
 Project layout:
 
-- booktracker/database.py — reading runs, timed sessions, annotations, calendar/streak statistics, shelves, linked sources/editions and versioned merges
+- booktracker/database.py — reading runs, queue, timed sessions, annotations, local file associations, calendar statistics, shelves, linked sources/editions, versioned merges
 - booktracker/backups.py — daily SQLite snapshots and retention
 - booktracker/integrations.py — Open Library/story metadata, Goodreads CSV, JSON/XML/CSV
 - booktracker/epub_import.py — offline EPUB metadata and embedded cover parsing
