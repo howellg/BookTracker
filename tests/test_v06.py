@@ -139,7 +139,7 @@ def test_history_and_author_gui_navigation(app, library):
     library.record_progress_on(work, 90, date="2026-04-01", note="Second")
     window = MainWindow(library)
     try:
-        assert len(window.nav_buttons) == 12
+        assert len(window.nav_buttons) == 13
         window.navigate(4)
         assert window.authors_table.rowCount() == 1
         assert window.authors_table.item(0, 0).text() == "Brandon Sanderson"

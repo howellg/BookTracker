@@ -272,11 +272,11 @@ def test_migration_snapshot_and_idempotence(tmp_path):
         old.execute("PRAGMA user_version=6")
     migrated=Library(path)
     try:
-        snapshots=list((tmp_path/"backups").glob("BookTracker-before-v012-*.sqlite3"))
+        snapshots=list((tmp_path/"backups").glob("BookTracker-before-v013-*.sqlite3"))
         assert len(snapshots)==1
         with sqlite3.connect(snapshots[0]) as read:
             assert read.execute("PRAGMA user_version").fetchone()[0]==6
-        assert migrated.db.execute("PRAGMA user_version").fetchone()[0]==8
+        assert migrated.db.execute("PRAGMA user_version").fetchone()[0]==9
         assert migrated.get_work(book)["notes"]=="Important existing notes"
         migrated.enqueue_work(book)
     finally:
@@ -284,7 +284,7 @@ def test_migration_snapshot_and_idempotence(tmp_path):
     again=Library(path)
     try:
         assert len(again.list_queue())==1
-        assert len(list((tmp_path/"backups").glob("BookTracker-before-v012-*.sqlite3")))==1
+        assert len(list((tmp_path/"backups").glob("BookTracker-before-v013-*.sqlite3")))==1
     finally:
         again.close()
 
@@ -301,7 +301,7 @@ def test_gui_queue_and_file_manager_app_launch(app,library,tmp_path,monkeypatch)
     library.enqueue_work(second,priority="low")
     main=MainWindow(library)
     try:
-        assert len(main.nav_buttons)==12
+        assert len(main.nav_buttons)==13
         main.navigate(10)
         assert main.queue_table.rowCount()==2
         assert main.queue_summary_label.text().startswith("2 queued")
@@ -352,9 +352,10 @@ def test_compact_sidebar_navigation_stays_accessible(app,library):
         window.resize(960,630)
         window.show()
         app.processEvents()
-        assert len(window.nav_buttons)==12
-        assert window.nav_buttons[-2].text().endswith("Reading queue")
-        assert window.nav_buttons[-1].text().endswith("Reading habits")
+        assert len(window.nav_buttons)==13
+        assert window.nav_buttons[-3].text().endswith("Reading queue")
+        assert window.nav_buttons[-2].text().endswith("Reading habits")
+        assert window.nav_buttons[-1].text().endswith("Audiobooks")
         window.navigate(10)
         assert window.pages.currentIndex()==10
     finally:

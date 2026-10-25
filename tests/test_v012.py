@@ -199,7 +199,7 @@ def test_v8_roundtrip_and_idempotent_merge(db,tmp_path,ext):
     db.acknowledge_releases(work)
     db.record_source_check(source,observed_units=47)
     saved=db.export_data()
-    assert saved["schema_version"]==8
+    assert saved["schema_version"]==9
     out=tmp_path/("portable"+ext)
     export_file(db,out)
     restore=Library(tmp_path/("restore"+ext+".sqlite3"))
@@ -274,9 +274,9 @@ def test_v7_schema_migration_snapshot_idempotent(tmp_path):
         legacy.execute("PRAGMA user_version=7")
     upgraded=Library(dbfile)
     try:
-        assert upgraded.db.execute("PRAGMA user_version").fetchone()[0]==8
+        assert upgraded.db.execute("PRAGMA user_version").fetchone()[0]==9
         assert upgraded.get_work(work)["total_units"]==23
-        backups=list((tmp_path/"backups").glob("BookTracker-before-v012-*.sqlite3"))
+        backups=list((tmp_path/"backups").glob("BookTracker-before-v013-*.sqlite3"))
         assert len(backups)==1
         with sqlite3.connect(backups[0]) as snapshot:
             assert snapshot.execute("PRAGMA user_version").fetchone()[0]==7
@@ -287,7 +287,7 @@ def test_v7_schema_migration_snapshot_idempotent(tmp_path):
         upgraded.close()
     again=Library(dbfile)
     try:
-        assert len(list((tmp_path/"backups").glob("BookTracker-before-v012-*.sqlite3")))==1
+        assert len(list((tmp_path/"backups").glob("BookTracker-before-v013-*.sqlite3")))==1
         assert again.get_work(work)["title"]=="Long-running Story"
     finally:
         again.close()

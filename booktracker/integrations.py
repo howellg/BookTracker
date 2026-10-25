@@ -15,7 +15,7 @@ from urllib.parse import urlparse
 from .database import WORK_FIELDS, Library
 from .story_metadata import parse_story_html
 
-USER_AGENT = "BookTracker/0.12 (personal reading-library metadata client)"
+USER_AGENT = "BookTracker/0.13 (personal reading-library metadata client)"
 KNOWN_HOSTS = {
     "archiveofourown.org": ("AO3", "fanfiction", r"/works/(\d+)"),
     "www.archiveofourown.org": ("AO3", "fanfiction", r"/works/(\d+)"),
@@ -182,7 +182,7 @@ def export_file(library: Library, path: str | Path):
         ET.SubElement(root, "exported_at").text = backup["exported_at"]
         for name in ("works", "reading_runs", "progress_events", "shelves", "work_shelves",
                      "reading_goals", "saved_views", "reading_sessions", "annotations",
-                     "work_sources", "work_editions",  "source_checks", "reading_queue", "local_files", "serial_follows", "serial_releases"):
+                     "work_sources", "work_editions",  "source_checks", "reading_queue", "local_files", "serial_follows", "serial_releases", "audio_metadata"):
             parent = ET.SubElement(root, name)
             for entry in backup[name]:
                 node = ET.SubElement(parent, "item")
@@ -227,7 +227,7 @@ def import_file(library: Library, path: str | Path, *, strategy="merge") -> int:
         data = {"format": "booktracker", "schema_version": int(root.get("schema_version", "0"))}
         for name in ("works", "reading_runs", "progress_events", "shelves", "work_shelves",
                      "reading_goals", "saved_views", "reading_sessions", "annotations",
-                     "work_sources", "work_editions",  "source_checks", "reading_queue", "local_files", "serial_follows", "serial_releases"):
+                     "work_sources", "work_editions",  "source_checks", "reading_queue", "local_files", "serial_follows", "serial_releases", "audio_metadata"):
             if name in ("shelves", "work_shelves") and data["schema_version"] == 1:
                 continue
             if name == "reading_goals" and data["schema_version"] < 3:
@@ -241,6 +241,8 @@ def import_file(library: Library, path: str | Path, *, strategy="merge") -> int:
             if name in ("reading_queue", "local_files") and data["schema_version"] < 7:
                 continue
             if name in ("serial_follows", "serial_releases") and data["schema_version"] < 8:
+                continue
+            if name == "audio_metadata" and data["schema_version"] < 9:
                 continue
             parent = root.find(name)
             if parent is None:
