@@ -11,13 +11,16 @@ Built with Python, PySide6, and SQLite. No account, cloud subscription, or alway
 - Independently log **time spent reading or listening to audiobooks**, using explicit dates and durations. Time records do not invent chapter/page progress.
 - Save **bookmarks, quotations, and reading notes** associated with books and optional chapter/page positions.
 - Distinguish **caught up with an ongoing story** from **completed the work**.
+- Associate **multiple crossposted story sources** with the same work, instead of creating duplicate reading histories.
+- Track **print, ebook, web, and audiobook editions** under one work; choose which edition should supply the main ISBN and page count.
+- Use the **Update center** to review known unread chapters and previously failed checks, and check supported sites manually.
 - Track **rereads** as independent reading runs without losing previous history.
 - Search titles, authors, fandoms, series, ISBNs, descriptions, personal notes and tags. Filter by type, status, shelves, exact author/series/tag, favorites and metadata completeness.
 - Store personal star ratings (0.5 increments), notes, publication status, word counts, source URLs and more. Imported tag lists in the book details panel collapse when long.
 - Import a **Goodreads library CSV** (from Goodreads → My Books → Import and export).
 - Search by **title/ISBN or author** from **+ Add work → Find online**. Author search returns many matching works, with checkboxes and an **Add N selected** action.
 - Paste a list of book titles using **+ Add work → Paste titles**. Enter an author once and import every pasted line as a book, even when catalog services are unavailable.
-- Import checked books as **Completed (date unknown)** or **Plan to read**. Existing titles and cross-provider duplicate editions are skipped without changing previous reading history.
+- Import checked books as **Completed (date unknown)** or **Plan to read**. Existing reading history remains untouched while newly recognized crosspost URLs and alternate ISBNs may be attached to matching existing works.
 - Show cover thumbnails in the library and larger covers in each work's details. Covers are cached on disk for offline use.
 - Enrich public metadata where available, including pages, year, ISBN, genre/subject tags, language and a description. Existing books have a **Fill missing metadata / cover** button.
 - Cache successful public book searches locally for 12 hours, reducing API requests and allowing previously searched titles to be viewed if the catalogs temporarily go offline.
@@ -37,7 +40,51 @@ Built with Python, PySide6, and SQLite. No account, cloud subscription, or alway
 - Explore the **Reading calendar**, marked dates, streaks, individual activities and time sessions. Export time logs as CSV.
 - Search the **Notes & quotes** journal, copy selections to the clipboard and export selected annotations to Markdown.
 - Review library statistics, recent progress history, reading goals, time spent and series progress.
+- Manage crosspost source URLs, editions, and manually triggered chapter checks without altering work-level reading history.
 - All data is saved locally in an SQLite database; portable JSON/XML import uses stable UUIDs for merge.
+
+## New in v0.9.0
+
+This release adds an additive **catalog relationship layer** around each existing work. A work remains the single anchor for reading history, notes, ratings, shelves, progress and time sessions, but can now have multiple websites and editions.
+
+### Multiple story sources
+
+- From a book's details, choose **Manage sources & editions**. In the **Story sources** tab, attach another hosted version or mirror URL. Recognized sites (AO3, FanFiction.net, Royal Road, Scribble Hub, SpaceBattles and Sufficient Velocity) get stable site IDs; arbitrary HTTPS links can still be stored, but are not automatically fetched.
+- **Make primary** chooses which source link appears in the main work record. You can change the primary without losing past milestones, rereads, quotes or other personal information. Removing a source only removes the link and its associated check history.
+- **Import improvements:** When matching an existing book by ISBN or recognized source ID, BookTracker can now also find alternate ISBNs and crossposted links. Bulk importing a recognized crosspost attaches it as a secondary source instead of forcing a new library entry.
+- **Automatic source URL reconciliation:** Editing the primary story URL in Edit Work updates the linked source record. New works with a source link have a linked source immediately, without restarting the application.
+
+### Editions and formats
+
+- The **Print / ebook / audiobook editions** tab supports edition title, format, ISBN, publisher, publication date, page count, language and personal edition notes.
+- Set an edition as preferred to expose its ISBN and (where progress is page-based) its page count in the main library. Reading progress and history are never reset.
+- Existing works with ISBNs are migrated into a basic edition record. Older custom entries without ISBN remain valid.
+- Additional ISBNs from imported duplicates can be preserved as non-preferred edition entries.
+
+### New Update center
+
+- The new **Update center** sidebar page lists tracked serialized works with their known read / published chapters, unread chapter counts, number of linked sources, last check and errors.
+- Filter by **Unread known chapters**, **Failed checks**, or **Never checked**, and search by title or author.
+- **Check chapters** retrieves metadata from a recognized public story site *only when you ask*. If the site blocks the request, the error is recorded without deleting your work, reducing the chapter count or claiming the story was removed.
+- **Import saved HTML** parses a browser-saved story page locally when automated access is blocked. This also records an update in that source's check history.
+- **Set chapter count manually** lets you enter a known count without contacting the provider. It is explicitly labeled as user-entered in the audit trail.
+- **View check history** shows the previously reported counts, errors, dates and notes for a source.
+- A higher published chapter count increases the work's known published total when appropriate. It does **not** advance your reading position or silently change your reading status.
+
+### Safer migration and backups
+
+- Database **schema v6** adds the work_sources, work_editions, and source_checks tables. Existing tables are not replaced or rewritten, and legacy primary URL/ISBN fields remain supported.
+- **Before applying the schema upgrade**, BookTracker creates a WAL-consistent SQLite backup in the adjacent backups/ directory named BookTracker-before-v09-...sqlite3.
+- Version 6 **JSON, XML and .btbackup** exports include linked sources, editions and source-check audit records, along with all previous reading history, notes, goals, saved views and sessions. Portable .btbackup continues to embed locally imported EPUB covers.
+- Old v1–v5 exports remain importable. Source and edition IDs are remapped during a merge to link records to an already-matched work without overwriting local personal changes.
+
+### Upgrade
+
+1. Close BookTracker and export your current library as a .btbackup file, storing the backup somewhere safe.
+2. In the BookTracker repository, run git pull then uv sync.
+3. Launch with uv run python -m booktracker. The additive database upgrade runs automatically.
+
+**Limitations:** Website checks are user-triggered and best-effort; no CAPTCHA or Cloudflare bypass, no continuously running background scraper, and no automatic new-chapter notifications. Unsupported HTTPS sites can be saved as links but won't be requested automatically. Check history records metadata observations, not proof that every individual chapter is available.
 
 ## Fixed in v0.8.1
 
@@ -203,17 +250,19 @@ The database is stored in your OS's user-data directory (platformdirs), not insi
 12. To reuse library searches and filters, click **Save current filters**. Explore **Insights** and **Library health** for more management tools.
 13. Use **Reading calendar → Log reading / listening** to record real reading time. Marked days contribute to the streak counter.
 14. Use **Notes & quotes** or the selected book's **Add bookmark / quote / note** action to store passages or reading reactions.
+15. From the selected book, choose **Manage sources & editions** to attach crossposts, alternate ISBNs, ebook editions or audiobooks.
+16. Open **Update center** to review serial backlogs, failed checks and source chapter history.
 11. To record something you read last year, choose **Log progress**, check **Set a specific reading date**, then select the historical date. To correct an older log, use **Reading history → Edit selected**.
 
 For existing Goodreads history, use **File → Import Goodreads CSV**. It imports Goodreads shelves and ratings; it does not create a detailed historical progress log that Goodreads never exported.
 
 ## Backup and portability
 
-| Format | Works & history | Shelves, goals & personal journal | Local EPUB covers |
+| Format | Works & history | Sources, editions, personal journal | Local EPUB covers |
 |---|---|---|---|
 | **.btbackup** portable bundle | Yes | Yes (including time, notes and saved views) | **Yes** |
-| JSON (schema v5) | Yes | Yes (including time, notes and saved views) | No |
-| XML (schema v5) | Yes | Yes (including time, notes and saved views) | No |
+| JSON (schema v6) | Yes | Yes (including time, notes and saved views) | No |
+| XML (schema v6) | Yes | Yes (including time, notes and saved views) | No |
 | CSV catalog | Works/metadata only | No | No |
 | Goodreads CSV (import) | Imported work fields | No | No |
 
@@ -245,7 +294,7 @@ To run a minimal GUI smoke test without a display on CI, set QT_QPA_PLATFORM=off
 
 Project layout:
 
-- booktracker/database.py — reading runs, timed sessions, annotations, calendar/streak statistics, shelves, and versioned merges
+- booktracker/database.py — reading runs, timed sessions, annotations, calendar/streak statistics, shelves, linked sources/editions and versioned merges
 - booktracker/backups.py — daily SQLite snapshots and retention
 - booktracker/integrations.py — Open Library/story metadata, Goodreads CSV, JSON/XML/CSV
 - booktracker/epub_import.py — offline EPUB metadata and embedded cover parsing
