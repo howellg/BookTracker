@@ -51,6 +51,66 @@ Built with Python, PySide6, and SQLite. No account, cloud subscription, or alway
 - All data is saved locally in an SQLite database; portable JSON/XML import uses stable UUIDs for merge.
 - Use **Device sync** to exchange portable snapshots via a dedicated shared folder with per-field conflict review and recovery backups.
 
+## New in v0.19.0 — Pitch-preserving audio and listening workflow upgrades
+
+### Narrators keep their natural pitch at faster speed
+
+**Fixed:** v0.18's Qt 6.8 audio backend changed pitch when playback speed
+increased, making narrators sound unnaturally high. v0.19 selects the installed
+**mpv** media engine for variable-speed playback, with its explicit
+`--audio-pitch-correction=yes` setting. This keeps voices at their original
+pitch when adjusting speed (0.75×–2.5×). It also isolates playback from
+custom mpv scripts/configuration and accepts only linked local M4B files.
+
+On Arch Linux, install mpv if needed:
+
+```bash
+sudo pacman -S mpv
+```
+
+**Pitch safety fallback:** If mpv isn't available on another computer,
+BookTracker falls back to QtMultimedia at **1.0× only**, disabling the speed
+selector instead of silently pitch-shifting audio. Playback quality and
+available codecs depend on the installed backend; the existing
+**Open audio file** command always remains available.
+
+### Playback controls across the app
+
+A compact **audio control bar** appears at the bottom of BookTracker whenever
+the built-in player is open, on *every* page. It can play/pause, move back or
+forward 30 seconds, switch between parts, reopen the player window, or close
+audio. It shows the current title and playback position.
+
+### Better audiobook queues
+
+- New **play queue** in the player with double-click to play, Move up/down,
+  Remove (except the active part), and Restore sequence.
+- Select a file in **Audiobooks → Queue next** to place another compatible
+  part immediately after the currently playing part.
+- Queue order and removed parts persist in per-device settings across app
+  restarts. Restoring sequence returns all currently available parts.
+  Newly imported compatible parts join the queue without losing your edits.
+- The queue never automatically combines different books, narrators,
+  complete editions or standalone files.
+- Optional auto-next still respects the current queue, including reorderings.
+
+### EPUB and audio together
+
+The integrated EPUB reader's **Saved** tab now has a **♫ Listen** shortcut
+for books linked to an available M4B. If a book has more than one locally
+available audiobook, you choose which file to open. There is no fabricated
+EPUB-to-audio chapter alignment.
+
+**Data safety:** Listening time remains manual and explicitly confirmed;
+playing, skipping, auto-next, queue edits and resume points never change
+reading milestones or sessions. The queue and playback locations are stored
+in local device settings rather than the SQLite library, and do not sync
+or enter portable backups. No schema migration is needed.
+
+To update, close BookTracker, then run `git pull --ff-only && uv sync`
+from `~/BookTracker` before launching with
+`uv run python -m booktracker`.
+
 ## New in v0.18.0 — Local audiobook player and listening workflows
 
 Open **Audiobooks**, select a locally available M4B, and click
