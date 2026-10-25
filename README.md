@@ -51,6 +51,32 @@ Built with Python, PySide6, and SQLite. No account, cloud subscription, or alway
 - All data is saved locally in an SQLite database; portable JSON/XML import uses stable UUIDs for merge.
 - Use **Device sync** to exchange portable snapshots via a dedicated shared folder with per-field conflict review and recovery backups.
 
+## New in v0.16.0 — EPUB reader search and navigation
+
+The built-in EPUB reader now has **Find in book** for searching beyond the
+currently visible section. Results appear in a separate list, with section
+names and short excerpts. Double-click a result to open and select its passage.
+Ordinary **Find next** continues to search just the open section.
+
+- EPUB-wide searches run off the interface thread, can be cancelled, and
+  never contact the internet or save search terms in your library.
+- Safety limits: up to 200 matches, up to 30 per section, up to 2,000 spine
+  sections and 10 million characters inspected. A partial-results notice
+  explains when a limit was reached. Damaged sections are skipped with a
+  warning; original EPUB files are not altered.
+- **Filter contents by title** makes lengthy EPUB tables of contents easier
+  to browse without affecting the current reading position. For EPUBs
+  without navigation metadata, headings become filterable as sections
+  are opened.
+- New shortcuts: **Ctrl+F** focuses section search, **Ctrl+Shift+F**
+  searches the entire EPUB using the entered term, **Alt+Home / Alt+End**
+  jumps to the first or last section. Alt+Left / Alt+Right still navigates
+  between sections.
+- No database migration or backup-format changes; reading-progress
+  milestones and listening/reading time remain explicitly logged only.
+- To update from an earlier version, close BookTracker, run
+  `git pull && uv sync`, then `uv run python -m booktracker`.
+
 ## New in v0.15.0 — Integrated EPUB reader
 
 Read linked EPUB files inside BookTracker, without leaving the desktop app.
