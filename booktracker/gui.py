@@ -74,6 +74,7 @@ from .integrations import (
     source_from_url,
 )
 from .metadata import missing_book_metadata
+from .reader_gui import EpubReader
 from .sync_gui import SyncPage
 
 LABELS = {
@@ -1839,6 +1840,7 @@ class LocalFilesDialog(QDialog):
         actions=QHBoxLayout()
         for caption,callback in (
             ("+ Attach files",self.attach),
+            ("Read EPUB",self.read_selected_epub),
             ("Open selected",self.open_file),
             ("Relink selected",self.relink),
             ("Find in folder",self.relink_folder),
@@ -1903,6 +1905,18 @@ class LocalFilesDialog(QDialog):
         self.refresh()
         if errors:
             QMessageBox.warning(self,"Some files not linked","\n".join(errors[:12]))
+
+    def read_selected_epub(self):
+        key=self.selected_file_id()
+        if not key:
+            QMessageBox.information(self,"Choose EPUB","Select an EPUB file first.")
+            return
+        try:
+            reader=EpubReader(self,self.library,key)
+            reader.exec()
+            self.refresh()
+        except (ValueError,OSError,KeyError) as exc:
+            QMessageBox.warning(self,"EPUB reader",str(exc))
 
     def open_file(self):
         key=self.selected_file_id()
@@ -2375,6 +2389,7 @@ class MainWindow(QMainWindow):
         for title, callback, shortcut in (
             ("Add work", self.add_work, "Ctrl+N"),
             ("Import EPUB files", self.import_epub_files, "Ctrl+Shift+E"),
+            ("Read selected EPUB", self.read_selected_epub, "Ctrl+Alt+R"),
             ("Import Goodreads CSV", self.import_goodreads_csv, ""),
             ("Import BookTracker file", self.import_library, ""),
             ("Export BookTracker file", self.export_library, "Ctrl+Shift+S"),
@@ -4452,6 +4467,43 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             fail(self,exc)
 
+    def read_selected_epub(self):
+        work=self.selected_work()
+        if not work:
+            QMessageBox.information(
+                self,"Choose a book","Select a book with a linked EPUB first."
+            )
+            return
+        files=[
+            file for file in self.library.list_local_files(work["id"])
+            if file["format"]=="epub"
+        ]
+        if not files:
+            QMessageBox.information(
+                self,"No EPUB linked",
+                "Use Local files → + Attach files to link an EPUB first."
+            )
+            return
+        if len(files)==1:
+            selected=files[0]
+        else:
+            options=[
+                f"{file['filename']} — {'Available' if file['available'] else 'Missing'}"
+                for file in files
+            ]
+            name,okay=QInputDialog.getItem(
+                self,"Choose an EPUB","Linked editions:",options,0,False
+            )
+            if not okay:
+                return
+            selected=files[options.index(name)]
+        try:
+            reader=EpubReader(self,self.library,selected["id"])
+            reader.exec()
+            self.refresh_all(work["id"])
+        except (OSError,ValueError,KeyError) as exc:
+            QMessageBox.warning(self,"EPUB reader",str(exc))
+
     def manage_local_files(self):
         work=self.selected_work()
         if not work:
@@ -5108,6 +5160,14 @@ class MainWindow(QMainWindow):
             f"Local files ({len(self.library.list_local_files(work_id))})",
             self.manage_local_files
         ))
+        linked_epubs=[
+            file for file in self.library.list_local_files(work_id)
+            if file["format"]=="epub"
+        ]
+        if linked_epubs:
+            self.details.addWidget(button(
+                "Read EPUB in BookTracker", self.read_selected_epub, primary=True
+            ))
         audio_files=self.library.list_audio_files(work_id=work_id)
         if audio_files:
             hours=sum(f["duration_ms"] for f in audio_files

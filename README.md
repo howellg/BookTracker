@@ -14,6 +14,7 @@ Built with Python, PySide6, and SQLite. No account, cloud subscription, or alway
 - Build a **reading queue** with priority, planned dates, personal notes, manual order and random suggestions.
 - Associate existing EPUB/M4B/PDF and other reading files with a book; bulk-relink missing files from a folder across computers.
 - Import AudiobookAI completed parts and archival editions read-only, or scan standalone M4Bs. Match titles deliberately, inspect narrator/part/duration/chapter metadata, and open media in the system player.
+- Read EPUBs in BookTracker with themes, navigation, persistent positions, bookmarks, quotes, search and optional progress logging.
 - Associate **multiple crossposted story sources** with the same work, instead of creating duplicate reading histories.
 - Track **print, ebook, web, and audiobook editions** under one work; choose which edition should supply the main ISBN and page count.
 - Use the **Update center** to follow ongoing stories, distinguish newly detected vs unread chapters, inspect release history, and run bounded manual or opt-in checks.
@@ -49,6 +50,69 @@ Built with Python, PySide6, and SQLite. No account, cloud subscription, or alway
 - Manage crosspost URLs, editions, followed stories, observed releases, and safe manual/opt-in chapter checks without altering work-level reading history.
 - All data is saved locally in an SQLite database; portable JSON/XML import uses stable UUIDs for merge.
 - Use **Device sync** to exchange portable snapshots via a dedicated shared folder with per-field conflict review and recovery backups.
+
+## New in v0.15.0 — Integrated EPUB reader
+
+Read linked EPUB files inside BookTracker, without leaving the desktop app.
+
+### Open a book
+
+1. Select a work in **My library** and click **Read EPUB in BookTracker**,
+   which appears for books with linked EPUB files.
+2. If several editions are attached, choose the desired EPUB.
+3. Alternatively choose **Local files → Read EPUB**, or **File → Read selected
+   EPUB** (Ctrl+Alt+R). Attach your existing EPUB via Local files when needed.
+4. The reader opens at your saved location. EPUB files from another computer
+   must be relinked before they can be opened.
+
+### Navigation, themes and images
+
+- Navigate with Previous/Next, the contents panel, or Alt+Left/Alt+Right.
+  EPUB3 navigation and EPUB2 NCX tables of contents are supported. Books
+  without contents metadata show numbered sections and titles discovered
+  from headings when visited.
+- Choose Dark, Sepia or Light theme and adjust type size with A−/A+.
+  Theme and text zoom persist across application launches.
+- Find text within the current section. Double-click saved bookmarks to
+  return to an approximate saved location. The sidebar can be resized.
+- Render permitted local JPEG, PNG, GIF and WebP images from the EPUB
+  under size and pixel-count limits. No HTML resources are loaded from
+  external sites; no EPUB contents are extracted to disk.
+- Current spine section and normalized scroll ratio save automatically.
+  Merely opening or scrolling never creates a reading-history event.
+
+### Bookmarks, notes and real reading history
+
+- Create labeled bookmarks for an EPUB's section and approximate scroll
+  location. Remove bookmarks without removing their book.
+- Save notes and selected quotes into the existing Notes & quotes journal,
+  linked to the book and its current spine section.
+- **Log reading progress…** requires a user-entered numeric position and
+  explicit confirmation. EPUB spine sections are NOT reliably equivalent
+  to actual chapters or printed pages; no completion is inferred.
+- No reading/listening time is fabricated. The existing reading timer can
+  still be used to record actual sessions.
+
+### Safety and limitations
+
+- EPUB text is rendered locally in Qt, not in a web browser. Scripts,
+  active HTML, CSS styling, external images, remote URLs, forms and unsafe
+  file paths are stripped. EPUB ZIP size and internal member counts are
+  bounded. The original EPUB is never modified.
+- Complex publisher layouts, advanced CSS, interactive pages, SVGs and
+  mathematical notation may not be reproduced perfectly. For specialized
+  layouts, use a dedicated EPUB application.
+- SQLite **schema v11** adds epub_positions and epub_bookmarks; all
+  existing reading history, AudiobookAI metadata and sync settings remain.
+- Before migration BookTracker creates a WAL-consistent snapshot at
+  backups/BookTracker-before-v015-*.sqlite3.
+- JSON, XML and portable .btbackup exports now include reader positions
+  and bookmarks, never full EPUB bytes or machine-specific paths.
+  BookTracker shared-folder sync also exchanges reader locations with
+  conservative conflict review. Relink the original EPUB on each computer.
+- Backup formats v1–v10 are still importable.
+- To upgrade, close the app, export a precautionary .btbackup, then run
+  git pull, uv sync, and uv run python -m booktracker.
 
 ## Fix in v0.14.1
 
@@ -571,8 +635,8 @@ For existing Goodreads history, use **File → Import Goodreads CSV**. It import
 | Format | Works & history | Audio metadata, follows, queue, journal | Local EPUB covers |
 |---|---|---|---|
 | **.btbackup** portable bundle | Yes | Yes (including time, notes and saved views) | **Yes** |
-| JSON (schema v10) | Yes | Yes (including time, notes and saved views) | No |
-| XML (schema v10) | Yes | Yes (including time, notes and saved views) | No |
+| JSON (schema v11) | Yes | Yes (including time, notes and saved views) | No |
+| XML (schema v11) | Yes | Yes (including time, notes and saved views) | No |
 | CSV catalog | Works/metadata only | No | No |
 | Goodreads CSV (import) | Imported work fields | No | No |
 
@@ -608,6 +672,8 @@ Project layout:
 - booktracker/audiobooks.py — read-only AudiobookAI Studio ledger, bounded M4B scanning and FFprobe metadata parsing
 - booktracker/sync.py — portable shared-folder snapshots, peer baselines and conservative three-way reconciliation
 - booktracker/sync_gui.py — peer discovery and explicit field-conflict review
+- booktracker/epub_reader.py — bounded offline EPUB parser with TOC and sanitized HTML
+- booktracker/reader_gui.py — Qt EPUB reading interface, bookmarks and user-controlled progress
 - booktracker/audio_gui.py — audiobook catalogue, matching preview, M4B discovery worker and chapter viewer
 - booktracker/backups.py — daily SQLite snapshots and retention
 - booktracker/integrations.py — Open Library/story metadata, Goodreads CSV, JSON/XML/CSV
