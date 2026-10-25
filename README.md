@@ -51,6 +51,44 @@ Built with Python, PySide6, and SQLite. No account, cloud subscription, or alway
 - All data is saved locally in an SQLite database; portable JSON/XML import uses stable UUIDs for merge.
 - Use **Device sync** to exchange portable snapshots via a dedicated shared folder with per-field conflict review and recovery backups.
 
+## New in v0.17.0 — Reading comfort and annotations
+
+The integrated EPUB reader now offers a more comfortable layout and direct
+access to the notes you create as you read.
+
+- **Readable typography:** Choose Serif, Sans or Monospace fonts, Compact /
+  Normal / Relaxed line spacing, and Narrow / Comfortable / Wide margins.
+  Font size still uses A− and A+. These controls use Qt document formatting,
+  not just widget stylesheet text size.
+- **Fourth theme:** High contrast joins Dark, Sepia and Light.
+- **Focus reading:** Hide the navigation sidebar for a distraction-free view.
+  The button restores it instantly, and the preference persists next launch.
+- **Tabbed sidebar:** Contents (with title filter), book-wide Search results,
+  and Saved (EPUB position bookmarks and the work's notes / quotes). The
+  reader fits a compact 660×480 window, including the two-row action buttons.
+- **Approximate section scroll meter:** Shows how far down the current EPUB
+  *spine section* you've scrolled. It never claims a chapter, page, or work
+  completion percentage and never adds formal progress or minutes.
+- **Quick selection copy:** Copy selected text to the clipboard without
+  saving a new note.
+- **Bookmark renaming:** Update a bookmark's label without changing its
+  original section or scroll location. Renames participate in the same
+  review-driven, field-level Device sync as other supported edits.
+- **Work-specific notes:** View, search, edit, copy and explicitly delete
+  notes and quotes without leaving the reader. Existing journal records are
+  reused; there are no parallel annotation databases.
+- **Markdown export:** Export up to 5,000 notes and quotes belonging to the
+  current work to a chosen local file using an atomic write. Other books'
+  annotations are not included.
+
+Reading positions still save automatically; completing chapters/pages and
+recording reading time remain explicit operations. There is **no database
+migration** or backup format change from v0.16. Portable backups and
+two-device sync continue to work.
+
+After closing BookTracker, run `git pull --ff-only && uv sync` from your
+BookTracker directory and restart with `uv run python -m booktracker`.
+
 ## New in v0.16.0 — EPUB reader search and navigation
 
 The built-in EPUB reader now has **Find in book** for searching beyond the

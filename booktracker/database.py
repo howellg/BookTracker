@@ -2778,6 +2778,17 @@ class Library:
             )
         return identifier
 
+    def rename_epub_bookmark(self, identifier, label):
+        """Rename a saved reader bookmark without moving its position."""
+        label = self._epub_bookmark_label(label)
+        with self.transaction():
+            changed = self.db.execute(
+                "UPDATE epub_bookmarks SET label=?,updated_at=? WHERE id=?",
+                (label, now(), identifier),
+            ).rowcount
+            if not changed:
+                raise ValueError("EPUB bookmark no longer exists.")
+
     def remove_epub_bookmark(self,identifier):
         with self.transaction():
             return bool(self.db.execute(
