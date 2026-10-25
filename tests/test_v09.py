@@ -318,7 +318,7 @@ def test_catalog_dialog_source_and_edition_workflows(tmp_path,monkeypatch):
     db.record_progress_on(key,22,date="2026-06-01")
     screen=MainWindow(db)
     try:
-        assert len(screen.nav_buttons)==11
+        assert len(screen.nav_buttons)==12
         manager=CatalogManagerDialog(screen,db,key)
         try:
             assert manager.sources.rowCount()==0

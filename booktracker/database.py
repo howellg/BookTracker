@@ -7,7 +7,7 @@ import sqlite3
 import uuid
 from contextlib import contextmanager
 from datetime import date as date_class
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 KINDS = ("book", "fanfiction", "web_novel", "other")
@@ -1610,7 +1610,7 @@ class Library:
                 raise ValueError("Location must be a whole-number chapter or page.") from exc
             if not 0 <= location <= 10000000:
                 raise ValueError("Location is outside the supported range.")
-        if location_unit not in ("", *UNITS):
+        if location_unit not in ("", *UNITS, "kindle_location"):
             raise ValueError("Unknown bookmark location unit.")
         if location is None:
             location_unit = ""
@@ -2550,6 +2550,220 @@ class Library:
                 "DELETE FROM local_files WHERE id=?", (file_id,)
             )
             return bool(cursor.rowcount)
+
+    def reading_habits(self, *, days=30, today=None):
+        """Summarize real dated activity without guessing unlogged time."""
+        days = int(days)
+        if not 1 <= days <= 3650:
+            raise ValueError("Choose an interval between 1 and 3,650 days.")
+        end = date_class.fromisoformat(self._day(today or date_class.today()))
+        start = end - timedelta(days=days - 1)
+        if start.year < 1900:
+            raise ValueError("Selected period predates supported dates.")
+        source = self.daily_activity()
+        selected = {
+            date_class.fromisoformat(key): value
+            for key, value in source.items()
+            if start.isoformat() <= key <= end.isoformat()
+        }
+        weekdays = [
+            {"index": i, "day": day, "active_days": 0, "minutes": 0,
+             "reading_minutes": 0, "listening_minutes": 0, "chapters": 0, "pages": 0}
+            for i, day in enumerate(("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"))
+        ]
+        weeks = {}
+        longest = current = 0
+        for offset in range(days):
+            day = start + timedelta(days=offset)
+            bucket = selected.get(day)
+            if bucket:
+                current += 1
+                longest = max(longest, current)
+                weekday = weekdays[day.weekday()]
+                weekday["active_days"] += 1
+                for unit in ("reading_minutes", "listening_minutes", "chapters", "pages"):
+                    weekday[unit] += bucket[unit]
+                weekday["minutes"] += bucket["reading_minutes"] + bucket["listening_minutes"]
+            else:
+                current = 0
+            monday = (day - timedelta(days=day.weekday())).isoformat()
+            week = weeks.setdefault(monday, {
+                "week_start": monday, "active_days": 0, "reading_minutes": 0,
+                "listening_minutes": 0, "chapters": 0, "pages": 0, "sessions": 0,
+            })
+            if bucket:
+                week["active_days"] += 1
+                for unit in ("reading_minutes", "listening_minutes", "chapters", "pages", "sessions"):
+                    week[unit] += bucket[unit]
+        totals = {
+            unit: sum(bucket[unit] for bucket in selected.values())
+            for unit in ("reading_minutes", "listening_minutes", "chapters",
+                         "pages", "sessions", "milestones")
+        }
+        top = {}
+        for session in self.db.execute(
+            """SELECT s.work_id,w.title,w.author,s.mode,
+                      SUM(s.minutes) AS minutes
+               FROM reading_sessions s JOIN works w ON w.id=s.work_id
+               WHERE s.read_date BETWEEN ? AND ?
+               GROUP BY s.work_id,s.mode""",
+            (start.isoformat(), end.isoformat()),
+        ):
+            work = top.setdefault(session["work_id"], {
+                "work_id": session["work_id"], "title": session["title"],
+                "author": session["author"], "reading_minutes": 0,
+                "listening_minutes": 0,
+            })
+            work[session["mode"] + "_minutes"] += session["minutes"]
+        titles = sorted(
+            top.values(),
+            key=lambda w: (-w["reading_minutes"]-w["listening_minutes"],
+                           w["title"].casefold()),
+        )
+        # Known dates only; completion marked unknown never counts.
+        completions = set()
+        for row in self.db.execute(
+            "SELECT work_id,finished_at FROM reading_runs WHERE finished_at!=''"
+        ):
+            finished = self.activity_day(row["finished_at"])
+            if finished and start.isoformat() <= finished <= end.isoformat():
+                completions.add(row["work_id"])
+        for row in self.db.execute(
+            "SELECT id,finished_at FROM works WHERE status='completed' AND finished_at!=''"
+        ):
+            finished = self.activity_day(row["finished_at"])
+            if finished and start.isoformat() <= finished <= end.isoformat():
+                completions.add(row["id"])
+        return {
+            "start": start.isoformat(), "end": end.isoformat(),
+            "days": days, "active_days": len(selected), "longest_streak": longest,
+            "completions": len(completions), **totals,
+            "minutes": totals["reading_minutes"] + totals["listening_minutes"],
+            "weekdays": weekdays, "weeks": list(weeks.values()),
+            "top_books": titles,
+            "daily": [
+                {"date": key.isoformat(), **selected[key]}
+                for key in sorted(selected)
+            ],
+        }
+
+    def annual_goal_pacing(self, *, year=None, today=None):
+        """Compare existing annual goals to calendar pace, not guessed reading."""
+        from calendar import isleap
+
+        date_value = date_class.fromisoformat(self._day(today or date_class.today()))
+        year = int(year or date_value.year)
+        if not 1900 <= year <= 2200:
+            raise ValueError("Invalid reading goal year.")
+        duration = 366 if isleap(year) else 365
+        if date_value.year < year:
+            elapsed = 0
+        elif date_value.year > year:
+            elapsed = duration
+        else:
+            elapsed = date_value.timetuple().tm_yday
+        goal = self.get_goal(year)
+        actual = self.goal_progress(year)
+        metrics = {}
+        for key in ("books","chapters","pages"):
+            total = goal[key + "_target"]
+            observed = actual[key]
+            expectation = total * elapsed / duration if total else 0
+            projection = (
+                observed * duration / elapsed if elapsed else 0
+            )
+            metrics[key] = {
+                "actual": observed, "target": total,
+                "expected_now": round(expectation,1),
+                "projected_year_end": round(projection,1),
+                "on_pace": observed >= expectation if total and elapsed else None,
+                "percent": round(100*observed/total,1) if total else None,
+            }
+        return {"year": year, "elapsed_days": elapsed,
+                "total_days": duration, "metrics": metrics}
+
+    def import_clippings(self, records, decisions):
+        """Import preview-approved Kindle passages atomically.
+
+        decisions maps (normalized title, normalized author) to either an
+        existing work ID, 'create', or None. Default is to skip, never guess.
+        Deterministic annotation IDs make repeated imports idempotent.
+        """
+        if not isinstance(records, list) or len(records) > 100000:
+            raise ValueError("Invalid or excessively large clippings collection.")
+        if not isinstance(decisions, dict):
+            raise ValueError("Clippings import requires explicit book matching.")
+        created = {}
+        result = {"imported": 0, "duplicates": 0, "skipped": 0, "created": 0}
+        with self.transaction():
+            for row in records:
+                if not isinstance(row, dict):
+                    raise ValueError("Malformed Kindle clipping.")
+                title = str(row.get("title") or "").strip()
+                author = str(row.get("author") or "").strip()
+                if not title or len(title) > 500 or len(author) > 350:
+                    raise ValueError("Kindle clipping is missing a valid title.")
+                key = (title.casefold(), author.casefold())
+                choice = decisions.get(key)
+                if choice is None:
+                    result["skipped"] += 1
+                    continue
+                if choice == "create":
+                    if key not in created:
+                        ident = str(uuid.uuid5(
+                            uuid.NAMESPACE_URL,
+                            json.dumps(
+                                ["booktracker-kindle-custom-v1", key],
+                                ensure_ascii=False, separators=(",", ":")
+                            )
+                        ))
+                        previous = self.get_work(ident)
+                        if previous:
+                            if (
+                                previous["title"].casefold(),
+                                previous["author"].casefold()
+                            ) != key:
+                                raise ValueError(
+                                    "Custom Kindle book ID conflicts with another work."
+                                )
+                        else:
+                            self.db.execute(
+                                """INSERT INTO works
+                                (id,title,author,kind,status,publication_status,
+                                 progress_unit,added_at,updated_at)
+                                VALUES (?,?,?,'book','plan_to_read','unknown','pages',?,?)""",
+                                (ident, title, author, now(), now()),
+                            )
+                            result["created"] += 1
+                        created[key] = ident
+                    work_id = created[key]
+                else:
+                    work_id = str(choice)
+                    if not self.get_work(work_id):
+                        raise ValueError("Matched Kindle clipping work no longer exists.")
+                values = self._annotation_values(
+                    row.get("kind"), row.get("body"), row.get("location"),
+                    row.get("location_unit", ""),
+                )
+                stable = json.dumps([
+                    "kindle-clipping-v1", work_id, key, *values
+                ], ensure_ascii=False, separators=(",", ":"))
+                ident = str(uuid.uuid5(uuid.NAMESPACE_URL, stable))
+                existing = self.db.execute(
+                    "SELECT 1 FROM annotations WHERE id=?", (ident,)
+                ).fetchone()
+                if existing:
+                    result["duplicates"] += 1
+                    continue
+                stamp = now()
+                self.db.execute(
+                    """INSERT INTO annotations
+                    (id,work_id,kind,location,location_unit,body,created_at,updated_at)
+                    VALUES(?,?,?,?,?,?,?,?)""",
+                    (ident,work_id,*values,stamp,stamp),
+                )
+                result["imported"] += 1
+        return result
 
     def export_data(self):
         return {"format": "booktracker", "schema_version": 7, "exported_at": now(),

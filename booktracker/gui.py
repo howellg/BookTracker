@@ -7,7 +7,7 @@ import webbrowser
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QDate, QSettings, QSize, Qt, QThread, QUrl, Signal
+from PySide6.QtCore import QDate, QElapsedTimer, QSettings, QSize, Qt, QThread, QTimer, QUrl, Signal
 from PySide6.QtGui import (
     QAction,
     QColor,
@@ -59,8 +59,9 @@ from PySide6.QtWidgets import (
 
 from .backups import automatic_backup
 from .book_search import _normalize, cached_book_search
+from .clippings import group_clippings, read_clippings
 from .covers import CoverCache, cover_url_for
-from .database import KINDS, PUBLICATION, STATUSES, UNITS, Library
+from .database import KINDS, PUBLICATION, STATUSES, UNITS, Library, _book_identity
 from .epub_import import read_epub_metadata
 from .integrations import (
     export_file,
@@ -78,6 +79,7 @@ LABELS = {
     "completed": "Completed", "paused": "Paused", "dropped": "Dropped",
     "unknown": "Unknown", "ongoing": "Ongoing", "hiatus": "Hiatus",
     "chapters": "Chapters", "pages": "Pages", "percent": "Percent",
+    "kindle_location": "Kindle location",
 }
 BG = "#10151f"
 PANEL = "#192231"
@@ -1110,7 +1112,7 @@ class AnnotationDialog(QDialog):
         self.location.setRange(0, 10000000)
         self.location.setToolTip("The chapter, page or percentage for this entry.")
         self.unit = QComboBox()
-        for key in UNITS:
+        for key in (*UNITS, "kindle_location"):
             self.unit.addItem(name(key), key)
         self.unit.setToolTip("Choose whether the position refers to chapters, pages or percent.")
         self.has_location.toggled.connect(self.location.setEnabled)
@@ -1950,6 +1952,267 @@ class LocalFilesDialog(QDialog):
         self.refresh()
 
 
+class ReadingTimerDialog(QDialog):
+    """Monotonic, foreground stopwatch. Saves only on explicit confirmation."""
+
+    def __init__(self, parent, library, *, work_id=None):
+        super().__init__(parent)
+        self.setWindowTitle("Reading / audiobook timer")
+        self.resize(560, 465)
+        self.setMinimumWidth(450)
+        layout = QVBoxLayout(self)
+        layout.addWidget(label(
+            "Time only counts while this stopwatch is running. "
+            "Pause it any time, then save real minutes to your calendar.",
+            "muted"
+        ))
+        form = QFormLayout()
+        self.book = QComboBox()
+        self.book.setEditable(True)
+        self.book.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.book.completer().setFilterMode(Qt.MatchFlag.MatchContains)
+        for work in library.list_works(sort="title"):
+            self.book.addItem(
+                f"{work['title']} — {work['author'] or 'Unknown author'}", work["id"]
+            )
+        if work_id:
+            idx = self.book.findData(work_id)
+            if idx >= 0:
+                self.book.setCurrentIndex(idx)
+        self.mode = QComboBox()
+        self.mode.addItem("Reading (text / ebooks)", "reading")
+        self.mode.addItem("Listening (audiobooks)", "listening")
+        self.date = QDateEdit()
+        self.date.setCalendarPopup(True)
+        self.date.setDisplayFormat("yyyy-MM-dd")
+        self.date.setMinimumDate(QDate(1900,1,1))
+        self.date.setMaximumDate(QDate(2200,12,31))
+        self.date.setDate(QDate.currentDate())
+        self.note = QTextEdit()
+        self.note.setPlaceholderText("Optional session notes…")
+        self.note.setMinimumHeight(70)
+        self.note.setMaximumHeight(100)
+        for title,control in (
+            ("Book",self.book),("Session type",self.mode),
+            ("Reading date",self.date),("Note",self.note)
+        ):
+            form.addRow(title,control)
+        layout.addLayout(form)
+        self.clock=label("00:00:00","value")
+        self.clock.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        layout.addWidget(self.clock)
+        controls=QHBoxLayout()
+        self.start_button=button("Start",self.toggle_timer,primary=True)
+        self.reset_button=button("Reset timer",self.reset_timer)
+        controls.addWidget(self.start_button)
+        controls.addWidget(self.reset_button)
+        layout.addLayout(controls)
+        layout.addWidget(label(
+            "The clock uses elapsed (monotonic) time; no reading progress is inferred. "
+            "Sessions shorter than 60 seconds cannot be saved. "
+            "Closing without saving discards this stopwatch.",
+            "muted"
+        ))
+        actions=QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save |
+            QDialogButtonBox.StandardButton.Cancel
+        )
+        actions.accepted.connect(self.save_timer)
+        actions.rejected.connect(self.reject)
+        layout.addWidget(actions)
+        self._accumulated_ms=0
+        self._running=False
+        self._elapsed=QElapsedTimer()
+        self._ticker=QTimer(self)
+        self._ticker.setInterval(250)
+        self._ticker.timeout.connect(self.refresh_timer)
+
+    def elapsed_ms(self):
+        return self._accumulated_ms + (
+            self._elapsed.elapsed() if self._running else 0
+        )
+
+    def refresh_timer(self):
+        seconds=self.elapsed_ms()//1000
+        hours,remain=divmod(seconds,3600)
+        minutes,seconds=divmod(remain,60)
+        self.clock.setText(f"{hours:02d}:{minutes:02d}:{seconds:02d}")
+
+    def toggle_timer(self):
+        if self._running:
+            self._accumulated_ms+=self._elapsed.elapsed()
+            self._running=False
+            self._ticker.stop()
+            self.start_button.setText("Resume")
+        else:
+            self._elapsed.start()
+            self._running=True
+            self._ticker.start()
+            self.start_button.setText("Pause")
+        self.refresh_timer()
+
+    def reset_timer(self):
+        if self.elapsed_ms() and QMessageBox.question(
+            self,"Reset timer?","Discard the elapsed time from this stopwatch?"
+        )!=QMessageBox.StandardButton.Yes:
+            return
+        self._running=False
+        self._ticker.stop()
+        self._accumulated_ms=0
+        self.start_button.setText("Start")
+        self.refresh_timer()
+
+    def values(self):
+        return {
+            "read_date":self.date.date().toString("yyyy-MM-dd"),
+            "minutes":self.elapsed_ms()//60000,
+            "mode":self.mode.currentData(),
+            "note":self.note.toPlainText(),
+        }
+
+    def save_timer(self):
+        index=self.book.currentIndex()
+        if (index<0 or not self.book.currentData()
+                or self.book.currentText()!=self.book.itemText(index)):
+            QMessageBox.warning(
+                self,"Select book","Choose a book from your library."
+            )
+            return
+        values=self.values()
+        if values["minutes"]<1:
+            QMessageBox.warning(
+                self,"Session too short",
+                "At least one full minute is required to log reading time."
+            )
+            return
+        if values["minutes"]>1440:
+            QMessageBox.warning(
+                self,"Session too long",
+                "BookTracker supports sessions of up to 24 hours. "
+                "Save shorter sessions separately."
+            )
+            return
+        self.accept()
+
+    def done(self,code):
+        if (
+            code!=QDialog.DialogCode.Accepted
+            and self.elapsed_ms()>=1000
+            and QMessageBox.question(
+                self,"Discard unsaved time?",
+                "This timed session has not been saved. Discard the elapsed time?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )!=QMessageBox.StandardButton.Yes
+        ):
+            return
+        if code==QDialog.DialogCode.Accepted and self._running:
+            # Freeze the exact accepted duration before the caller persists it.
+            self._accumulated_ms+=self._elapsed.elapsed()
+            self._running=False
+        self._ticker.stop()
+        super().done(code)
+
+
+class ClippingsPreviewDialog(QDialog):
+    """Preview and explicitly choose each Kindle book target before importing."""
+
+    def __init__(self,parent,library,parsed):
+        super().__init__(parent)
+        self.library=library
+        self.parsed=parsed
+        self.groups=group_clippings(parsed["records"])
+        self.setWindowTitle("Import Kindle clippings")
+        self.resize(1020,650)
+        self.setMinimumSize(740,520)
+        layout=QVBoxLayout(self)
+        layout.addWidget(label("Review Kindle highlights and notes","headline"))
+        layout.addWidget(label(
+            f"{len(parsed['records'])} readable passages across "
+            f"{len(self.groups)} Kindle titles; {parsed['skipped']} unsupported "
+            "or empty entries skipped. Nothing is imported until you confirm.",
+            "muted"
+        ))
+        layout.addWidget(label(
+            "For each title, choose a specific library book, create a new custom "
+            "book, or skip it. BookTracker only auto-selects a unique exact "
+            "title/author match. Original Kindle locations are preserved.",
+            "muted"
+        ))
+        self.table=QTableWidget(len(self.groups),3)
+        self.table.setHorizontalHeaderLabels(
+            ["Kindle title / author","Passages","Target in BookTracker"]
+        )
+        self.table.verticalHeader().setVisible(False)
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table.horizontalHeader().setSectionResizeMode(
+            0,QHeaderView.ResizeMode.Stretch
+        )
+        self.table.horizontalHeader().setSectionResizeMode(
+            1,QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.table.horizontalHeader().setSectionResizeMode(
+            2,QHeaderView.ResizeMode.Stretch
+        )
+        self.choices=[]
+        books=library.list_works(sort="title")
+        for row, group in enumerate(self.groups):
+            title=group["title"]+(
+                f" — {group['author']}" if group["author"] else ""
+            )
+            self.table.setItem(row,0,QTableWidgetItem(title))
+            self.table.setItem(row,1,QTableWidgetItem(str(len(group["records"]))))
+            choice=QComboBox()
+            choice.addItem("Skip this Kindle title",None)
+            choice.addItem("+ Create a custom book (unread)", "create")
+            matched=[]
+            for work in books:
+                choice.addItem(
+                    f"{work['title']} — {work['author'] or 'Unknown author'}",
+                    work["id"]
+                )
+                if _book_identity(work["title"]) != _book_identity(group["title"]):
+                    continue
+                if (group["author"] and
+                        _book_identity(work["author"]) != _book_identity(group["author"])):
+                    continue
+                matched.append(work["id"])
+            if len(matched)==1:
+                choice.setCurrentIndex(choice.findData(matched[0]))
+            self.table.setCellWidget(row,2,choice)
+            self.table.setRowHeight(row,44)
+            self.choices.append(choice)
+        layout.addWidget(self.table,stretch=1)
+        layout.addWidget(label(
+            "Reimporting the same passages is safe: duplicate import IDs are "
+            "skipped. Existing notes are not overwritten. Kindle's original "
+            "highlight date is not used as a fabricated reading-history date.",
+            "muted"
+        ))
+        actions=QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok |
+            QDialogButtonBox.StandardButton.Cancel
+        )
+        actions.accepted.connect(self.check_selection)
+        actions.rejected.connect(self.reject)
+        layout.addWidget(actions)
+
+    def decisions(self):
+        return {
+            group["key"]:self.choices[i].currentData()
+            for i,group in enumerate(self.groups)
+        }
+
+    def check_selection(self):
+        if not any(choice.currentData() is not None for choice in self.choices):
+            QMessageBox.warning(
+                self,"Nothing to import",
+                "Select at least one existing book or Create a custom book."
+            )
+            return
+        self.accept()
+
+
 class MainWindow(QMainWindow):
     def __init__(self, library):
         super().__init__()
@@ -2009,7 +2272,8 @@ class MainWindow(QMainWindow):
                              ("▦   Reading calendar", 7),
                              ("✎   Notes && quotes", 8),
                              ("◉   Update center", 9),
-                             ("☷   Reading queue", 10)):
+                             ("☷   Reading queue", 10),
+                             ("◴   Reading habits", 11)):
             nav = button(title, lambda _, i=index: self.navigate(i))
             nav.setObjectName("nav")
             nav.setCheckable(True)
@@ -2038,6 +2302,7 @@ class MainWindow(QMainWindow):
         self.create_journal_page()
         self.create_updates_page()
         self.create_queue_page()
+        self.create_habits_page()
         geometry = self.settings.value("window_geometry")
         if geometry:
             self.restoreGeometry(geometry)
@@ -2074,6 +2339,9 @@ class MainWindow(QMainWindow):
             ("Sources and editions", self.manage_work_catalog, "Ctrl+Shift+M"),
             ("Update center", lambda: self.navigate(9), "Ctrl+Shift+U"),
             ("Reading queue", lambda: self.navigate(10), "Ctrl+Shift+Q"),
+            ("Reading habits", lambda: self.navigate(11), "Ctrl+Alt+H"),
+            ("Start reading timer", self.open_reading_timer, "Ctrl+Alt+T"),
+            ("Import Kindle clippings", self.import_kindle_clippings, ""),
             ("Local book/audio files", self.manage_local_files, "Ctrl+Shift+F"),
             ("Relink library files from folder", self.relink_library_files, ""),
         ):
@@ -2111,6 +2379,8 @@ class MainWindow(QMainWindow):
             self.refresh_updates_page()
         elif index == 10:
             self.refresh_queue_page()
+        elif index == 11:
+            self.refresh_habits_page()
 
     def focus_library_search(self):
         self.navigate(0)
@@ -2715,6 +2985,7 @@ class MainWindow(QMainWindow):
         heading.addWidget(button(
             "+ Log reading / listening", self.log_reading_session, primary=True
         ))
+        heading.addWidget(button("Start timer", self.open_reading_timer))
         heading.addWidget(button("Export time log CSV", self.export_time_log))
         layout.addLayout(heading)
         layout.addWidget(label(
@@ -3000,6 +3271,7 @@ class MainWindow(QMainWindow):
         heading.addWidget(button(
             "+ Add bookmark / quote / note", self.add_annotation, primary=True
         ))
+        heading.addWidget(button("Import Kindle highlights", self.import_kindle_clippings))
         heading.addWidget(button("Export Markdown", self.export_annotations_md))
         layout.addLayout(heading)
         layout.addWidget(label(
@@ -3708,6 +3980,300 @@ class MainWindow(QMainWindow):
         dialog.exec()
         self.refresh_all(work["id"])
 
+    def create_habits_page(self):
+        wrapper=QWidget()
+        wrapper_layout=QVBoxLayout(wrapper)
+        wrapper_layout.setContentsMargins(0,0,0,0)
+        scroll=QScrollArea()
+        scroll.setObjectName("habitsScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setStyleSheet(
+            "QScrollArea#habitsScroll { background: #10151f; border: none; }"
+            "QWidget#habitsContent { background: #10151f; }"
+        )
+        wrapper_layout.addWidget(scroll)
+        page=QWidget()
+        page.setObjectName("habitsContent")
+        layout=QVBoxLayout(page)
+        layout.setSpacing(12)
+        header=QHBoxLayout()
+        header.addWidget(label("Reading habits","headline"),stretch=1)
+        header.addWidget(button("Start timer",self.open_reading_timer,primary=True))
+        header.addWidget(button("Export daily CSV",self.export_habits_csv))
+        layout.addLayout(header)
+        layout.addWidget(label(
+            "Only actual dated milestones and manually logged reading/listening "
+            "minutes count. Unrecorded time and completion dates are never guessed.",
+            "muted"
+        ))
+        filters=QHBoxLayout()
+        filters.addWidget(label("Period:"))
+        self.habits_period=QComboBox()
+        for days,text in (
+            (7,"Last 7 days"),(30,"Last 30 days"),(90,"Last 90 days"),
+            (365,"Last 365 days"),(730,"Last 2 years")
+        ):
+            self.habits_period.addItem(text,days)
+        self.habits_period.setCurrentIndex(1)
+        self.habits_period.currentIndexChanged.connect(self.refresh_habits_page)
+        filters.addWidget(self.habits_period)
+        filters.addStretch()
+        self.habits_streak=label("","subheading")
+        filters.addWidget(self.habits_streak)
+        layout.addLayout(filters)
+        summaries=QGridLayout()
+        self.habits_cards={}
+        for position,(key,title) in enumerate((
+            ("active_days","Active days"),("minutes","Total logged time"),
+            ("reading_minutes","Reading time"),("listening_minutes","Listening time"),
+            ("chapters","Chapters"),("pages","Pages"),
+            ("completions","Known completions"),("longest_streak","Longest streak")
+        )):
+            box=QFrame()
+            box.setObjectName("statCard")
+            inner=QVBoxLayout(box)
+            inner.addWidget(label(title,"muted"))
+            current=label("0","value")
+            inner.addWidget(current)
+            self.habits_cards[key]=current
+            summaries.addWidget(box,position//4,position%4)
+        layout.addLayout(summaries)
+        panels=QHBoxLayout()
+        weekdays=QVBoxLayout()
+        weekdays.addWidget(label("Weekday activity","subheading"))
+        self.habits_weekday_bars=[]
+        for name_day in ("Mon","Tue","Wed","Thu","Fri","Sat","Sun"):
+            line=QHBoxLayout()
+            tag=label(name_day)
+            tag.setFixedWidth(40)
+            line.addWidget(tag)
+            progress=QProgressBar()
+            progress.setRange(0,100)
+            progress.setValue(0)
+            progress.setFormat("No time recorded")
+            line.addWidget(progress,stretch=1)
+            weekdays.addLayout(line)
+            self.habits_weekday_bars.append(progress)
+        weekdays.addWidget(label(
+            "Bars compare logged reading + listening minutes by weekday. "
+            "A milestone without a session counts as an active day but has no "
+            "estimated duration.", "muted"
+        ))
+        panels.addLayout(weekdays,stretch=1)
+        weekly=QVBoxLayout()
+        weekly.addWidget(label("Week-by-week history","subheading"))
+        self.habits_weeks=QTableWidget(0,5)
+        self.habits_weeks.setMinimumHeight(240)
+        self.habits_weeks.setHorizontalHeaderLabels([
+            "Week of","Active days","Read","Listened","Chapters / pages"
+        ])
+        self.habits_weeks.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.habits_weeks.verticalHeader().setVisible(False)
+        self.habits_weeks.horizontalHeader().setSectionResizeMode(
+            0,QHeaderView.ResizeMode.Stretch
+        )
+        for col in (1,2,3,4):
+            self.habits_weeks.horizontalHeader().setSectionResizeMode(
+                col,QHeaderView.ResizeMode.ResizeToContents
+            )
+        weekly.addWidget(self.habits_weeks,stretch=1)
+        panels.addLayout(weekly,stretch=2)
+        layout.addLayout(panels,stretch=2)
+        layout.addWidget(label("Books with the most logged time","subheading"))
+        self.habits_top=QTableWidget(0,3)
+        self.habits_top.setMinimumHeight(135)
+        self.habits_top.setHorizontalHeaderLabels(
+            ["Book","Reading minutes","Listening minutes"]
+        )
+        self.habits_top.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.habits_top.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.habits_top.verticalHeader().setVisible(False)
+        self.habits_top.horizontalHeader().setSectionResizeMode(
+            0,QHeaderView.ResizeMode.Stretch
+        )
+        for col in (1,2):
+            self.habits_top.horizontalHeader().setSectionResizeMode(
+                col,QHeaderView.ResizeMode.ResizeToContents
+            )
+        self.habits_top.itemDoubleClicked.connect(self.open_habits_work)
+        layout.addWidget(self.habits_top,stretch=1)
+        layout.addWidget(label(
+            "Annual goal pace  ·  Set or change yearly targets in Dashboard",
+            "subheading"
+        ))
+        self.habits_goal_summary=label("","muted")
+        layout.addWidget(self.habits_goal_summary)
+        self.habits_goal_bars={}
+        goals_row=QHBoxLayout()
+        for key,text in (("books","Books"),("chapters","Chapters"),("pages","Pages")):
+            group=QVBoxLayout()
+            group.addWidget(label(text))
+            bar=QProgressBar()
+            bar.setRange(0,100)
+            bar.setValue(0)
+            bar.setFormat("No goal set")
+            group.addWidget(bar)
+            self.habits_goal_bars[key]=bar
+            goals_row.addLayout(group)
+        layout.addLayout(goals_row)
+        scroll.setWidget(page)
+        self.pages.addWidget(wrapper)
+
+    def refresh_habits_page(self,*_args):
+        overview=self.library.reading_habits(days=self.habits_period.currentData())
+        self._habits_data=overview
+        self.habits_streak.setText(
+            f"Current streak: {self.library.reading_streak()} days  ·  "
+            f"{overview['active_days']}/{overview['days']} active days"
+        )
+        pace=self.library.annual_goal_pacing()
+        self.habits_goal_summary.setText(
+            f"{pace['year']} targets · {pace['elapsed_days']}/{pace['total_days']} "
+            "calendar days elapsed. Projection assumes the same recorded pace "
+            "for the rest of the year."
+        )
+        for key,bar in self.habits_goal_bars.items():
+            goal=pace["metrics"][key]
+            if goal["target"]:
+                bar.setValue(min(100,round(goal["percent"])))
+                ahead="On pace" if goal["on_pace"] else "Behind pace"
+                bar.setFormat(
+                    f"{goal['actual']:,} / {goal['target']:,} · {ahead} · "
+                    f"Projected {goal['projected_year_end']:,.0f}"
+                )
+            else:
+                bar.setValue(0)
+                bar.setFormat(f"{goal['actual']:,} recorded; no goal")
+
+        for key,widget in self.habits_cards.items():
+            value=overview[key]
+            if key.endswith("_minutes") or key=="minutes":
+                widget.setText(f"{value/60:.1f} h")
+            else:
+                widget.setText(f"{value:,}")
+        high=max((item["minutes"] for item in overview["weekdays"]),default=0)
+        for i,entry in enumerate(overview["weekdays"]):
+            bar=self.habits_weekday_bars[i]
+            bar.setValue(round(100*entry["minutes"]/high) if high else 0)
+            bar.setFormat(
+                f"{entry['minutes']} min  ·  {entry['active_days']} active days"
+            )
+        shown=list(reversed(overview["weeks"][-16:]))
+        self.habits_weeks.setRowCount(len(shown))
+        for row,week in enumerate(shown):
+            values=(
+                week["week_start"],str(week["active_days"]),
+                str(week["reading_minutes"]),str(week["listening_minutes"]),
+                f"{week['chapters']} / {week['pages']}"
+            )
+            for col,value in enumerate(values):
+                self.habits_weeks.setItem(row,col,QTableWidgetItem(value))
+            self.habits_weeks.setRowHeight(row,34)
+        top=overview["top_books"][:12]
+        self.habits_top.setRowCount(len(top))
+        for row,work in enumerate(top):
+            for col,value in enumerate((
+                work["title"],str(work["reading_minutes"]),
+                str(work["listening_minutes"])
+            )):
+                item=QTableWidgetItem(value)
+                if col==0:
+                    item.setData(Qt.ItemDataRole.UserRole,work["work_id"])
+                self.habits_top.setItem(row,col,item)
+            self.habits_top.setRowHeight(row,35)
+
+    def open_habits_work(self,item=None):
+        row=self.habits_top.currentRow()
+        cell=self.habits_top.item(row,0) if row>=0 else None
+        if not cell:
+            return
+        work_id=cell.data(Qt.ItemDataRole.UserRole)
+        self.clear_library_filters()
+        self.navigate(0)
+        self.refresh_library(select_id=work_id)
+
+    def export_habits_csv(self):
+        data=self.library.reading_habits(days=self.habits_period.currentData())
+        path,_=QFileDialog.getSaveFileName(
+            self,"Export daily reading activity",
+            f"BookTracker-habits-{data['start']}-to-{data['end']}.csv",
+            "CSV files (*.csv)"
+        )
+        if not path:
+            return
+        try:
+            with Path(path).open("w",encoding="utf-8-sig",newline="") as handle:
+                writer=csv.writer(handle)
+                writer.writerow([
+                    "Date","Reading minutes","Listening minutes","Chapters",
+                    "Pages","Sessions","Milestones"
+                ])
+                for day in data["daily"]:
+                    writer.writerow([
+                        day["date"],day["reading_minutes"],day["listening_minutes"],
+                        day["chapters"],day["pages"],day["sessions"],day["milestones"]
+                    ])
+            self.statusBar().showMessage(
+                f"Exported {len(data['daily'])} active days.",6500
+            )
+        except OSError as exc:
+            fail(self,exc)
+
+    def open_reading_timer(self):
+        if not self.library.list_works():
+            QMessageBox.information(
+                self,"Library empty","Add a book before timing your reading."
+            )
+            return
+        dialog=ReadingTimerDialog(self,self.library,work_id=self.selected_id)
+        if dialog.exec()!=QDialog.DialogCode.Accepted:
+            return
+        try:
+            key=dialog.book.currentData()
+            self.library.add_session(key,**dialog.values())
+            self.refresh_all(key)
+            self.statusBar().showMessage(
+                f"Saved {dialog.values()['minutes']} real minutes.",7000
+            )
+        except Exception as exc:
+            fail(self,exc)
+
+    def import_kindle_clippings(self):
+        path,_=QFileDialog.getOpenFileName(
+            self,"Import Kindle My Clippings.txt","","Text files (*.txt)"
+        )
+        if not path:
+            return
+        try:
+            parsed=read_clippings(path)
+            groups=group_clippings(parsed["records"])
+            if len(groups)>300:
+                raise ValueError(
+                    "This export contains over 300 distinct Kindle titles. "
+                    "Split the file into smaller batches before importing."
+                )
+            dialog=ClippingsPreviewDialog(self,self.library,parsed)
+            if dialog.exec()!=QDialog.DialogCode.Accepted:
+                return
+            result=self.library.import_clippings(
+                parsed["records"],dialog.decisions()
+            )
+            self.refresh_all()
+            if self.pages.currentIndex()==8:
+                self.refresh_journal_work_filter()
+                self.refresh_journal_page()
+            QMessageBox.information(
+                self,"Kindle highlights imported",
+                f"Passages imported: {result['imported']}\n"
+                f"Already imported: {result['duplicates']}\n"
+                f"Skipped: {result['skipped']}\n"
+                f"Custom books created: {result['created']}\n\n"
+                "Your existing reading history was not changed."
+            )
+        except Exception as exc:
+            fail(self,exc)
+
     def create_series_page(self):
         page = QWidget()
         layout = QVBoxLayout(page)
@@ -3918,6 +4484,8 @@ class MainWindow(QMainWindow):
             self.refresh_updates_page()
         if self.pages.currentIndex() == 10:
             self.refresh_queue_page()
+        if self.pages.currentIndex() == 11:
+            self.refresh_habits_page()
 
     def refresh_library(self, *_args, select_id=None):
         active_view = self.saved_view_combo.currentData()
@@ -4056,6 +4624,9 @@ class MainWindow(QMainWindow):
         self.details.addWidget(button(
             f"Local files ({len(self.library.list_local_files(work_id))})",
             self.manage_local_files
+        ))
+        self.details.addWidget(button(
+            "Start reading / listening timer", self.open_reading_timer
         ))
         queued=self.library.get_queue_entry(work_id)
         if queued:

@@ -301,7 +301,7 @@ def test_gui_queue_and_file_manager_app_launch(app,library,tmp_path,monkeypatch)
     library.enqueue_work(second,priority="low")
     main=MainWindow(library)
     try:
-        assert len(main.nav_buttons)==11
+        assert len(main.nav_buttons)==12
         main.navigate(10)
         assert main.queue_table.rowCount()==2
         assert main.queue_summary_label.text().startswith("2 queued")
@@ -352,8 +352,9 @@ def test_compact_sidebar_navigation_stays_accessible(app,library):
         window.resize(960,630)
         window.show()
         app.processEvents()
-        assert len(window.nav_buttons)==11
-        assert window.nav_buttons[-1].text().endswith("Reading queue")
+        assert len(window.nav_buttons)==12
+        assert window.nav_buttons[-2].text().endswith("Reading queue")
+        assert window.nav_buttons[-1].text().endswith("Reading habits")
         window.navigate(10)
         assert window.pages.currentIndex()==10
     finally:
