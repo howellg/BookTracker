@@ -10,7 +10,7 @@ import json
 from pathlib import Path
 from time import monotonic
 
-from PySide6.QtCore import QSettings, Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import QSettings, Qt, QThread, QTimer, QUrl, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -22,10 +22,20 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QPushButton,
     QSlider,
+    QTabWidget,
     QVBoxLayout,
+    QWidget,
 )
 
 from .audio_gui import fmt_duration
+from .audio_navigation import (
+    MAX_TOTAL_MS,
+    chapter_at,
+    global_position,
+    locate_global_time,
+    playlist_duration,
+    valid_chapters,
+)
 from .audiobooks import probe_m4b
 
 MAX_AUDIO_POSITION_MS = 7 * 24 * 3600 * 1000
@@ -113,8 +123,8 @@ def playlist_for_file(files, selected):
     ))
 
 
-def parse_timestamp(value):
-    """An explicit source-file position, not a listening-session duration."""
+def parse_timestamp(value, *, max_position_ms=MAX_AUDIO_POSITION_MS):
+    """An explicit media timestamp, not a listening-session duration."""
     value = str(value).strip()
     chunks = value.split(":")
     if not 1 <= len(chunks) <= 3 or any(
@@ -131,13 +141,34 @@ def parse_timestamp(value):
     for number in numbers:
         seconds = seconds * 60 + number
     result = seconds * 1000
-    if result > MAX_AUDIO_POSITION_MS:
+    if result > max_position_ms:
         raise ValueError("Timestamp exceeds the supported maximum.")
     return result
 
 
 def time_label(position, duration):
     return f"{fmt_duration(position)} / {fmt_duration(duration)}"
+
+
+class ChapterProbeThread(QThread):
+    """ffprobe can take several seconds on large M4Bs; never block playback."""
+
+    found = Signal(str, object)
+
+    def __init__(self, file_id, path, parent=None):
+        super().__init__(parent)
+        self.file_id = file_id
+        self.path = str(path)
+        file = Path(path).resolve(strict=True)
+        info = file.stat()
+        self.file_stamp = (str(file), info.st_size, info.st_mtime_ns)
+
+    def run(self):
+        try:
+            info = probe_m4b(self.path, timeout=10)
+        except (OSError, RuntimeError, ValueError) as exc:
+            info = {"probe_status": str(exc), "chapters": []}
+        self.found.emit(self.file_id, info)
 
 
 class AudioPlayerDialog(QDialog):
@@ -167,12 +198,15 @@ class AudioPlayerDialog(QDialog):
         self._closed = False
         self._finished_file = False
         self._loaded_chapters = []
+        self._current_chapter_index = None
+        self._chapter_worker = None
+        self._last_removed = None
         self._advance_scheduled = False
         self._mpv_engine = None
         self._supports_pitch_safe_speed = True
         self._sleep_deadline = None
         self.setWindowTitle("BookTracker — Audiobook player")
-        self.resize(700, 580)
+        self.resize(820, 710)
         self.setMinimumWidth(480)
         root = QVBoxLayout(self)
         self.title = QLabel("")
@@ -191,6 +225,24 @@ class AudioPlayerDialog(QDialog):
         root.addWidget(self.seek)
         self.clock = QLabel("0:00 / 0:00")
         root.addWidget(self.clock)
+        self.playlist_meter = QLabel("Playlist: waiting for duration metadata")
+        self.playlist_meter.setWordWrap(True)
+        root.addWidget(self.playlist_meter)
+        global_seek = QHBoxLayout()
+        self.book_timestamp = QLineEdit()
+        self.book_timestamp.setPlaceholderText("Playlist time 25:30:00")
+        self.book_timestamp.setMaxLength(14)
+        self.book_timestamp.setToolTip(
+            "Cumulative media time across the queued parts. Only available "
+            "when all queued parts have verified duration metadata."
+        )
+        self.book_timestamp.returnPressed.connect(self.seek_playlist_time)
+        global_seek.addWidget(QLabel("Go to playlist time"))
+        global_seek.addWidget(self.book_timestamp)
+        self.book_seek = self._button("Go", self.seek_playlist_time)
+        global_seek.addWidget(self.book_seek)
+        global_seek.addStretch()
+        root.addLayout(global_seek)
         buttons = QHBoxLayout()
         self.previous = self._button("Previous part", lambda: self.change_part(-1))
         self.back = self._button("−30 sec", lambda: self.jump(-30000))
@@ -235,7 +287,7 @@ class AudioPlayerDialog(QDialog):
         self.chapters.addItem("Chapter markers (load on request)", -1)
         self.chapters.activated.connect(self.seek_chapter)
         options.addWidget(self.chapters, stretch=1)
-        options.addWidget(self._button("Load markers", self.load_chapters))
+        options.addWidget(self._button("Load markers", self.start_chapter_probe))
         root.addLayout(options)
         long_form = QHBoxLayout()
         self.goto_time = QLineEdit()
@@ -263,20 +315,67 @@ class AudioPlayerDialog(QDialog):
         self.sleep_label = QLabel("Off")
         sleep_row.addWidget(self.sleep_label, stretch=1)
         root.addLayout(sleep_row)
-        root.addWidget(QLabel("Play queue (double-click to play a part)"))
+        self.navigation_tabs = QTabWidget()
+        queue_page = QWidget()
+        queue_layout = QVBoxLayout(queue_page)
+        queue_layout.setContentsMargins(4, 4, 4, 4)
+        queue_layout.addWidget(QLabel(
+            "Queue order is saved on this computer. Drag parts to reorder."
+        ))
+        self.queue_filter = QLineEdit()
+        self.queue_filter.setPlaceholderText("Find part number or filename…")
+        self.queue_filter.textChanged.connect(self.filter_queue)
+        queue_layout.addWidget(self.queue_filter)
         self.queue_list = QListWidget()
-        self.queue_list.setMaximumHeight(120)
+        self.queue_list.setDragDropMode(QListWidget.DragDropMode.InternalMove)
+        self.queue_list.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self.queue_list.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
+        self.queue_list.setMinimumHeight(145)
         self.queue_list.itemDoubleClicked.connect(self.play_queue_item)
-        root.addWidget(self.queue_list)
+        self.queue_list.model().rowsMoved.connect(self.sync_queue_from_view)
+        queue_layout.addWidget(self.queue_list, stretch=1)
         queue_buttons = QHBoxLayout()
         for text, callback in (
-            ("Move up", lambda: self.move_queue(-1)),
-            ("Move down", lambda: self.move_queue(1)),
+            ("▲", lambda: self.move_queue(-1)),
+            ("▼", lambda: self.move_queue(1)),
+            ("Play next", self.play_selected_next),
+            ("To end", self.send_selected_to_end),
             ("Remove", self.remove_from_queue),
-            ("Restore sequence", self.restore_queue),
+            ("Undo", self.undo_remove),
+            ("Restore", self.restore_queue),
         ):
             queue_buttons.addWidget(self._button(text, callback))
-        root.addLayout(queue_buttons)
+        queue_layout.addLayout(queue_buttons)
+        self.navigation_tabs.addTab(queue_page, "Play queue")
+        chapter_page = QWidget()
+        chapter_layout = QVBoxLayout(chapter_page)
+        chapter_layout.setContentsMargins(4, 4, 4, 4)
+        chapter_controls = QHBoxLayout()
+        self.chapter_search = QLineEdit()
+        self.chapter_search.setPlaceholderText("Search chapter titles or numbers…")
+        self.chapter_search.textChanged.connect(self.filter_chapters)
+        chapter_controls.addWidget(self.chapter_search, stretch=1)
+        self.chapter_load_button = self._button(
+            "Load markers", self.start_chapter_probe
+        )
+        chapter_controls.addWidget(self.chapter_load_button)
+        chapter_layout.addLayout(chapter_controls)
+        self.chapter_summary = QLabel("Chapter markers are loaded only on request.")
+        chapter_layout.addWidget(self.chapter_summary)
+        self.chapter_list = QListWidget()
+        self.chapter_list.setMinimumHeight(145)
+        self.chapter_list.itemDoubleClicked.connect(self.play_chapter_item)
+        chapter_layout.addWidget(self.chapter_list, stretch=1)
+        chapter_nav = QHBoxLayout()
+        for text,callback in (
+            ("◀ Previous chapter", self.previous_chapter),
+            ("Current chapter", self.select_current_chapter),
+            ("Next chapter ▶", self.next_chapter),
+        ):
+            chapter_nav.addWidget(self._button(text, callback))
+        chapter_layout.addLayout(chapter_nav)
+        self.navigation_tabs.addTab(chapter_page, "Chapters")
+        root.addWidget(self.navigation_tabs, stretch=1)
         root.addWidget(self._button("Close player", self.close))
         if player is None and audio_output is None:
             from .mpv_player import MpvOutput, MpvPlayer, pitch_safe_backend
@@ -363,20 +462,86 @@ class AudioPlayerDialog(QDialog):
     def refresh_queue(self):
         if not hasattr(self, "queue_list"):
             return
-        prior = self.queue_list.currentRow()
+        selected = self.queue_list.currentItem()
+        selected_id = (selected.data(Qt.ItemDataRole.UserRole)
+                       if selected else self.current["id"])
         self.queue_list.clear()
         for idx, item in enumerate(self.files):
-            title = item["filename"]
-            text = f"{idx + 1}. {title}"
+            text = f"{idx + 1}. {item['filename']}"
             if idx == self._index:
                 text = "▶ " + text
+            duration = int(item.get("duration_ms") or 0)
+            if duration > 0:
+                text += f"  ·  {fmt_duration(duration)}"
             widget = QListWidgetItem(text)
             widget.setData(Qt.ItemDataRole.UserRole, item["id"])
+            widget.setToolTip(item["filename"])
             self.queue_list.addItem(widget)
-        if 0 <= prior < self.queue_list.count():
-            self.queue_list.setCurrentRow(prior)
-        else:
-            self.queue_list.setCurrentRow(self._index)
+        self.filter_queue()
+        for row in range(self.queue_list.count()):
+            if self.queue_list.item(row).data(Qt.ItemDataRole.UserRole) == selected_id:
+                self.queue_list.setCurrentRow(row)
+                break
+        self.update_playlist_meter()
+
+    def filter_queue(self, *_args):
+        query = self.queue_filter.text().strip().casefold()
+        # Dragging in a filtered view can obscure the insertion destination.
+        self.queue_list.setDragEnabled(not bool(query))
+        for row in range(self.queue_list.count()):
+            item = self.queue_list.item(row)
+            item.setHidden(query not in item.text().casefold())
+
+    def sync_queue_from_view(self, *_args):
+        """Synchronize Qt drag/drop order using immutable IDs, not row indices."""
+        if self.queue_list.count() != len(self.files):
+            return
+        identifiers = [self.queue_list.item(i).data(Qt.ItemDataRole.UserRole)
+                       for i in range(self.queue_list.count())]
+        previous = {item["id"]: item for item in self.files}
+        if len(set(identifiers)) != len(self.files) or set(identifiers) != set(previous):
+            self.refresh_queue()
+            return
+        active = self.current["id"]
+        self.files = [previous[identifier] for identifier in identifiers]
+        self._index = identifiers.index(active)
+        self._save_queue()
+        self.refresh_queue()
+        self.previous.setEnabled(self._index > 0)
+        self.next.setEnabled(self._index < len(self.files) - 1)
+        self.updated.emit()
+
+    def _selected_queue_index(self):
+        item = self.queue_list.currentItem()
+        if item is None:
+            return None
+        target = item.data(Qt.ItemDataRole.UserRole)
+        return next((i for i, row in enumerate(self.files)
+                     if row["id"] == target), None)
+
+    def play_selected_next(self):
+        index = self._selected_queue_index()
+        if index is not None:
+            self.queue_selected_next(self.files[index])
+
+    def send_selected_to_end(self):
+        index = self._selected_queue_index()
+        if index is None or index == len(self.files) - 1:
+            return
+        selected_id = self.files[index]["id"]
+        active_id = self.current["id"]
+        self.files.append(self.files.pop(index))
+        self._index = next(i for i, item in enumerate(self.files)
+                           if item["id"] == active_id)
+        self._save_queue()
+        self.refresh_queue()
+        for row in range(self.queue_list.count()):
+            if self.queue_list.item(row).data(Qt.ItemDataRole.UserRole) == selected_id:
+                self.queue_list.setCurrentRow(row)
+                break
+        self.previous.setEnabled(self._index > 0)
+        self.next.setEnabled(self._index < len(self.files) - 1)
+        self.updated.emit()
 
     def play_queue_item(self, item):
         identifier = item.data(Qt.ItemDataRole.UserRole)
@@ -400,9 +565,11 @@ class AudioPlayerDialog(QDialog):
             self.player.play()
 
     def move_queue(self, delta):
-        row = self.queue_list.currentRow()
+        row = self._selected_queue_index()
+        if row is None:
+            return
         target = row + delta
-        if not 0 <= row < len(self.files) or not 0 <= target < len(self.files):
+        if not 0 <= target < len(self.files):
             return
         active_id = self.current["id"]
         self.files[row], self.files[target] = self.files[target], self.files[row]
@@ -416,12 +583,13 @@ class AudioPlayerDialog(QDialog):
         self.updated.emit()
 
     def remove_from_queue(self):
-        row = self.queue_list.currentRow()
-        if row < 0 or row >= len(self.files):
+        row = self._selected_queue_index()
+        if row is None:
             return
         if row == self._index:
             self.status.setText("Cannot remove the currently playing file from its queue.")
             return
+        self._last_removed = (self.files[row]["id"], row)
         self.files.pop(row)
         if row < self._index:
             self._index -= 1
@@ -431,7 +599,30 @@ class AudioPlayerDialog(QDialog):
         self.next.setEnabled(self._index < len(self.files) - 1)
         self.updated.emit()
 
+    def undo_remove(self):
+        if self._last_removed is None:
+            self.status.setText("No removed queue entry to restore.")
+            return
+        file_id, original_index = self._last_removed
+        self._last_removed = None
+        if any(item["id"] == file_id for item in self.files):
+            return
+        item = next((item for item in self._all_files if item["id"] == file_id), None)
+        if item is None:
+            return
+        active_id = self.current["id"]
+        self.files.insert(min(original_index, len(self.files)), item)
+        self._index = next(i for i, part in enumerate(self.files)
+                           if part["id"] == active_id)
+        self._save_queue()
+        self.refresh_queue()
+        self.previous.setEnabled(self._index > 0)
+        self.next.setEnabled(self._index < len(self.files) - 1)
+        self.status.setText("Restored the last removed queue entry.")
+        self.updated.emit()
+
     def restore_queue(self):
+        self._last_removed = None
         selected_id = self.current["id"]
         self.files = list(self._all_files)
         self._index = next(i for i, item in enumerate(self.files)
@@ -480,6 +671,9 @@ class AudioPlayerDialog(QDialog):
         self._finished_file = False
         item = self.current
         self._loaded_chapters = []
+        self._current_chapter_index = None
+        self.chapter_list.clear()
+        self.chapter_summary.setText("Chapter markers are loaded only on request.")
         self.chapters.clear()
         self.chapters.addItem("Chapter markers (load on request)", -1)
         self.title.setText(
@@ -541,6 +735,8 @@ class AudioPlayerDialog(QDialog):
         if not self.seek.isSliderDown():
             self.seek.setValue(max(0, int(position)))
         self.clock.setText(time_label(position, self.player.duration()))
+        self.update_playlist_meter()
+        self.highlight_current_chapter()
         self.updated.emit()
 
     def restart_part(self):
@@ -630,30 +826,193 @@ class AudioPlayerDialog(QDialog):
         self.output.setVolume(number / 100)
         self.settings.setValue("player_volume", number)
 
-    def load_chapters(self):
+    def start_chapter_probe(self):
+        if self._closed or self._chapter_worker is not None:
+            return
         if not Path(self.current["path"]).is_file():
             self.status.setText("The selected M4B is no longer available.")
             return
-        data = probe_m4b(self.current["path"])
-        if data["probe_status"] != "ok" or not data["chapters"]:
+        try:
+            worker = ChapterProbeThread(
+                self.current["id"], self.current["path"], self
+            )
+        except (ValueError, OSError) as exc:
+            self.status.setText(f"Cannot read M4B chapter markers: {exc}")
+            return
+        self._chapter_worker = worker
+        self.chapter_load_button.setEnabled(False)
+        self.chapter_summary.setText("Reading chapter markers in the background…")
+        worker.found.connect(self._chapter_probe_result)
+        worker.finished.connect(self._chapter_probe_finished)
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+
+    def _chapter_probe_result(self, file_id, result):
+        if self._closed or self.current["id"] != file_id:
+            return
+        try:
+            file = Path(self.current["path"]).resolve(strict=True)
+            info = file.stat()
+            stamp = (str(file), info.st_size, info.st_mtime_ns)
+        except (ValueError, OSError):
+            stamp = None
+        if stamp != self._chapter_worker.file_stamp:
+            self.chapter_summary.setText("File changed during metadata scan. Reload markers.")
+            return
+        self.load_chapters(result)
+
+    def _chapter_probe_finished(self):
+        self._chapter_worker = None
+        if not self._closed:
+            self.chapter_load_button.setEnabled(True)
+
+    def load_chapters(self, data=None):
+        if not Path(self.current["path"]).is_file():
+            self.status.setText("The selected M4B is no longer available.")
+            return
+        if data is None:
+            data = probe_m4b(self.current["path"])
+        if data.get("probe_status") != "ok" or not data.get("chapters"):
+            self.chapter_summary.setText("No readable chapter markers in this M4B.")
             self.status.setText("This M4B has no readable chapter markers.")
             return
-        self._loaded_chapters = data["chapters"][:5000]
+        self._loaded_chapters = valid_chapters(
+            data["chapters"], self.player.duration()
+        )
+        if not self._loaded_chapters:
+            self.chapter_summary.setText("No valid chapter markers in this M4B.")
+            return
         self.chapters.clear()
         self.chapters.addItem("Jump to chapter…", -1)
+        self.chapter_list.clear()
         for idx, ch in enumerate(self._loaded_chapters):
-            self.chapters.addItem(
-                f"{idx + 1}. {ch['title'] or 'Untitled'} ({fmt_duration(ch['start_ms'])})",
-                ch["start_ms"],
+            title = f"{idx + 1}. {ch['title']} ({fmt_duration(ch['start_ms'])})"
+            self.chapters.addItem(title, ch["start_ms"])
+            item = QListWidgetItem(title)
+            item.setData(Qt.ItemDataRole.UserRole, idx)
+            item.setToolTip(
+                f"From {fmt_duration(ch['start_ms'])} to {fmt_duration(ch['end_ms'])}"
             )
+            self.chapter_list.addItem(item)
+        self.filter_chapters()
+        self.highlight_current_chapter()
+        self.chapter_summary.setText(
+            f"{len(self._loaded_chapters):,} markers in this audio part"
+        )
+        self.navigation_tabs.setCurrentIndex(1)
         self.status.setText(f"Loaded {len(self._loaded_chapters)} chapter markers.")
+
+    def filter_chapters(self, *_args):
+        query = self.chapter_search.text().strip().casefold()
+        for row in range(self.chapter_list.count()):
+            item = self.chapter_list.item(row)
+            item.setHidden(query not in item.text().casefold())
+
+    def play_chapter_item(self, item):
+        idx = item.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(idx, int) or not 0 <= idx < len(self._loaded_chapters):
+            return
+        self.seek_to_position(self._loaded_chapters[idx]["start_ms"])
+
+    def highlight_current_chapter(self):
+        idx = chapter_at(self._loaded_chapters, self.player.position())
+        if idx == self._current_chapter_index:
+            return
+        old = self._current_chapter_index
+        self._current_chapter_index = idx
+        for row in (old, idx):
+            if row is None or not 0 <= row < self.chapter_list.count():
+                continue
+            item = self.chapter_list.item(row)
+            item.setText(
+                ("▶ " if row == idx else "") + f"{row + 1}. "
+                + self._loaded_chapters[row]["title"] + " ("
+                + fmt_duration(self._loaded_chapters[row]["start_ms"]) + ")"
+            )
+        self.filter_chapters()
+        if idx is not None:
+            self.chapter_summary.setText(
+                f"Chapter {idx + 1}/{len(self._loaded_chapters)}: "
+                f"{self._loaded_chapters[idx]['title']}"
+            )
+
+    def select_current_chapter(self):
+        index = chapter_at(self._loaded_chapters, self.player.position())
+        if index is not None:
+            self.chapter_search.clear()
+            self.chapter_list.setCurrentRow(index)
+            self.chapter_list.scrollToItem(self.chapter_list.item(index))
+
+    def next_chapter(self):
+        index = chapter_at(self._loaded_chapters, self.player.position())
+        target = 0 if index is None else index + 1
+        if 0 <= target < len(self._loaded_chapters):
+            self.seek_to_position(self._loaded_chapters[target]["start_ms"])
+
+    def previous_chapter(self):
+        index = chapter_at(self._loaded_chapters, self.player.position())
+        if index is None:
+            return
+        start = self._loaded_chapters[index]["start_ms"]
+        target = index - 1 if self.player.position() <= start + 3000 else index
+        if target >= 0:
+            self.seek_to_position(self._loaded_chapters[target]["start_ms"])
 
     def seek_chapter(self, *_args):
         position = self.chapters.currentData()
         if position is not None and 0 <= int(position) <= MAX_AUDIO_POSITION_MS:
-            self._finished_file = False
-            self.player.setPosition(int(position))
-            self.save_position()
+            self.seek_to_position(int(position))
+
+    def update_playlist_meter(self):
+        """Only display cumulative playback time when all durations are known."""
+        if not hasattr(self, "playlist_meter") or not hasattr(self, "player"):
+            return
+        timeline = playlist_duration(self.files, self.current["id"],
+                                     self.player.duration())
+        self.book_timestamp.setEnabled(timeline["known"])
+        self.book_seek.setEnabled(timeline["known"])
+        if not timeline["known"]:
+            if timeline["missing"] == 0:
+                reason = "playlist duration exceeds the one-year seek limit"
+            else:
+                reason = f"{timeline['missing']} missing duration(s)"
+            self.playlist_meter.setText(
+                f"Playlist: {len(self.files)} part(s); {reason}. "
+                "Book-wide seeking unavailable."
+            )
+            return
+        position = global_position(timeline, self.current["id"],
+                                   self.player.position())
+        remaining = max(0, timeline["total_ms"] - position)
+        self.playlist_meter.setText(
+            f"Playlist media time: {fmt_duration(position)} / "
+            f"{fmt_duration(timeline['total_ms'])} "
+            f"· remaining {fmt_duration(remaining)} "
+            f"· part {self._index + 1} of {len(self.files)}"
+        )
+
+    def seek_playlist_time(self):
+        """Jump by cumulative imported media duration, never by reading progress."""
+        timeline = playlist_duration(self.files, self.current["id"],
+                                     self.player.duration())
+        if not timeline["known"]:
+            self.status.setText("Cannot seek playlist: one or more part durations unknown.")
+            return
+        try:
+            position = parse_timestamp(
+                self.book_timestamp.text(), max_position_ms=MAX_TOTAL_MS
+            )
+            idx, file_time = locate_global_time(timeline, position)
+        except ValueError as exc:
+            self.status.setText(str(exc))
+            return
+        if idx != self._index:
+            self.change_part_to(idx)
+        self.seek_to_position(file_time)
+        self.status.setText(
+            f"Moved to playlist time {fmt_duration(position)} "
+            f"(part {idx + 1} at {fmt_duration(file_time)})."
+        )
 
     def on_media_status(self, state):
         from PySide6.QtMultimedia import QMediaPlayer
@@ -706,6 +1065,15 @@ class AudioPlayerDialog(QDialog):
             self.status.setText("Playback resume position could not be saved.")
 
     def closeEvent(self, event):
+        worker = self._chapter_worker
+        # ffprobe itself has a ten-second timeout. Keep its QThread
+        # alive until done so Qt cannot destroy a running worker.
+        if worker is not None and worker.isRunning() and not worker.wait(12_000):
+            event.ignore()
+            self.status.setText(
+                "Finishing the chapter scan before closing the player."
+            )
+            return
         self._save_timer.stop()
         self._sleep_tick.stop()
         self.save_position()
