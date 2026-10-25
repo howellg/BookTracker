@@ -2005,7 +2005,7 @@ class LocalFilesDialog(QDialog):
 class ReadingTimerDialog(QDialog):
     """Monotonic, foreground stopwatch. Saves only on explicit confirmation."""
 
-    def __init__(self, parent, library, *, work_id=None):
+    def __init__(self, parent, library, *, work_id=None, mode="reading"):
         super().__init__(parent)
         self.setWindowTitle("Reading / audiobook timer")
         self.resize(560, 465)
@@ -2032,6 +2032,9 @@ class ReadingTimerDialog(QDialog):
         self.mode = QComboBox()
         self.mode.addItem("Reading (text / ebooks)", "reading")
         self.mode.addItem("Listening (audiobooks)", "listening")
+        if mode not in ("reading","listening"):
+            raise ValueError("Unknown reading timer type.")
+        self.mode.setCurrentIndex(self.mode.findData(mode))
         self.date = QDateEdit()
         self.date.setCalendarPopup(True)
         self.date.setDisplayFormat("yyyy-MM-dd")
@@ -4753,13 +4756,15 @@ class MainWindow(QMainWindow):
         except OSError as exc:
             fail(self,exc)
 
-    def open_reading_timer(self):
+    def open_reading_timer(self, *, work_id=None, mode="reading"):
         if not self.library.list_works():
             QMessageBox.information(
                 self,"Library empty","Add a book before timing your reading."
             )
             return
-        dialog=ReadingTimerDialog(self,self.library,work_id=self.selected_id)
+        dialog=ReadingTimerDialog(
+            self,self.library,work_id=work_id or self.selected_id,mode=mode
+        )
         if dialog.exec()!=QDialog.DialogCode.Accepted:
             return
         try:
@@ -6181,6 +6186,8 @@ class MainWindow(QMainWindow):
                 worker.wait()
         if self._serial_tray:
             self._serial_tray.hide()
+        if self.audio_page._player_dialog is not None:
+            self.audio_page._player_dialog.close()
         self.settings.setValue("window_geometry", self.saveGeometry())
         self.settings.setValue("library_view", self.view_selector.currentData())
         self.library.close()

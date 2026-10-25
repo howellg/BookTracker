@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QThread, QUrl, Signal
+from PySide6.QtCore import QSettings, Qt, QThread, QUrl, Signal
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QFileDialog,
+    QGridLayout,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -303,6 +304,7 @@ class AudioLibraryPage(QWidget):
         self.library=library
         self.main=parent
         self.worker=None
+        self._player_dialog=None
         self.setAcceptDrops(True)
         layout=QVBoxLayout(self)
         head=QHBoxLayout()
@@ -367,10 +369,10 @@ class AudioLibraryPage(QWidget):
         self.groups.itemDoubleClicked.connect(lambda _item:self.open_book())
         self.groups.setMinimumHeight(180)
         splitter.addWidget(self.groups)
-        self.files=QTableWidget(0,8)
+        self.files=QTableWidget(0,9)
         self.files.setHorizontalHeaderLabels([
             "File","Part / full","Narrator","Length","Markers","EPUB sections",
-            "Status","Origin"
+            "Status","Origin","Resume (this device)"
         ])
         self.files.verticalHeader().setVisible(False)
         self.files.horizontalHeader().setStyleSheet(
@@ -384,7 +386,7 @@ class AudioLibraryPage(QWidget):
             0,QHeaderView.ResizeMode.Interactive
         )
         self.files.horizontalHeader().resizeSection(0,270)
-        for col in range(1,8):
+        for col in range(1,9):
             self.files.horizontalHeader().setSectionResizeMode(
                 col,QHeaderView.ResizeMode.ResizeToContents
             )
@@ -393,22 +395,26 @@ class AudioLibraryPage(QWidget):
         splitter.addWidget(self.files)
         splitter.setSizes([350,190])
         layout.addWidget(splitter,stretch=1)
-        actions=QHBoxLayout()
-        for text,func in (
+        actions=QGridLayout()
+        for index,(text,func) in enumerate((
+            ("Play in BookTracker",self.play_in_app),
             ("Open audio file",self.open_file),
+            ("Start listening timer",self.start_listening_timer),
+            ("Log listening time",self.log_listening_session),
             ("Chapter markers",self.show_chapters),
             ("Refresh metadata",self.refresh_metadata),
             ("Local file links",self.manage_files),
             ("Open library book",self.open_book),
-        ):
-            actions.addWidget(_button(text,func))
+        )):
+            actions.addWidget(_button(text,func),index//4,index%4)
         layout.addLayout(actions)
         layout.addWidget(_label(
             "Possible part gaps are missing numbers between 1 and the largest "
             "known part; they do not prove generation was attempted. "
             "When a complete M4B is present, its length is shown instead of "
-            "adding it to overlapping part durations. No listening activity "
-            "is inferred from an imported file.", "muted"
+            "adding it to overlapping part durations. Built-in playback "
+            "resumes only on this device. Playing, seeking or opening an M4B "
+            "never logs listening minutes or reading milestones.", "muted"
         ))
         self.refresh()
 
@@ -484,11 +490,16 @@ class AudioLibraryPage(QWidget):
         self.refresh_files()
 
     def refresh_files(self):
+        from .audio_player import AudioResumeStore
+
+        previous=self.current_file()
+        previous_id=previous["id"] if previous else None
         group=self.current_group()
         if not group:
             self._files=[]
             self.files.setRowCount(0)
             return
+        resume=AudioResumeStore(QSettings("BookTracker","BookTracker"))
         self._files=[
             item for item in self.library.list_audio_files(
                 work_id=group["work_id"]
@@ -510,6 +521,8 @@ class AudioLibraryPage(QWidget):
                 parts,
                 "Available" if item["available"] else "Missing / relink",
                 item["origin"],
+                fmt_duration(resume.position(item["id"],item["path"]))
+                if item["available"] and resume.position(item["id"],item["path"]) else "—",
             )
             for col,value in enumerate(values):
                 cell=QTableWidgetItem(value)
@@ -518,7 +531,11 @@ class AudioLibraryPage(QWidget):
                 self.files.setItem(row,col,cell)
             self.files.setRowHeight(row,34)
         if self._files:
-            self.files.selectRow(0)
+            chosen=next(
+                (index for index,item in enumerate(self._files) if item["id"]==previous_id),
+                0
+            )
+            self.files.selectRow(chosen)
 
     def import_studio(self):
         suggested=str(Path.home()/"AudiobookAI/output/audiobookai_studio.sqlite3")
@@ -619,6 +636,71 @@ class AudioLibraryPage(QWidget):
             self.scan_message.setText(
                 "Stopping scan after the current metadata probe completes…"
             )
+
+    def play_in_app(self):
+        """Open a modeless player so the listening timer stays usable."""
+        if self._player_dialog is not None:
+            self._player_dialog.show()
+            self._player_dialog.raise_()
+            self._player_dialog.activateWindow()
+            return
+        item=self.current_file()
+        if not item:
+            self.scan_message.setText("Select an M4B file to play.")
+            return
+        if not item["available"]:
+            QMessageBox.information(
+                self,"M4B file missing",
+                "Relink this M4B on this device before playing it."
+            )
+            return
+        try:
+            from .audio_player import AudioPlayerDialog
+
+            dialog=AudioPlayerDialog(self,self._files,item)
+            self._player_dialog=dialog
+            dialog.finished.connect(self.player_closed)
+            dialog.show()
+        except (RuntimeError,ValueError,OSError) as exc:
+            QMessageBox.warning(
+                self,"Built-in player unavailable",
+                f"{exc}\n\nYou can still open the audio file in your external player."
+            )
+
+    def player_closed(self,*_args):
+        self._player_dialog=None
+        self.refresh_files()
+
+    def start_listening_timer(self):
+        group=self.current_group()
+        if not group or not self.main:
+            self.scan_message.setText("Select an audiobook before starting a timer.")
+            return
+        self.main.open_reading_timer(work_id=group["work_id"],mode="listening")
+
+    def log_listening_session(self):
+        """Save explicit, user-entered minutes; never derive from file duration."""
+        group=self.current_group()
+        if not group:
+            self.scan_message.setText("Select an audiobook before logging time.")
+            return
+        from .gui import ReadingSessionDialog
+
+        dialog=ReadingSessionDialog(self,self.library,work_id=group["work_id"])
+        dialog.mode.setCurrentIndex(dialog.mode.findData("listening"))
+        if dialog.exec()!=QDialog.DialogCode.Accepted:
+            return
+        try:
+            self.library.add_session(
+                group["work_id"],**dialog.values()
+            )
+            if self.main:
+                self.main.refresh_all(group["work_id"])
+            self.scan_message.setText(
+                f"Saved {dialog.values()['minutes']} manually reported listening minutes."
+            )
+        except ValueError as exc:
+            QMessageBox.warning(self,"Log listening time",str(exc))
 
     def open_file(self):
         item=self.current_file()
@@ -722,6 +804,11 @@ class AudioLibraryPage(QWidget):
         self.main.clear_library_filters()
         self.main.navigate(0)
         self.main.refresh_library(select_id=group["work_id"])
+
+    def closeEvent(self,event):
+        if self._player_dialog is not None:
+            self._player_dialog.close()
+        super().closeEvent(event)
 
     def dragEnterEvent(self,event):
         urls=event.mimeData().urls() if event.mimeData().hasUrls() else []
