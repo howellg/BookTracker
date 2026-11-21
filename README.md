@@ -51,6 +51,24 @@ Built with Python, PySide6, and SQLite. No account, cloud subscription, or alway
 - All data is saved locally in an SQLite database; portable JSON/XML import uses stable UUIDs for merge.
 - Use **Device sync** to exchange portable snapshots via a dedicated shared folder with per-field conflict review and recovery backups.
 
+## New in v0.23.0 — Searchable audiobook bookmarks
+
+- **Named audio timestamps:** The M4B player now includes an **Audio bookmarks**
+  tab for storing named positions in any currently queued part. Use the optional
+  name field, then **Save position**; double-click a bookmark (or choose Jump)
+  to return to the correct part and audio time.
+- **Organize bookmarks:** Search bookmark names and part numbers, rename and
+  remove entries, or **Copy Markdown** to put a timestamp list on the clipboard.
+  Bookmarks are ordered by queue part then timestamp, even when you rearrange
+  the queue. Up to 200 bookmarks can be saved per M4B.
+- **Global actions:** The bottom player toolbar now includes **Bookmark** and
+  **Saved times**. Press **Ctrl+Alt+B** anywhere within BookTracker to save
+  the current audiobook timestamp without navigating away.
+- **Local and safe:** Names and positions are saved only in this computer's
+  QSettings, separate from SQLite, sync and backups. If an M4B changes or
+  moves, old timestamps will not be applied to it. Listening time and
+  reading progress remain explicit and are never inferred from bookmarks.
+
 ## New in v0.22.0 — Reliable chapter caching and missing-file recovery
 
 - **Reusable chapter metadata:** BookTracker caches successfully verified M4B

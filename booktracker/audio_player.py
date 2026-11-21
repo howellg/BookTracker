@@ -12,10 +12,12 @@ from time import monotonic
 
 from PySide6.QtCore import QSettings, Qt, QThread, QTimer, QUrl, Signal
 from PySide6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -27,6 +29,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .audio_bookmarks import AudioBookmarkStore, bookmarks_markdown
 from .audio_gui import fmt_duration
 from .audio_navigation import (
     MAX_TOTAL_MS,
@@ -182,6 +185,7 @@ class AudioPlayerDialog(QDialog):
         self.settings = settings if settings is not None else QSettings("BookTracker", "BookTracker")
         self.resume = AudioResumeStore(self.settings)
         self.chapter_cache = ChapterCache()
+        self.audio_bookmarks = AudioBookmarkStore(self.settings)
         self._all_files = playlist_for_file(files, selected)
         self.files = list(self._all_files)
         group = (selected["work_id"], selected["narrator"],
@@ -379,6 +383,38 @@ class AudioPlayerDialog(QDialog):
             chapter_nav.addWidget(self._button(text, callback))
         chapter_layout.addLayout(chapter_nav)
         self.navigation_tabs.addTab(chapter_page, "Chapters")
+        marker_page = QWidget()
+        marker_layout = QVBoxLayout(marker_page)
+        marker_layout.setContentsMargins(4,4,4,4)
+        marker_layout.addWidget(QLabel(
+            "Named audio timestamps across queued parts (local to this computer)."
+        ))
+        marker_header = QHBoxLayout()
+        self.bookmark_filter = QLineEdit()
+        self.bookmark_filter.setPlaceholderText("Search bookmark names or part…")
+        self.bookmark_filter.textChanged.connect(self.filter_audio_bookmarks)
+        marker_header.addWidget(self.bookmark_filter)
+        self.bookmark_name = QLineEdit()
+        self.bookmark_name.setPlaceholderText("Optional bookmark name")
+        self.bookmark_name.setMaxLength(120)
+        self.bookmark_name.returnPressed.connect(self.save_audio_bookmark)
+        marker_header.addWidget(self.bookmark_name)
+        marker_layout.addLayout(marker_header)
+        self.audio_bookmark_list = QListWidget()
+        self.audio_bookmark_list.setMinimumHeight(145)
+        self.audio_bookmark_list.itemDoubleClicked.connect(self.jump_audio_bookmark)
+        marker_layout.addWidget(self.audio_bookmark_list,stretch=1)
+        marker_actions = QHBoxLayout()
+        for text, callback in (
+            ("Save position", self.save_audio_bookmark),
+            ("Jump", self.jump_audio_bookmark),
+            ("Rename", self.rename_audio_bookmark),
+            ("Remove", self.remove_audio_bookmark),
+            ("Copy Markdown", self.copy_audio_bookmarks),
+        ):
+            marker_actions.addWidget(self._button(text, callback))
+        marker_layout.addLayout(marker_actions)
+        self.navigation_tabs.addTab(marker_page, "Audio bookmarks")
         root.addWidget(self.navigation_tabs, stretch=1)
         root.addWidget(self._button("Close player", self.close))
         if player is None and audio_output is None:
@@ -487,6 +523,7 @@ class AudioPlayerDialog(QDialog):
                 self.queue_list.setCurrentRow(row)
                 break
         self.update_playlist_meter()
+        self.refresh_audio_bookmarks()
 
     def filter_queue(self, *_args):
         query = self.queue_filter.text().strip().casefold()
@@ -514,6 +551,120 @@ class AudioPlayerDialog(QDialog):
         self.previous.setEnabled(self._index > 0)
         self.next.setEnabled(self._index < len(self.files) - 1)
         self.updated.emit()
+
+    def refresh_audio_bookmarks(self):
+        """Show only bookmarks from this playlist's unchanged local audio files."""
+        if not hasattr(self,"audio_bookmark_list"):
+            return
+        selected=self.audio_bookmark_list.currentItem()
+        selected_key=(selected.data(Qt.ItemDataRole.UserRole)
+                      if selected is not None else None)
+        self.audio_bookmark_list.clear()
+        for index,part in enumerate(self.files):
+            for mark in self.audio_bookmarks.list(part):
+                is_current=part["id"]==self.current["id"]
+                prefix="▶ " if is_current else ""
+                title=(f"{prefix}Part {index + 1} · "
+                       f"{fmt_duration(mark['position_ms'])} · {mark['title']}")
+                item=QListWidgetItem(title)
+                item.setData(Qt.ItemDataRole.UserRole,(part["id"],mark["id"]))
+                item.setToolTip(part["filename"])
+                self.audio_bookmark_list.addItem(item)
+        self.filter_audio_bookmarks()
+        if selected_key is not None:
+            for row in range(self.audio_bookmark_list.count()):
+                if (self.audio_bookmark_list.item(row).data(Qt.ItemDataRole.UserRole)
+                        == selected_key):
+                    self.audio_bookmark_list.setCurrentRow(row)
+                    break
+
+    def filter_audio_bookmarks(self, *_args):
+        query=self.bookmark_filter.text().strip().casefold()
+        for index in range(self.audio_bookmark_list.count()):
+            item=self.audio_bookmark_list.item(index)
+            item.setHidden(query not in item.text().casefold())
+
+    def save_audio_bookmark(self):
+        label=self.bookmark_name.text().strip() or (
+            f"At {fmt_duration(self.player.position())}"
+        )
+        try:
+            self.audio_bookmarks.add(self.current,int(self.player.position()),label)
+        except (ValueError,OSError) as exc:
+            self.status.setText(f"Could not save audio bookmark: {exc}")
+            return
+        self.bookmark_name.clear()
+        self.refresh_audio_bookmarks()
+        self.navigation_tabs.setCurrentIndex(2)
+        self.status.setText("Saved this audio timestamp on this computer only.")
+
+    def _selected_audio_bookmark(self):
+        current=self.audio_bookmark_list.currentItem()
+        if current is None:
+            return None
+        pair=current.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(pair,tuple) or len(pair)!=2:
+            return None
+        file_id,mark_id=pair
+        index=next((idx for idx,p in enumerate(self.files) if p["id"]==file_id),None)
+        if index is None:
+            return None
+        part=self.files[index]
+        mark=next((m for m in self.audio_bookmarks.list(part)
+                   if m["id"]==mark_id),None)
+        return (index,part,mark) if mark is not None else None
+
+    def jump_audio_bookmark(self,*_args):
+        selected=self._selected_audio_bookmark()
+        if selected is None:
+            self.status.setText("Choose a valid saved audio bookmark first.")
+            return
+        index,part,mark=selected
+        if index!=self._index:
+            self.change_part_to(index)
+            if self.current["id"]!=part["id"]:
+                return
+        self.seek_to_position(mark["position_ms"])
+        self.status.setText(
+            f"Jumped to audio bookmark: {mark['title']} "
+            f"({fmt_duration(mark['position_ms'])})."
+        )
+
+    def rename_audio_bookmark(self):
+        selected=self._selected_audio_bookmark()
+        if selected is None:
+            return
+        _index,part,mark=selected
+        title,ok=QInputDialog.getText(
+            self,"Rename audio bookmark","Bookmark name:",
+            text=mark["title"]
+        )
+        if not ok:
+            return
+        try:
+            if self.audio_bookmarks.rename(part,mark["id"],title):
+                self.refresh_audio_bookmarks()
+        except (ValueError,OSError) as exc:
+            self.status.setText(str(exc))
+
+    def remove_audio_bookmark(self):
+        selected=self._selected_audio_bookmark()
+        if selected is None:
+            return
+        _index,part,mark=selected
+        try:
+            if self.audio_bookmarks.remove(part,mark["id"]):
+                self.refresh_audio_bookmarks()
+                self.status.setText("Removed selected local audio bookmark.")
+        except (ValueError,OSError) as exc:
+            self.status.setText(str(exc))
+
+    def copy_audio_bookmarks(self):
+        value=bookmarks_markdown(self.files,self.audio_bookmarks)
+        QApplication.clipboard().setText(value)
+        self.status.setText(
+            "Copied the queued audiobook's timestamp bookmarks as Markdown."
+        )
 
     def _selected_queue_index(self):
         item = self.queue_list.currentItem()
