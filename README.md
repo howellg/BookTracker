@@ -51,6 +51,31 @@ Built with Python, PySide6, and SQLite. No account, cloud subscription, or alway
 - All data is saved locally in an SQLite database; portable JSON/XML import uses stable UUIDs for merge.
 - Use **Device sync** to exchange portable snapshots via a dedicated shared folder with per-field conflict review and recovery backups.
 
+## New in v0.24.0 — Listening continuity and player switching
+
+- **Recent audiobooks:** The Audiobooks page offers **Resume recent** and
+  **Recent audio…**. These actions use a bounded list of the last 30 locally
+  opened M4Bs and let you reopen a known file with its existing per-file
+  resume position. Missing, replaced and unlinked recordings are ignored.
+- **Change books without manual closing:** Selecting **Play in BookTracker**
+  while a different recording is open now asks whether to switch. Selecting
+  **No** leaves the active player untouched. Selecting **Yes** closes the
+  previous player (saving its current position), opens the newly selected
+  recording, and keeps the main-window mini-player synchronized.
+  Selecting the already playing file simply focuses its window.
+- **Pitch-safe speed on every page:** The mini-player bar now has a
+  0.75×–2.5× speed selector synchronized with the main player's speed
+  control. It remains disabled whenever a pitch-preserving backend is
+  unavailable; BookTracker never silently pitches up the narrator.
+- **Protected local history:** Recent-file entries store file IDs and
+  path/size/modified-time identities only in this computer's settings,
+  not in the SQLite library or exported/synced data. Opening or resuming
+  a recording does not automatically log listening time or reading progress.
+
+v0.24 builds on the v0.22 chapter cache and v0.23 named audio bookmarks.
+No database migration, audio source modifications, or AudiobookAI Studio
+changes are required.
+
 ## New in v0.23.0 — Searchable audiobook bookmarks
 
 - **Named audio timestamps:** The M4B player now includes an **Audio bookmarks**

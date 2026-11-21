@@ -41,6 +41,7 @@ from .audio_navigation import (
 )
 from .audiobooks import probe_m4b
 from .chapter_cache import ChapterCache
+from .recent_audio import RecentAudioStore
 
 MAX_AUDIO_POSITION_MS = 7 * 24 * 3600 * 1000
 
@@ -186,6 +187,7 @@ class AudioPlayerDialog(QDialog):
         self.resume = AudioResumeStore(self.settings)
         self.chapter_cache = ChapterCache()
         self.audio_bookmarks = AudioBookmarkStore(self.settings)
+        self.recent_audio = RecentAudioStore(self.settings)
         self._all_files = playlist_for_file(files, selected)
         self.files = list(self._all_files)
         group = (selected["work_id"], selected["narrator"],
@@ -856,6 +858,7 @@ class AudioPlayerDialog(QDialog):
         self.player.stop()
         self.player.setSource(QUrl.fromLocalFile(item["path"]))
         self.change_speed()
+        self.recent_audio.mark_opened(item)
         self._loading = False
         cached = self.chapter_cache.read(item)
         self.chapter_load_button.setText("Refresh markers" if cached else "Load markers")
