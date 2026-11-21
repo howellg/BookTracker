@@ -37,6 +37,7 @@ from .audio_navigation import (
     valid_chapters,
 )
 from .audiobooks import probe_m4b
+from .chapter_cache import ChapterCache
 
 MAX_AUDIO_POSITION_MS = 7 * 24 * 3600 * 1000
 
@@ -180,6 +181,7 @@ class AudioPlayerDialog(QDialog):
         super().__init__(parent)
         self.settings = settings if settings is not None else QSettings("BookTracker", "BookTracker")
         self.resume = AudioResumeStore(self.settings)
+        self.chapter_cache = ChapterCache()
         self._all_files = playlist_for_file(files, selected)
         self.files = list(self._all_files)
         group = (selected["work_id"], selected["narrator"],
@@ -287,7 +289,7 @@ class AudioPlayerDialog(QDialog):
         self.chapters.addItem("Chapter markers (load on request)", -1)
         self.chapters.activated.connect(self.seek_chapter)
         options.addWidget(self.chapters, stretch=1)
-        options.addWidget(self._button("Load markers", self.start_chapter_probe))
+        options.addWidget(self._button("Load markers", lambda: self.start_chapter_probe(refresh=bool(self._loaded_chapters))))
         root.addLayout(options)
         long_form = QHBoxLayout()
         self.goto_time = QLineEdit()
@@ -356,7 +358,9 @@ class AudioPlayerDialog(QDialog):
         self.chapter_search.textChanged.connect(self.filter_chapters)
         chapter_controls.addWidget(self.chapter_search, stretch=1)
         self.chapter_load_button = self._button(
-            "Load markers", self.start_chapter_probe
+            "Load markers", lambda: self.start_chapter_probe(
+                refresh=bool(self._loaded_chapters)
+            )
         )
         chapter_controls.addWidget(self.chapter_load_button)
         chapter_layout.addLayout(chapter_controls)
@@ -553,12 +557,20 @@ class AudioPlayerDialog(QDialog):
     def change_part_to(self, target):
         if not 0 <= target < len(self.files) or target == self._index:
             return
+        self.save_position()
+        next_file = self.files[target]
+        try:
+            AudioResumeStore._identity(next_file["path"])
+        except (OSError, ValueError, KeyError):
+            self.status.setText(
+                "The next audio part is missing or has changed. Relink it before playback."
+            )
+            return
         from PySide6.QtMultimedia import QMediaPlayer
 
         was_playing=(
             self.player.playbackState()==QMediaPlayer.PlaybackState.PlayingState
         )
-        self.save_position()
         self._index = target
         self.load_part()
         if was_playing:
@@ -694,6 +706,10 @@ class AudioPlayerDialog(QDialog):
         self.player.setSource(QUrl.fromLocalFile(item["path"]))
         self.change_speed()
         self._loading = False
+        cached = self.chapter_cache.read(item)
+        self.chapter_load_button.setText("Refresh markers" if cached else "Load markers")
+        if cached:
+            self.load_chapters(cached, cached=True, open_tab=False)
         self.refresh_queue()
         self.updated.emit()
 
@@ -826,12 +842,17 @@ class AudioPlayerDialog(QDialog):
         self.output.setVolume(number / 100)
         self.settings.setValue("player_volume", number)
 
-    def start_chapter_probe(self):
+    def start_chapter_probe(self, *_args, refresh=False):
         if self._closed or self._chapter_worker is not None:
             return
         if not Path(self.current["path"]).is_file():
             self.status.setText("The selected M4B is no longer available.")
             return
+        if not refresh:
+            cached = self.chapter_cache.read(self.current)
+            if cached:
+                self.load_chapters(cached, cached=True)
+                return
         try:
             worker = ChapterProbeThread(
                 self.current["id"], self.current["path"], self
@@ -859,6 +880,7 @@ class AudioPlayerDialog(QDialog):
         if stamp != self._chapter_worker.file_stamp:
             self.chapter_summary.setText("File changed during metadata scan. Reload markers.")
             return
+        self.chapter_cache.write(self.current, result)
         self.load_chapters(result)
 
     def _chapter_probe_finished(self):
@@ -866,7 +888,7 @@ class AudioPlayerDialog(QDialog):
         if not self._closed:
             self.chapter_load_button.setEnabled(True)
 
-    def load_chapters(self, data=None):
+    def load_chapters(self, data=None, *, cached=False, open_tab=True):
         if not Path(self.current["path"]).is_file():
             self.status.setText("The selected M4B is no longer available.")
             return
@@ -899,8 +921,13 @@ class AudioPlayerDialog(QDialog):
         self.chapter_summary.setText(
             f"{len(self._loaded_chapters):,} markers in this audio part"
         )
-        self.navigation_tabs.setCurrentIndex(1)
-        self.status.setText(f"Loaded {len(self._loaded_chapters)} chapter markers.")
+        if open_tab:
+            self.navigation_tabs.setCurrentIndex(1)
+        self.chapter_load_button.setText("Refresh markers" if cached else "Load markers")
+        suffix = " (local cache)" if cached else ""
+        self.status.setText(
+            f"Loaded {len(self._loaded_chapters)} chapter markers{suffix}."
+        )
 
     def filter_chapters(self, *_args):
         query = self.chapter_search.text().strip().casefold()

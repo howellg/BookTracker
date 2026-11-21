@@ -51,6 +51,29 @@ Built with Python, PySide6, and SQLite. No account, cloud subscription, or alway
 - All data is saved locally in an SQLite database; portable JSON/XML import uses stable UUIDs for merge.
 - Use **Device sync** to exchange portable snapshots via a dedicated shared folder with per-field conflict review and recovery backups.
 
+## New in v0.22.0 — Reliable chapter caching and missing-file recovery
+
+- **Reusable chapter metadata:** BookTracker caches successfully verified M4B
+  chapter markers in a bounded private, device-local cache. Reopening an audio
+  part with unchanged path/size/modification timestamp immediately restores its
+  chapter list without another potentially slow ffprobe scan. The cache is
+  separate from SQLite, portable backups and device sync.
+- **Refresh on demand:** The **Refresh markers** button rescans the active M4B
+  in the background if its chapter information needs to be refreshed. Switching
+  to a different part while a scan is underway discards the previous part's
+  result; replacing an M4B invalidates its older cached markers.
+- **Bounded and atomic:** Chapter metadata cache files use atomic replacement,
+  private filesystem permissions, a two-megabyte per-file limit and an
+  approximately 64-audiobook least-recently-used retention limit. Corrupt or
+  stale cache entries are ignored and may be regenerated.
+- **Safer missing-part handling:** If the next queued recording is no longer
+  available locally, the player keeps the current part instead of unexpectedly
+  switching or crashing. Its current resume position is saved before reporting
+  the missing file.
+
+Playback remains pitch-corrected through mpv; no listening sessions, reading
+milestones, audiobook data or library schema are changed.
+
 ## New in v0.21.0 — Audiobook chapter browser, queue editor and long-book timeline
 
 ### Chapter navigation without losing your place
