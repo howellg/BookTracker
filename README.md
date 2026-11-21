@@ -51,6 +51,38 @@ Built with Python, PySide6, and SQLite. No account, cloud subscription, or alway
 - All data is saved locally in an SQLite database; portable JSON/XML import uses stable UUIDs for merge.
 - Use **Device sync** to exchange portable snapshots via a dedicated shared folder with per-field conflict review and recovery backups.
 
+## New in v0.25.0 — Recovery checks, portable checksums and backup verification
+
+BookTracker now includes **read-only recovery diagnostics** and **verified snapshots**.
+
+From your BookTracker directory:
+
+```bash
+uv run python -m booktracker --doctor
+uv run python -m booktracker --verify-backup ~/Documents/my-library.btbackup
+uv run python -m booktracker --snapshot ~/Documents/BookTracker-recovery.sqlite3
+```
+
+These commands do **not** launch Qt and can run on headless Linux machines. The
+doctor checks SQLite integrity and foreign keys without opening the live
+library in read/write mode. `--verify-backup` checks a portable bundle or
+SQLite snapshot without importing anything; it returns nonzero on failure.
+`--snapshot` uses SQLite's online backup API, validates the generated
+snapshot, and refuses to overwrite an existing destination.
+
+New full portable `.btbackup` exports include a SHA-256 checksum for the
+library manifest as well as the existing checksums on imported cover images.
+Legacy portable backups **without** a manifest checksum still import. Sync
+snapshots carry and verify their separate sync envelope, and filtered peer
+imports regenerate checksums correctly. The GUI adds **Verify backup file**
+under File and in the sidebar, and Library health reports database integrity
+and foreign-key violations. Replacing your library from an invalid portable
+bundle is refused before any import confirmation.
+
+The **Audiobooks** menu shortcut is now `Ctrl+Alt+A`; `Ctrl+Alt+B`
+continues to save the current audiobook timestamp, eliminating a conflict.
+No library schema migration was required.
+
 ## New in v0.24.0 — Listening continuity and player switching
 
 - **Recent audiobooks:** The Audiobooks page offers **Resume recent** and

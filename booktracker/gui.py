@@ -74,6 +74,7 @@ from .integrations import (
     import_goodreads,
     source_from_url,
 )
+from .maintenance import format_report, inspect_backup, inspect_sqlite
 from .metadata import missing_book_metadata
 from .reader_gui import EpubReader
 from .sync_gui import SyncPage
@@ -2350,6 +2351,7 @@ class MainWindow(QMainWindow):
         sidebar.addWidget(button("Import library", self.import_library))
         sidebar.addWidget(button("Export library", self.export_library))
         sidebar.addWidget(button("Back up database", self.manual_backup))
+        sidebar.addWidget(button("Verify backup file", self.verify_backup_file))
         sidebar.addWidget(label("Offline-first · SQLite", "muted"))
         outer.addWidget(side)
 
@@ -2578,7 +2580,9 @@ class MainWindow(QMainWindow):
         return True
 
     def make_menu(self):
-        menu = self.menuBar().addMenu("&File")
+        # Retain the QMenu wrapper for the lifetime of this window.
+        self.file_menu = self.menuBar().addMenu("&File")
+        menu = self.file_menu
         for title, callback, shortcut in (
             ("Add work", self.add_work, "Ctrl+N"),
             ("Import EPUB files", self.import_epub_files, "Ctrl+Shift+E"),
@@ -2587,6 +2591,7 @@ class MainWindow(QMainWindow):
             ("Import BookTracker file", self.import_library, ""),
             ("Export BookTracker file", self.export_library, "Ctrl+Shift+S"),
             ("Back up database", self.manual_backup, "Ctrl+B"),
+            ("Verify backup file", self.verify_backup_file, ""),
             ("Focus library search", self.focus_library_search, "Ctrl+F"),
             ("Reading history", lambda: self.navigate(1), "Ctrl+H"),
             ("Authors", lambda: self.navigate(4), "Ctrl+Shift+A"),
@@ -2603,7 +2608,7 @@ class MainWindow(QMainWindow):
              "Ctrl+Alt+U"),
             ("Reading queue", lambda: self.navigate(10), "Ctrl+Shift+Q"),
             ("Reading habits", lambda: self.navigate(11), "Ctrl+Alt+H"),
-            ("Audiobooks", lambda: self.navigate(12), "Ctrl+Alt+B"),
+            ("Audiobooks", lambda: self.navigate(12), "Ctrl+Alt+A"),
             ("Device sync", lambda: self.navigate(13), "Ctrl+Alt+S"),
             ("Import AudiobookAI completed parts",
              lambda: self.audio_page.import_studio(), ""),
@@ -3240,15 +3245,20 @@ class MainWindow(QMainWindow):
             fail(self, exc)
 
     def show_integrity_result(self):
-        try:
-            status = self.library.integrity_check()
+        report = inspect_sqlite(self.library.path, full=True)
+        if report["ok"]:
             QMessageBox.information(
-                self, "SQLite integrity check",
-                "Database integrity: OK" if status == "ok" else
-                f"Database integrity check reported: {status}"
+                self, "Database recovery check",
+                f"Database: OK\nWorks: {report['works']}\n"
+                f"Foreign-key violations: 0\n"
+                f"SQLite schema version: {report['schema_version']}\n\n"
+                "This check is read-only. Existing recovery snapshots remain unchanged."
             )
-        except Exception as exc:
-            fail(self, exc)
+        else:
+            QMessageBox.warning(
+                self, "Database recovery check failed",
+                format_report(report)[:5000]
+            )
 
     def create_calendar_page(self):
         page = QWidget()
@@ -5833,6 +5843,26 @@ class MainWindow(QMainWindow):
             except Exception as exc:
                 fail(self, exc)
 
+    def verify_backup_file(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Verify BookTracker backup", str(self.library.path.parent / "backups"),
+            "BookTracker backups (*.btbackup *.sqlite3 *.db *.sqlite)"
+        )
+        if not path:
+            return
+        result = inspect_backup(path)
+        if result.get("ok"):
+            QMessageBox.information(
+                self, "Backup verified",
+                "Backup integrity verified without importing or changing any data.\n\n"
+                + format_report(result)[:3500]
+            )
+        else:
+            QMessageBox.warning(
+                self, "Backup verification failed",
+                format_report(result)[:5000]
+            )
+
     def manual_backup(self):
         path, _ = QFileDialog.getSaveFileName(
             self, "Save database snapshot",
@@ -5841,8 +5871,18 @@ class MainWindow(QMainWindow):
         )
         if not path:
             return
+        if Path(path).exists() and QMessageBox.question(
+            self, "Overwrite snapshot?",
+            "A backup already exists at this location. Replace it?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        ) != QMessageBox.StandardButton.Yes:
+            return
         try:
             self.library.backup_to(path)
+            result = inspect_sqlite(path, full=True)
+            if not result["ok"]:
+                raise ValueError("Saved SQLite backup did not pass recovery checks.")
             QMessageBox.information(self, "Backup complete", f"Verified backup saved to:\n{path}")
         except Exception as exc:
             fail(self, exc)
@@ -6211,6 +6251,15 @@ class MainWindow(QMainWindow):
             "BookTracker files (*.btbackup *.json *.xml *.csv)")
         if not path:
             return
+        if Path(path).suffix.casefold() == ".btbackup":
+            result = inspect_backup(path)
+            if not result.get("ok"):
+                QMessageBox.warning(
+                    self, "Cannot import invalid backup",
+                    "Backup verification failed. No library data was changed.\n\n"
+                    + format_report(result)[:4000]
+                )
+                return
         answer = QMessageBox.question(
             self, "Import library", "Merge imported books with your existing library?\n\n"
             "Yes = merge and skip duplicate history IDs.\nNo = replace your entire library.",
