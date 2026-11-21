@@ -2,12 +2,24 @@
 from __future__ import annotations
 
 import csv
+import sqlite3
 import sys
 import webbrowser
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QDate, QElapsedTimer, QSettings, QSize, Qt, QThread, QTimer, QUrl, Signal
+from PySide6.QtCore import (
+    QDate,
+    QElapsedTimer,
+    QLockFile,
+    QSettings,
+    QSize,
+    Qt,
+    QThread,
+    QTimer,
+    QUrl,
+    Signal,
+)
 from PySide6.QtGui import (
     QAction,
     QColor,
@@ -6422,11 +6434,22 @@ class MainWindow(QMainWindow):
                 return
         for worker in (self.metadata_worker, self.epub_worker):
             if worker and worker.isRunning():
-                worker.wait()
+                worker.requestInterruption()
+                if not worker.wait(15000):
+                    event.ignore()
+                    self.statusBar().showMessage(
+                        "An active import or metadata request is still finishing.", 10000
+                    )
+                    return
         if self._serial_tray:
             self._serial_tray.hide()
-        if self.audio_page._player_dialog is not None:
-            self.audio_page._player_dialog.close()
+        if (self.audio_page._player_dialog is not None
+                and not self.audio_page._player_dialog.close()):
+            event.ignore()
+            self.statusBar().showMessage(
+                "The audio engine is still closing; library remains open.", 10000
+            )
+            return
         self.settings.setValue("window_geometry", self.saveGeometry())
         self.settings.setValue("library_view", self.view_selector.currentData())
         self.library.close()
@@ -6434,11 +6457,54 @@ class MainWindow(QMainWindow):
 
 
 def run(db_path):
-    app = QApplication(sys.argv)
+    """Safely open a single GUI instance for the selected library."""
+    app = QApplication.instance() or QApplication(sys.argv)
     app.setApplicationName("BookTracker")
     app.setStyle("Fusion")
     app.setStyleSheet(STYLE)
-    library = Library(db_path)
-    window = MainWindow(library)
-    window.show()
-    return app.exec()
+
+    # Never try a schema migration or write a WAL on top of corrupted data.
+    path = Path(db_path).expanduser().resolve(strict=False)
+    if path.exists():
+        report = inspect_sqlite(path, full=False)
+        if not report["ok"]:
+            QMessageBox.critical(
+                None, "BookTracker database needs recovery",
+                "The selected library failed a read-only integrity check. "
+                "It has NOT been modified. Verify and restore a trusted SQLite "
+                "snapshot or .btbackup before reopening.\n\n"
+                + format_report(report)[:4000]
+            )
+            return 2
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        QMessageBox.critical(
+            None, "Cannot open BookTracker database", str(exc)
+        )
+        return 2
+
+    lock = QLockFile(str(path) + ".booktracker.lock")
+    if not lock.tryLock(100):
+        QMessageBox.warning(
+            None, "BookTracker is already running",
+            "Another BookTracker window is using this library. "
+            "Close that window before opening another instance. "
+            "Use --database to open a different library."
+        )
+        return 3
+    try:
+        try:
+            library = Library(path)
+        except (sqlite3.Error, OSError, ValueError, RuntimeError) as exc:
+            QMessageBox.critical(None, "Cannot open BookTracker library", str(exc))
+            return 2
+        try:
+            window = MainWindow(library)
+        except Exception:
+            library.close()
+            raise
+        window.show()
+        return app.exec()
+    finally:
+        lock.unlock()
