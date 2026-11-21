@@ -2403,6 +2403,8 @@ class MainWindow(QMainWindow):
             ("Play / Pause",lambda:self.audio_transport("play")),
             ("+30s",lambda:self.audio_transport("forward")),
             ("Part ▶",lambda:self.audio_transport("next")),
+            ("Bookmark",lambda:self.audio_transport("bookmark")),
+            ("Saved times",lambda:self.audio_transport("marks")),
             ("Show player",self.show_audio_player),
             ("Shortcuts",self.show_audio_shortcuts),
             ("Close audio",self.close_audio_player),
@@ -2417,6 +2419,7 @@ class MainWindow(QMainWindow):
             ("Ctrl+Alt+Space","play"),
             ("Ctrl+Alt+J","back"),
             ("Ctrl+Alt+L","forward"),
+            ("Ctrl+Alt+B","bookmark"),
             ("Ctrl+Alt+PgUp","previous"),
             ("Ctrl+Alt+PgDown","next"),
         )
@@ -2437,6 +2440,7 @@ class MainWindow(QMainWindow):
             "Ctrl+Alt+Space — Play / pause\n"
             "Ctrl+Alt+J — Skip back 30 seconds\n"
             "Ctrl+Alt+L — Skip forward 30 seconds\n"
+            "Ctrl+Alt+B — Save the current audiobook timestamp\n"
             "Ctrl+Alt+Page Up — Previous audiobook part\n"
             "Ctrl+Alt+Page Down — Next audiobook part\n\n"
             "These shortcuts work in BookTracker while the audio player is open."
@@ -2456,6 +2460,11 @@ class MainWindow(QMainWindow):
             player.jump(30000)
         elif command=="play":
             player.toggle_play()
+        elif command=="bookmark":
+            player.save_audio_bookmark()
+        elif command=="marks":
+            player.navigation_tabs.setCurrentIndex(2)
+            self.show_audio_player()
 
     def show_audio_player(self):
         player=self.audio_page._player_dialog
