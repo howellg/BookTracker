@@ -51,6 +51,29 @@ Built with Python, PySide6, and SQLite. No account, cloud subscription, or alway
 - All data is saved locally in an SQLite database; portable JSON/XML import uses stable UUIDs for merge.
 - Use **Device sync** to exchange portable snapshots via a dedicated shared folder with per-field conflict review and recovery backups.
 
+## New in v0.26.0 — Safe startup, daily backup validation and clean shutdown
+
+- **Single writer per library:** BookTracker now uses a per-database Qt lock
+  when launched normally. A second desktop instance aimed at the same SQLite
+  file displays a warning rather than creating competing GUI sessions.
+  You can still use `--database` to open a separate test or alternate library.
+- **Recovery-first startup:** Existing databases are checked read-only before
+  Qt opens them for editing. If a database fails integrity or foreign-key
+  checks, BookTracker refuses to start that library and points you toward
+  your existing recovery snapshots instead of attempting a schema migration.
+- **Safer shutdown:** The app now waits for import and metadata workers with
+  bounded timeouts. It will not close SQLite underneath an audio player whose
+  chapter-metadata scan or playback backend still needs to finish closing.
+- **Verified daily backups:** Each new automatic daily SQLite backup uses a
+  private temporary file, verifies the snapshot and renames it atomically.
+  If today's backup already exists but is corrupt, BookTracker raises a
+  visible warning without deleting or overwriting the damaged file. Verified
+  backups keep the existing 14-day retention policy.
+
+No database schema changes, automatic listening logs, or reading-progress
+updates are introduced by this release. Recovery tools added in v0.25 remain
+available from both the desktop UI and the CLI.
+
 ## New in v0.25.0 — Recovery checks, portable checksums and backup verification
 
 BookTracker now includes **read-only recovery diagnostics** and **verified snapshots**.

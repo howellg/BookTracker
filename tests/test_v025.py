@@ -192,7 +192,9 @@ def test_cli_supports_headless_version_doctor_backup_verify(tmp_path, library):
         )
     about = call("--version")
     assert about.returncode == 0
-    assert "BookTracker 0.25.0" in about.stdout
+    from booktracker import __version__
+
+    assert f"BookTracker {__version__}" in about.stdout
     result = call("--database", library.path, "--doctor")
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout)["ok"]
