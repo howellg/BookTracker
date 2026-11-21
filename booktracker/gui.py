@@ -71,6 +71,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from . import __version__
 from .audio_gui import AudioLibraryPage
 from .backups import automatic_backup
 from .book_search import _normalize, cached_book_search
@@ -2640,6 +2641,38 @@ class MainWindow(QMainWindow):
         quit_action = QAction("Quit", self)
         quit_action.triggered.connect(self.close)
         menu.addAction(quit_action)
+        self.help_menu = self.menuBar().addMenu("&Help")
+        self.help_menu.addAction("Run offline self-test", self.run_release_self_test)
+        self.help_menu.addAction("About BookTracker", self.show_about)
+
+    def show_about(self):
+        QMessageBox.about(
+            self, "About BookTracker",
+            f"BookTracker {__version__}\n\n"
+            "Your reading, remembered.\n\n"
+            "A local-first library for books, fanfiction, web novels, "
+            "EPUBs and audiobooks. Built with Python, PySide6 and SQLite.\n\n"
+            "Licensed under MIT. No account is required.\n"
+            "Your library remains on this computer unless you explicitly "
+            "export or synchronize it.\n\n"
+            "Documentation: https://github.com/howellg/BookTracker"
+        )
+
+    def run_release_self_test(self):
+        from .maintenance import format_report, run_self_test
+
+        result = run_self_test()
+        if result["ok"]:
+            QMessageBox.information(
+                self, "BookTracker offline self-test passed",
+                "Offline self-test passed. All local data and recovery checks passed.\n\n"
+                + format_report(result)[:4000]
+            )
+        else:
+            QMessageBox.warning(
+                self, "BookTracker offline self-test failed",
+                format_report(result)[:4000]
+            )
 
     def navigate(self, index):
         self.pages.setCurrentIndex(index)
@@ -6460,6 +6493,7 @@ def run(db_path):
     """Safely open a single GUI instance for the selected library."""
     app = QApplication.instance() or QApplication(sys.argv)
     app.setApplicationName("BookTracker")
+    app.setApplicationVersion(__version__)
     app.setStyle("Fusion")
     app.setStyleSheet(STYLE)
 

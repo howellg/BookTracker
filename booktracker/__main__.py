@@ -26,18 +26,23 @@ def main(argv=None):
                             help="Verify a SQLite or .btbackup archive without importing")
     operations.add_argument("--snapshot", type=Path, metavar="FILE",
                             help="Make a verified SQLite backup without modifying the source")
+    operations.add_argument("--self-test", action="store_true",
+                            help="Exercise all core data workflows in a disposable library")
     args = parser.parse_args(argv)
     db_path = args.database or default_database()
 
-    if args.doctor or args.verify_backup or args.snapshot:
+    if args.doctor or args.verify_backup or args.snapshot or args.self_test:
         from .maintenance import (
             format_report,
             inspect_backup,
             inspect_sqlite,
+            run_self_test,
             snapshot_sqlite,
         )
 
-        if args.doctor:
+        if args.self_test:
+            result = run_self_test()
+        elif args.doctor:
             result = inspect_sqlite(db_path, full=True)
         elif args.verify_backup:
             result = inspect_backup(args.verify_backup)

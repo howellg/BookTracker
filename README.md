@@ -51,6 +51,43 @@ Built with Python, PySide6, and SQLite. No account, cloud subscription, or alway
 - All data is saved locally in an SQLite database; portable JSON/XML import uses stable UUIDs for merge.
 - Use **Device sync** to exchange portable snapshots via a dedicated shared folder with per-field conflict review and recovery backups.
 
+## BookTracker 1.0.0 — Stable local-first release
+
+Version 1.0.0 marks a **stable core workflow** for tracking books, fanfiction,
+web novels, locally linked EPUBs, and audiobooks. It preserves existing
+libraries, EPUB annotations, M4B resume positions, portable exports and
+explicit reading/listening sessions.
+
+**1.0 release highlights:**
+
+- Comprehensive offline checks with `uv run python -m booktracker --self-test`
+  use only a disposable test library; they verify reading history, notes,
+  SQLite snapshots, portable backup/restore and shared-folder device sync.
+- The new **Help** menu provides the exact installed version, privacy/license
+  information and a one-click offline diagnostic.
+- GitHub CI now validates Python **3.10–3.13**, packages a tested wheel and
+  source archive, and verifies the installed-wheel version.
+- Safety improvements from v0.25–v0.26 protect startup, backups, imports,
+  concurrent writes and shutdown without changing the SQLite schema.
+- A [recovery guide](docs/RECOVERY.md),
+  [release checklist](docs/RELEASE_CHECKLIST.md) and
+  [changelog](CHANGELOG.md) document maintenance and limitations.
+
+**Upgrade an existing installation** (close the application first):
+
+```bash
+cd ~/BookTracker
+git pull --ff-only
+uv sync
+uv run python -m booktracker
+```
+
+Your SQLite database is stored **outside the repository**, so Git updates
+don't replace it. The app creates verified daily snapshots; make an
+additional full `.btbackup` export before migration between computers.
+You can check an existing library without changing it using
+`uv run python -m booktracker --doctor`.
+
 ## New in v0.26.0 — Safe startup, daily backup validation and clean shutdown
 
 - **Single writer per library:** BookTracker now uses a per-database Qt lock
@@ -1037,7 +1074,7 @@ The database is stored in your OS's user-data directory (platformdirs), not insi
 16. Open **Update center** to review serial backlogs, failed checks and source chapter history.
 17. Open **Reading queue**, use **+ Plan a book** or choose **Queue selected** in your library, then set priorities and optionally target dates.
 18. Select a book and choose **Local files** to attach existing EPUB or M4B files. Use **Find in folder** to relink missing media after transferring your library.
-11. To record something you read last year, choose **Log progress**, check **Set a specific reading date**, then select the historical date. To correct an older log, use **Reading history → Edit selected**.
+19. To record something you read last year, choose **Log progress**, check **Set a specific reading date**, then select the historical date. To correct an older log, use **Reading history → Edit selected**.
 
 For existing Goodreads history, use **File → Import Goodreads CSV**. It imports Goodreads shelves and ratings; it does not create a detailed historical progress log that Goodreads never exported.
 
@@ -1057,7 +1094,7 @@ JSON/XML remain useful for structured-data interchange and preserve reading runs
 
 Automatic SQLite snapshots are kept beside your database in the backups folder (14 daily snapshots retained). **The SQLite snapshot itself does not include the separate imported_covers directory**. For a portable, complete transfer of locally imported covers, use a .btbackup file.
 
-Local EPUB, M4B and other book/audio files are never copied into BookTracker exports. Only filenames and metadata are saved for them; the original files must be transferred separately and relinked on another machine. This is manual file-based portability, **not** continuous multi-device synchronization.
+Local EPUB, M4B and other book/audio files are never copied into BookTracker exports. Only filenames and metadata are saved; the original media must be transferred separately and relinked. **Device sync** provides explicit, reviewable portable snapshots through a user-configured shared folder; it is not an always-on hosted cloud service or automatic transfer of the actual media files. Device-local player settings, M4B bookmarks and resume times are also not included in library exports.
 
 ## Site-specific limitations
 
@@ -1065,7 +1102,7 @@ The website importer uses public HTML metadata on a **best-effort** basis, witho
 
 Goodreads has no generally available new public API access; BookTracker supports its user-exported CSV instead. The built-in title search uses the public Open Library and Google Books catalogs. New searches require an internet connection and may be rate-limited or temporarily unavailable; the Paste titles tab always works offline. If one provider fails, the application still shows results from the other. Successful search results are cached on your computer for 12 hours and can also serve as a fallback during a temporary outage. Saved metadata and reading history remain local.
 
-**Current scope:** This release is a reading-history tracker, not a downloader, e-reader, chapter-notification service, or background story crawler.
+**Current scope:** BookTracker is primarily a personal reading-history manager **with a built-in local EPUB reader and M4B player**. It is not an online book downloader, a text-to-speech generator, a full PDF editor, or an always-on background story crawler. EPUB/audio location links require explicit user action; the application does not claim automatic text/audio synchronization or infer listening hours from playback.
 
 ## Development
 
@@ -1097,9 +1134,27 @@ Project layout:
 - booktracker/gui.py — Qt desktop application
 - tests/ — database and portability regression tests
 
-## Roadmap
+## Limitations and possible future improvements
 
-Automatic site-specific word/chapter adapters, optional timed-session stopwatch and additional visualizations, easier bulk URL importing, multi-source/edition grouping, a browser helper for fanfiction, AudiobookAI integration, optional multi-device synchronization, and installable desktop binaries.
+- **Media dependencies:** For pitch-preserving variable-speed M4B playback,
+  install the local `mpv` binary. Without mpv, the Qt fallback remains at
+  **1.0×**, not chipmunk-pitched playback. Scanning embedded chapter markers
+  depends on the optional local `ffprobe` binary.
+- **No automatic alignment:** EPUB positions and M4B timestamps are not
+  equivalent chapters. Any links between the two are explicitly saved by
+  the user. Reading and listening time is logged only by user action.
+- **Device-local extras:** M4B resume times, local play queues, audiobook
+  timestamp bookmarks and some position links are stored on the current
+  computer, not in cross-device library backups.
+- **Network services:** Story and book metadata come from external public
+  services that can change, deny access or rate-limit requests. Local manual
+  entry works offline.
+- **Distribution:** Published wheel/sdist packages need Python and runtime
+  dependencies. Standalone signed Windows/macOS installers and cross-platform
+  binary packaging remain potential future projects; they are **not** included
+  in the 1.0 release.
+- **Further ideas:** More site-specific metadata adapters, improved bulk
+  imports, and optional export/import for device-local reading settings.
 
 ## License
 
