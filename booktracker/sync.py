@@ -614,5 +614,10 @@ def _apply_filtered(library,source,data,callback):
                 if entry.file_size>5_000_000:
                     raise ValueError("Sync cover exceeds limit.")
                 zout.writestr(entry,zin.read(entry))
-            zout.writestr("library.json",_json(data))
+            filtered_library = _json(data)
+            zout.writestr("library.json", filtered_library)
+            zout.writestr("integrity.json", json.dumps({
+                "format": "BookTracker-full", "version": 1,
+                "library_sha256": hashlib.sha256(filtered_library.encode("utf-8")).hexdigest(),
+            }))
         return import_portable(library,archive,postmerge=callback,sync_mode=True)
