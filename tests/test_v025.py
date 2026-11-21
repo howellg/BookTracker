@@ -10,7 +10,7 @@ import sys
 import zipfile
 
 import pytest
-from PySide6.QtWidgets import QMessageBox
+from PySide6.QtWidgets import QApplication, QMessageBox
 
 from booktracker import sync
 from booktracker.database import Library
@@ -21,6 +21,17 @@ from booktracker.maintenance import (
     snapshot_sqlite,
 )
 from booktracker.portable_backup import export_portable, import_portable, verify_portable
+
+
+@pytest.fixture(scope="module")
+def app():
+    return QApplication.instance() or QApplication([])
+
+
+def stable_export(library):
+    value = library.export_data()
+    value.pop("exported_at", None)
+    return value
 
 
 @pytest.fixture
@@ -34,7 +45,7 @@ def library(tmp_path):
 
 
 def test_readonly_database_doctor_checks_integrity_and_foreign_keys(library):
-    before = library.export_data()
+    before = stable_export(library)
     report = inspect_sqlite(library.path)
     assert report["ok"], report
     assert report["integrity"] == ["ok"]
@@ -43,7 +54,7 @@ def test_readonly_database_doctor_checks_integrity_and_foreign_keys(library):
     assert report["schema_version"] == 11
     assert report["full_check"]
     assert json.loads(format_report(report))["ok"]
-    assert library.export_data() == before
+    assert stable_export(library) == before
 
 
 def test_readonly_doctor_rejects_invalid_or_missing_sqlite(tmp_path):
@@ -57,7 +68,7 @@ def test_readonly_doctor_rejects_invalid_or_missing_sqlite(tmp_path):
 
 
 def test_snapshot_creation_is_atomic_and_never_overwrites(tmp_path, library):
-    source_before = library.export_data()
+    source_before = stable_export(library)
     destination = tmp_path / "new" / "safe snapshot.sqlite3"
     result = snapshot_sqlite(library.path, destination)
     assert result["ok"]
@@ -65,7 +76,7 @@ def test_snapshot_creation_is_atomic_and_never_overwrites(tmp_path, library):
     assert inspect_backup(destination)["ok"]
     with pytest.raises(FileExistsError):
         snapshot_sqlite(library.path, destination)
-    assert library.export_data() == source_before
+    assert stable_export(library) == source_before
     with sqlite3.connect(destination) as conn:
         assert conn.execute("SELECT COUNT(*) FROM progress_events").fetchone()[0] == 1
 
@@ -123,11 +134,11 @@ def test_corrupt_manifest_detected_before_restore_changes(tmp_path, library):
     other = Library(tmp_path / "untouched.sqlite3")
     try:
         key = other.add_work({"title": "Keep me"})
-        original = other.export_data()
+        original = stable_export(other)
         with pytest.raises(ValueError, match="checksum"):
             import_portable(other, corrupt, strategy="replace")
         assert other.get_work(key)
-        assert other.export_data() == original
+        assert stable_export(other) == original
     finally:
         other.close()
 
@@ -202,7 +213,7 @@ def test_gui_integrity_and_verification_are_readonly(app, tmp_path, monkeypatch)
 
     library = Library(tmp_path/"gui.sqlite3")
     library.add_work({"title": "Leave unchanged"})
-    before = library.export_data()
+    before = stable_export(library)
     main = MainWindow(library)
     try:
         calls = []
@@ -217,7 +228,7 @@ def test_gui_integrity_and_verification_are_readonly(app, tmp_path, monkeypatch)
         main.show_integrity_result()
         main.verify_backup_file()
         assert calls == ["pass", "pass"]
-        assert library.export_data() == before
+        assert stable_export(library) == before
         file_menu = main.file_menu
         actions = {item.text(): item.shortcut().toString()
                    for item in file_menu.actions()}
