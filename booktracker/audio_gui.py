@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMessageBox,
@@ -33,6 +34,7 @@ from .audiobooks import (
     scan_m4b_folder,
 )
 from .database import _book_identity
+from .recent_audio import RecentAudioStore
 
 
 def fmt_duration(milliseconds):
@@ -305,6 +307,8 @@ class AudioLibraryPage(QWidget):
         self.main=parent
         self.worker=None
         self._player_dialog=None
+        self._active_audio_file_id=None
+        self.recent_store=RecentAudioStore(QSettings("BookTracker","BookTracker"))
         self.setAcceptDrops(True)
         layout=QVBoxLayout(self)
         head=QHBoxLayout()
@@ -398,6 +402,8 @@ class AudioLibraryPage(QWidget):
         actions=QGridLayout()
         for index,(text,func) in enumerate((
             ("Play in BookTracker",self.play_in_app),
+            ("Resume recent",self.resume_recent),
+            ("Recent audio…",self.choose_recent),
             ("Queue next",self.queue_selected_next),
             ("Open audio file",self.open_file),
             ("Start listening timer",self.start_listening_timer),
@@ -647,27 +653,55 @@ class AudioLibraryPage(QWidget):
         self.launch_audio_file(item)
 
     def launch_audio_file(self,item):
-        if self._player_dialog is not None:
-            self._player_dialog.show()
-            self._player_dialog.raise_()
-            self._player_dialog.activateWindow()
-            self.scan_message.setText(
-                "Audio player already open. Use Queue next or close it to switch books."
-            )
-            return
         if not item["available"]:
             QMessageBox.information(
                 self,"M4B file missing",
                 "Relink this M4B on this device before playing it."
             )
             return
-        try:
-            from .audio_player import AudioPlayerDialog
+        from .audio_player import AudioPlayerDialog, AudioResumeStore
 
+        try:
+            AudioResumeStore._identity(item["path"])
+        except (ValueError,OSError,KeyError):
+            self.scan_message.setText(
+                "The selected audiobook is missing or changed. Relink its local file."
+            )
+            return
+        old=self._player_dialog
+        if old is not None:
+            currently=getattr(old,"current",None)
+            current_id=(
+                currently.get("id") if isinstance(currently,dict)
+                else self._active_audio_file_id
+            )
+            if current_id==item["id"]:
+                old.show()
+                old.raise_()
+                old.activateWindow()
+                return
+            accepted=QMessageBox.question(
+                self,"Switch audiobook?",
+                f"Close the current player and open {item['filename']}? "
+                "The current playback position will be saved.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if accepted!=QMessageBox.StandardButton.Yes:
+                return
+            if not old.close():
+                self.scan_message.setText("Current player is still closing.")
+                return
+            if self._player_dialog is old:
+                self.player_closed(old)
+        try:
             available=self.library.list_audio_files(work_id=item["work_id"])
             dialog=AudioPlayerDialog(self,available,item)
             self._player_dialog=dialog
-            dialog.finished.connect(self.player_closed)
+            self._active_audio_file_id=item["id"]
+            dialog.finished.connect(
+                lambda _result, closed=dialog: self.player_closed(closed)
+            )
             dialog.show()
             if self.main is not None and hasattr(self.main,"attach_audio_player"):
                 self.main.attach_audio_player(dialog)
@@ -676,6 +710,37 @@ class AudioLibraryPage(QWidget):
                 self,"Built-in player unavailable",
                 f"{exc}\n\nYou can still open the audio file in your external player."
             )
+
+    def _recent_available(self):
+        return self.recent_store.available(self.library.list_audio_files())
+
+    def resume_recent(self):
+        rows=self._recent_available()
+        if not rows:
+            self.scan_message.setText(
+                "No previously opened, unchanged local M4B was found."
+            )
+            return
+        self.launch_audio_file(rows[0])
+
+    def choose_recent(self):
+        rows=self._recent_available()
+        if not rows:
+            self.scan_message.setText(
+                "No previously opened, unchanged local M4B was found."
+            )
+            return
+        labels=[
+            f"{entry['work_title']} — {entry['filename']} "
+            f"({entry['narrator'] or 'Narrator unspecified'})"
+            for entry in rows
+        ]
+        value,ok=QInputDialog.getItem(
+            self,"Recently opened audiobooks","Choose local recording:",
+            labels,0,False
+        )
+        if ok:
+            self.launch_audio_file(rows[labels.index(value)])
 
     def queue_selected_next(self):
         selected=self.current_file()
@@ -687,8 +752,11 @@ class AudioLibraryPage(QWidget):
         else:
             self.scan_message.setText("Queue accepts other parts from the same edition.")
 
-    def player_closed(self,*_args):
+    def player_closed(self, dialog=None, *_args):
+        if dialog is not None and self._player_dialog is not dialog:
+            return
         self._player_dialog=None
+        self._active_audio_file_id=None
         if self.main is not None and hasattr(self.main,"detach_audio_player"):
             self.main.detach_audio_player()
         self.refresh_files()

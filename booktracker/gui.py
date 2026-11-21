@@ -2397,6 +2397,13 @@ class MainWindow(QMainWindow):
         self.audio_mini_label=QLabel("No audiobook playing")
         self.audio_mini_label.setMaximumWidth(330)
         self.audio_toolbar.addWidget(self.audio_mini_label)
+        self.audio_toolbar.addWidget(QLabel("Speed"))
+        self.audio_mini_speed=QComboBox()
+        for value in (0.75,1.0,1.25,1.5,1.75,2.0,2.5):
+            self.audio_mini_speed.addItem(f"{value:g}×",value)
+        self.audio_mini_speed.setMaximumWidth(78)
+        self.audio_mini_speed.currentIndexChanged.connect(self.audio_set_speed)
+        self.audio_toolbar.addWidget(self.audio_mini_speed)
         for title,callback in (
             ("◀ Part",lambda:self.audio_transport("previous")),
             ("−30s",lambda:self.audio_transport("back")),
@@ -2433,6 +2440,15 @@ class MainWindow(QMainWindow):
             )
             self.addAction(action)
             self._audio_shortcuts.append(action)
+
+    def audio_set_speed(self, *_args):
+        player=self.audio_page._player_dialog
+        if player is None or not player._supports_pitch_safe_speed:
+            return
+        desired=self.audio_mini_speed.currentData()
+        index=player.speed.findData(desired)
+        if index>=0 and player.speed.currentIndex()!=index:
+            player.speed.setCurrentIndex(index)
 
     def show_audio_shortcuts(self):
         QMessageBox.information(
@@ -2481,11 +2497,13 @@ class MainWindow(QMainWindow):
     def attach_audio_player(self, dialog):
         self.audio_toolbar.show()
         dialog.updated.connect(self.refresh_audio_toolbar)
+        dialog.speed.currentIndexChanged.connect(self.refresh_audio_toolbar)
         self.refresh_audio_toolbar()
 
     def detach_audio_player(self):
         self.audio_toolbar.hide()
         self.audio_mini_label.setText("No audiobook playing")
+        self.audio_mini_speed.setEnabled(False)
 
     def refresh_audio_toolbar(self):
         player=self.audio_page._player_dialog
@@ -2498,6 +2516,14 @@ class MainWindow(QMainWindow):
                 f"{fmt_duration(player.player.duration())}"
             )
             self.audio_mini_label.setToolTip(player.current["filename"])
+            self.audio_mini_speed.setEnabled(player._supports_pitch_safe_speed)
+            index=self.audio_mini_speed.findData(
+                float(player.speed.currentData())
+            )
+            if index>=0 and self.audio_mini_speed.currentIndex()!=index:
+                self.audio_mini_speed.blockSignals(True)
+                self.audio_mini_speed.setCurrentIndex(index)
+                self.audio_mini_speed.blockSignals(False)
 
     def play_audio_for_work(self, work_id):
         """EPUB reader bridge: choose a local linked M4B, never infer progress."""
