@@ -127,3 +127,83 @@ def snapshot_sqlite(path, target):
 
 def format_report(result):
     return json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True)
+def run_self_test():
+    """Exercise release-critical workflows entirely inside a temporary folder.
+
+    Does not read or write the configured user database. Internet, Qt and mpv
+    are not required; failures are returned in a machine-readable report.
+    """
+    from .database import Library
+    from .portable_backup import export_portable, import_portable
+    from .sync import apply, plan, publish, read_snapshot
+
+    checks = []
+    try:
+        with tempfile.TemporaryDirectory(prefix="booktracker-selftest-") as folder:
+            root = Path(folder)
+            source = Library(root / "original.sqlite3")
+            try:
+                work = source.add_work({
+                    "title": "BookTracker Offline Self-Test",
+                    "author": "BookTracker",
+                    "progress_unit": "chapters",
+                    "total_units": 20,
+                })
+                source.record_progress_on(work, 7, date="2026-01-01")
+                source.add_session(
+                    work, read_date="2026-01-01", minutes=15, mode="reading"
+                )
+                source.add_annotation(
+                    work, kind="note", body="Self-test only",
+                    location=7, location_unit="chapters",
+                )
+                if source.integrity_check() != "ok":
+                    raise ValueError("New SQLite library integrity check failed.")
+                checks.append("create-and-edit-test-library")
+
+                snapshot = root / "verified.sqlite3"
+                if not snapshot_sqlite(source.path, snapshot)["ok"]:
+                    raise ValueError("SQLite online backup verification failed.")
+                checks.append("atomic-sqlite-snapshot")
+
+                archive = root / "library.btbackup"
+                export_portable(source, archive)
+                if not verify_portable(archive)["ok"]:
+                    raise ValueError("Portable archive checksum validation failed.")
+                checks.append("portable-export-integrity")
+
+                restored = Library(root / "restored.sqlite3")
+                try:
+                    if import_portable(restored, archive) != 1:
+                        raise ValueError("Portable import did not restore its work.")
+                    if (restored.get_work(work) is None
+                            or len(restored.history(work)) != 1
+                            or len(restored.list_sessions(work_id=work)) != 1
+                            or len(restored.list_annotations(work_id=work)) != 1):
+                        raise ValueError("Restored history or notes did not round-trip.")
+                    if restored.integrity_check() != "ok":
+                        raise ValueError("Restored SQLite library failed integrity checks.")
+                finally:
+                    restored.close()
+                checks.append("portable-restore-roundtrip")
+
+                remote = Library(root / "peer.sqlite3")
+                try:
+                    peer = read_snapshot(publish(source, root / "sync-folder"))
+                    changes = plan(remote, peer)
+                    result = apply(remote, changes)
+                    if (result["new_works"] != 1
+                            or remote.get_work(work) is None
+                            or len(remote.history(work)) != 1):
+                        raise ValueError("Two-device sync round-trip failed.")
+                finally:
+                    remote.close()
+                checks.append("device-sync-roundtrip")
+            finally:
+                source.close()
+        return {"kind": "self-test", "ok": True, "checks": checks,
+                "note": "Used only a disposable temporary library."}
+    except Exception as exc:
+        return {"kind": "self-test", "ok": False, "checks": checks,
+                "error": str(exc)[:500],
+                "note": "Configured user library was not accessed."}
